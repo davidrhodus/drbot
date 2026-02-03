@@ -1,0 +1,8 @@
+[package]
+name = "drbot-reclaim"
+version.workspace = true
+edition.workspace = true
+description = "Resource reclamation utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

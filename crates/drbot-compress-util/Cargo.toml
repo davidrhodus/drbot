@@ -1,0 +1,8 @@
+[package]
+name = "drbot-compress-util"
+version.workspace = true
+edition.workspace = true
+description = "Compression utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-deadline"
+version.workspace = true
+edition.workspace = true
+description = "Deadline handling for drbot"
+
+[dependencies]
+thiserror.workspace = true

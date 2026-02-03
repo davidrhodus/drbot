@@ -1,0 +1,8 @@
+[package]
+name = "drbot-cell"
+version.workspace = true
+edition.workspace = true
+description = "Cell-like wrapper utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

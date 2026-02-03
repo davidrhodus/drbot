@@ -1,0 +1,18 @@
+[package]
+name = "drbot-media"
+version.workspace = true
+edition.workspace = true
+description = "Media processing for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+base64 = "0.22"
+mime_guess = "2.0"

@@ -1,0 +1,9 @@
+[package]
+name = "drbot-diff-text"
+version.workspace = true
+edition.workspace = true
+description = "Text diffing for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

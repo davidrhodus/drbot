@@ -1,0 +1,8 @@
+[package]
+name = "drbot-log-level"
+version.workspace = true
+edition.workspace = true
+description = "Log level utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

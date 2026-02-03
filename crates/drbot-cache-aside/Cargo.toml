@@ -1,0 +1,8 @@
+[package]
+name = "drbot-cache-aside"
+version.workspace = true
+edition.workspace = true
+description = "Cache-aside pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

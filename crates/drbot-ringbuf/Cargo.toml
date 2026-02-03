@@ -1,0 +1,11 @@
+[package]
+name = "drbot-ringbuf"
+version.workspace = true
+edition.workspace = true
+description = "Ring buffer implementation for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

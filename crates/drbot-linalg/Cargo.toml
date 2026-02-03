@@ -1,0 +1,10 @@
+[package]
+name = "drbot-linalg"
+description = "Linear algebra utilities for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

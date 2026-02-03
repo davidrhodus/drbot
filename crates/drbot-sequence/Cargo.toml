@@ -1,0 +1,8 @@
+[package]
+name = "drbot-sequence"
+version.workspace = true
+edition.workspace = true
+description = "Sequence utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "drbot-channel-util"
+version.workspace = true
+edition.workspace = true
+description = "Channel utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-memento"
+version.workspace = true
+edition.workspace = true
+description = "Memento pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

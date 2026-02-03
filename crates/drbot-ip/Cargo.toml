@@ -1,0 +1,10 @@
+[package]
+name = "drbot-ip"
+version.workspace = true
+edition.workspace = true
+description = "IP address utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

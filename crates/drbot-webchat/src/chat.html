@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>drbot WebChat</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            background: #16213e;
+            padding: 1rem;
+            border-bottom: 1px solid #0f3460;
+        }
+        header h1 {
+            font-size: 1.25rem;
+            font-weight: 500;
+        }
+        header .status {
+            font-size: 0.75rem;
+            color: #888;
+            margin-top: 0.25rem;
+        }
+        header .status.connected {
+            color: #4ade80;
+        }
+        #messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        .message {
+            max-width: 80%;
+            padding: 0.75rem 1rem;
+            border-radius: 1rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .message.user {
+            background: #0f3460;
+            align-self: flex-end;
+            border-bottom-right-radius: 0.25rem;
+        }
+        .message.assistant {
+            background: #16213e;
+            align-self: flex-start;
+            border-bottom-left-radius: 0.25rem;
+        }
+        .message.system {
+            background: transparent;
+            color: #888;
+            font-size: 0.85rem;
+            text-align: center;
+            align-self: center;
+        }
+        .message.error {
+            background: #7f1d1d;
+            color: #fca5a5;
+        }
+        .message .typing {
+            display: inline-block;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+        #input-area {
+            padding: 1rem;
+            background: #16213e;
+            border-top: 1px solid #0f3460;
+        }
+        #input-form {
+            display: flex;
+            gap: 0.5rem;
+        }
+        #message-input {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: 1px solid #0f3460;
+            border-radius: 0.5rem;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 1rem;
+            outline: none;
+            resize: none;
+            min-height: 44px;
+            max-height: 150px;
+        }
+        #message-input:focus {
+            border-color: #3b82f6;
+        }
+        #send-btn {
+            padding: 0.75rem 1.5rem;
+            background: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #send-btn:hover {
+            background: #2563eb;
+        }
+        #send-btn:disabled {
+            background: #374151;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>drbot WebChat</h1>
+        <div class="status" id="status">Connecting...</div>
+    </header>
+    <div id="messages"></div>
+    <div id="input-area">
+        <form id="input-form">
+            <textarea id="message-input" placeholder="Type a message..." rows="1"></textarea>
+            <button type="submit" id="send-btn">Send</button>
+        </form>
+    </div>
+    <script>
+        const messagesEl = document.getElementById('messages');
+        const statusEl = document.getElementById('status');
+        const inputForm = document.getElementById('input-form');
+        const messageInput = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+
+        let ws = null;
+        let sessionId = null;
+        let currentRequestId = null;
+        let currentAssistantMsg = null;
+
+        function generateId() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0;
+                return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+            });
+        }
+
+        function addMessage(content, type = 'user') {
+            const msg = document.createElement('div');
+            msg.className = `message ${type}`;
+            msg.textContent = content;
+            messagesEl.appendChild(msg);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            return msg;
+        }
+
+        function getTokenFromUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const token = params.get('token');
+            if (!token) return null;
+            const trimmed = token.trim();
+            return trimmed.length ? trimmed : null;
+        }
+
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            let wsUrl = `${protocol}//${window.location.host}/ws`;
+            const token = getTokenFromUrl();
+            if (token) {
+                wsUrl += `?token=${encodeURIComponent(token)}`;
+            }
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                statusEl.textContent = 'Connected';
+                statusEl.className = 'status connected';
+                sendBtn.disabled = false;
+            };
+
+            ws.onclose = () => {
+                const hint = getTokenFromUrl()
+                    ? ''
+                    : ' (If auth is enabled, open with ?token=...)';
+                statusEl.textContent = `Disconnected - Reconnecting...${hint}`;
+                statusEl.className = 'status';
+                sendBtn.disabled = true;
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = () => {
+                const hint = getTokenFromUrl()
+                    ? ''
+                    : ' (If auth is enabled, open with ?token=...)';
+                statusEl.textContent = `Connection error${hint}`;
+                statusEl.className = 'status';
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleMessage(data);
+                } catch (e) {
+                    console.error('Failed to parse message:', e);
+                }
+            };
+        }
+
+        function handleMessage(data) {
+            if (data.type === 'event') {
+                handleEvent(data.event);
+            } else if (data.type === 'response') {
+                handleResponse(data);
+            }
+        }
+
+        function handleEvent(event) {
+            switch (event.event_type) {
+                case 'system.connected':
+                    addMessage('Connected to drbot gateway', 'system');
+                    break;
+                case 'chat.stream_start':
+                    if (event.data.request_id === currentRequestId) {
+                        currentAssistantMsg = addMessage('', 'assistant');
+                    }
+                    break;
+                case 'chat.stream_delta':
+                    if (event.data.request_id === currentRequestId && currentAssistantMsg) {
+                        currentAssistantMsg.textContent += event.data.delta;
+                        messagesEl.scrollTop = messagesEl.scrollHeight;
+                    }
+                    break;
+                case 'chat.stream_complete':
+                    if (event.data.request_id === currentRequestId) {
+                        currentRequestId = null;
+                        currentAssistantMsg = null;
+                        sendBtn.disabled = false;
+                        messageInput.disabled = false;
+                    }
+                    break;
+                case 'chat.stream_error':
+                    if (event.data.request_id === currentRequestId) {
+                        addMessage(`Error: ${event.data.error}`, 'error');
+                        currentRequestId = null;
+                        currentAssistantMsg = null;
+                        sendBtn.disabled = false;
+                        messageInput.disabled = false;
+                    }
+                    break;
+            }
+        }
+
+        function handleResponse(data) {
+            if (data.error) {
+                addMessage(`Error: ${data.error.message}`, 'error');
+                sendBtn.disabled = false;
+                messageInput.disabled = false;
+            } else if (data.id === currentRequestId && data.result && data.result.content) {
+                // Non-streaming response
+                addMessage(data.result.content, 'assistant');
+                currentRequestId = null;
+                sendBtn.disabled = false;
+                messageInput.disabled = false;
+            }
+        }
+
+        function sendMessage(text) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            currentRequestId = generateId();
+            if (!sessionId) {
+                sessionId = generateId();
+            }
+
+            const request = {
+                type: 'request',
+                request: {
+                    id: currentRequestId,
+                    method: 'chat.send',
+                    params: {
+                        message: text,
+                        session_id: sessionId,
+                        stream: true
+                    }
+                }
+            };
+
+            addMessage(text, 'user');
+            ws.send(JSON.stringify(request));
+            sendBtn.disabled = true;
+            messageInput.disabled = true;
+        }
+
+        inputForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const text = messageInput.value.trim();
+            if (text) {
+                sendMessage(text);
+                messageInput.value = '';
+                messageInput.style.height = 'auto';
+            }
+        });
+
+        messageInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                inputForm.dispatchEvent(new Event('submit'));
+            }
+        });
+
+        messageInput.addEventListener('input', () => {
+            messageInput.style.height = 'auto';
+            messageInput.style.height = Math.min(messageInput.scrollHeight, 150) + 'px';
+        });
+
+        connect();
+    </script>
+</body>
+</html>

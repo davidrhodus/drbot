@@ -1,0 +1,8 @@
+[package]
+name = "drbot-prototype"
+version.workspace = true
+edition.workspace = true
+description = "Prototype pattern utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

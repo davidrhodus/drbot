@@ -1,0 +1,8 @@
+[package]
+name = "drbot-tuple"
+version.workspace = true
+edition.workspace = true
+description = "Tuple utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "drbot-openai"
+version.workspace = true
+edition.workspace = true
+description = "OpenAI GPT provider for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+async-trait.workspace = true
+async-stream = "0.3"
+tokio.workspace = true
+tokio-stream.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true

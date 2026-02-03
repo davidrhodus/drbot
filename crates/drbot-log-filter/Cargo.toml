@@ -1,0 +1,8 @@
+[package]
+name = "drbot-log-filter"
+version.workspace = true
+edition.workspace = true
+description = "Log filtering utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

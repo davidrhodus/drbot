@@ -1,0 +1,8 @@
+[package]
+name = "drbot-env-config"
+version.workspace = true
+edition.workspace = true
+description = "Environment-based configuration for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-memo"
+version.workspace = true
+edition.workspace = true
+description = "Memoization for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "drbot-resilience"
+version.workspace = true
+edition.workspace = true
+description = "Smart retry and recovery for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

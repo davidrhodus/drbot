@@ -1,0 +1,21 @@
+[package]
+name = "drbot-workflows"
+version.workspace = true
+edition.workspace = true
+description = "Workflow automation for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+drbot-openai.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+regex.workspace = true

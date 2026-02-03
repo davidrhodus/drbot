@@ -1,0 +1,10 @@
+[package]
+name = "drbot-policy"
+version.workspace = true
+edition.workspace = true
+description = "Policy management and enforcement for drbot"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

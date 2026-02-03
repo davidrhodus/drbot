@@ -1,0 +1,7 @@
+[package]
+name = "drbot-iter"
+description = "Iterator utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

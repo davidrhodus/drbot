@@ -1,0 +1,22 @@
+[package]
+name = "drbot-computer"
+version.workspace = true
+edition.workspace = true
+description = "Computer use and desktop automation for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-screen = { path = "../drbot-screen" }
+async-trait.workspace = true
+async-recursion.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+image.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"

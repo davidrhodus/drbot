@@ -1,0 +1,8 @@
+[package]
+name = "drbot-reader"
+version.workspace = true
+edition.workspace = true
+description = "Reader utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

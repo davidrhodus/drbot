@@ -1,0 +1,11 @@
+[package]
+name = "drbot-array-util"
+version.workspace = true
+edition.workspace = true
+description = "Fixed-size array utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

@@ -1,0 +1,56 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.toml
+
+# drbot specific
+drbot.toml
+config.toml
+*.db
+*.db-shm
+*.db-wal
+.whatsapp/
+.sessions/
+media/
+
+# Node.js (for Baileys bridge)
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.coverage/
+lcov.info
+tarpaulin-report.html
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+*.tmp

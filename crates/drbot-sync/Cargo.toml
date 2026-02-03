@@ -1,0 +1,18 @@
+[package]
+name = "drbot-sync"
+version.workspace = true
+edition.workspace = true
+description = "Encrypted cross-device synchronization for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+ring.workspace = true
+hostname = "0.4"

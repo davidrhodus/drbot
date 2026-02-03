@@ -1,0 +1,26 @@
+[package]
+name = "drbot-mobile"
+version.workspace = true
+edition.workspace = true
+description = "Mobile device nodes (iOS/Android via Bonjour) for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-channels.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+futures.workspace = true
+mdns-sd.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

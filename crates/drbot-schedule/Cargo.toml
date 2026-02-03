@@ -1,0 +1,9 @@
+[package]
+name = "drbot-schedule"
+version.workspace = true
+edition.workspace = true
+description = "Scheduling utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-reborrow"
+version.workspace = true
+edition.workspace = true
+description = "Reborrowing utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

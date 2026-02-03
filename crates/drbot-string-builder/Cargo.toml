@@ -1,0 +1,8 @@
+[package]
+name = "drbot-string-builder"
+version.workspace = true
+edition.workspace = true
+description = "String builder for drbot"
+
+[dependencies]
+thiserror.workspace = true

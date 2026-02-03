@@ -1,0 +1,16 @@
+[package]
+name = "drbot-realtime"
+version.workspace = true
+edition.workspace = true
+description = "Real-time multi-user collaboration for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

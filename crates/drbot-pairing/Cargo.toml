@@ -1,0 +1,24 @@
+[package]
+name = "drbot-pairing"
+version.workspace = true
+edition.workspace = true
+description = "DM pairing and security system for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+ring.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

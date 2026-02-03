@@ -1,0 +1,8 @@
+[package]
+name = "drbot-chain"
+version.workspace = true
+edition.workspace = true
+description = "Chain of Responsibility pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

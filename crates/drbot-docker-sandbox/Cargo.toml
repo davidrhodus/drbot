@@ -1,0 +1,24 @@
+[package]
+name = "drbot-docker-sandbox"
+version.workspace = true
+edition.workspace = true
+description = "Docker container sandboxing for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+futures.workspace = true
+bollard = "0.18"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

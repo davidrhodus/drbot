@@ -1,0 +1,8 @@
+[package]
+name = "drbot-proxy"
+version.workspace = true
+edition.workspace = true
+description = "Proxy pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

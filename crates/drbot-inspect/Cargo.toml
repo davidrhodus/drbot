@@ -1,0 +1,8 @@
+[package]
+name = "drbot-inspect"
+version.workspace = true
+edition.workspace = true
+description = "Value inspection utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "drbot-glob"
+version.workspace = true
+edition.workspace = true
+description = "Glob pattern matching for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

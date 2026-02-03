@@ -1,0 +1,11 @@
+[package]
+name = "drbot-checked"
+version.workspace = true
+edition.workspace = true
+description = "Checked arithmetic utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

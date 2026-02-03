@@ -1,0 +1,22 @@
+[package]
+name = "drbot-plugins"
+version.workspace = true
+edition.workspace = true
+description = "Plugin runtime for drbot"
+
+[features]
+default = []
+wasm = ["wasmtime"]
+
+[dependencies]
+drbot-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dependencies.wasmtime]
+version = "27"
+optional = true

@@ -1,0 +1,19 @@
+[package]
+name = "drbot-middleware"
+version.workspace = true
+edition.workspace = true
+description = "Middleware chain for request processing in drbot"
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

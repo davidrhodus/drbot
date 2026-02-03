@@ -1,0 +1,16 @@
+[package]
+name = "drbot-export"
+version.workspace = true
+edition.workspace = true
+description = "Conversation export for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true

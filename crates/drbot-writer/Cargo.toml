@@ -1,0 +1,8 @@
+[package]
+name = "drbot-writer"
+version.workspace = true
+edition.workspace = true
+description = "Writer utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

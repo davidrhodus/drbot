@@ -1,0 +1,11 @@
+[package]
+name = "drbot-guard"
+version.workspace = true
+edition.workspace = true
+description = "Guard patterns and safety wrappers for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

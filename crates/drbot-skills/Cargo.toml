@@ -1,0 +1,31 @@
+[package]
+name = "drbot-skills"
+version.workspace = true
+edition.workspace = true
+description = "Skills system for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-tools.workspace = true
+drbot-plugins.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+toml.workspace = true
+dirs = "5"
+reqwest.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

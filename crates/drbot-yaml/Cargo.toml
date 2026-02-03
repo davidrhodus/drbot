@@ -1,0 +1,10 @@
+[package]
+name = "drbot-yaml"
+version.workspace = true
+edition.workspace = true
+description = "YAML utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

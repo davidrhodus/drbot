@@ -1,0 +1,11 @@
+[package]
+name = "drbot-triple"
+version.workspace = true
+edition.workspace = true
+description = "Triple utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

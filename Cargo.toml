@@ -1,0 +1,1439 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/drbot-core",
+    "crates/drbot-protocol",
+    "crates/drbot-gateway",
+    "crates/drbot-providers",
+    "crates/drbot-anthropic",
+    "crates/drbot-openai",
+    "crates/drbot-bedrock",
+    "crates/drbot-ollama",
+    "crates/drbot-channels",
+    "crates/drbot-whatsapp",
+    "crates/drbot-telegram",
+    "crates/drbot-slack",
+    "crates/drbot-discord",
+    "crates/drbot-signal",
+    "crates/drbot-imessage",
+    "crates/drbot-matrix",
+    "crates/drbot-webchat",
+    "crates/drbot-sessions",
+    "crates/drbot-memory",
+    "crates/drbot-browser",
+    "crates/drbot-cron",
+    "crates/drbot-hooks",
+    "crates/drbot-plugins",
+    "crates/drbot-tui",
+    "crates/drbot-cli",
+    "crates/drbot-media",
+    # Feature parity crates
+    "crates/drbot-pairing",
+    "crates/drbot-docker-sandbox",
+    "crates/drbot-mobile",
+    "crates/drbot-googlechat",
+    "crates/drbot-bluebubbles",
+    "crates/drbot-skills",
+    "crates/drbot-daemon",
+    "crates/drbot-update",
+    "crates/drbot-canvas",
+    "crates/drbot-canvas-protocol",
+    "crates/drbot-solana",
+    "crates/drbot-otc-escrow-program",
+    # Next-gen features
+    "crates/drbot-mcp",
+    "crates/drbot-router",
+    "crates/drbot-knowledge",
+    "crates/drbot-agents",
+    "crates/drbot-voice",
+    "crates/drbot-workflows",
+    "crates/drbot-context",
+    "crates/drbot-personas",
+    "crates/drbot-proactive",
+    "crates/drbot-export",
+    "crates/drbot-collab",
+    "crates/drbot-hotkey",
+    "crates/drbot-screen",
+    "crates/drbot-devtools",
+    "crates/drbot-sync",
+    # Advanced features
+    "crates/drbot-computer",
+    "crates/drbot-cache",
+    "crates/drbot-sandbox",
+    "crates/drbot-graph",
+    "crates/drbot-nlcmd",
+    "crates/drbot-gitconv",
+    "crates/drbot-analytics",
+    "crates/drbot-clipboard",
+    "crates/drbot-learning",
+    "crates/drbot-branch",
+    # Competitive edge features
+    "crates/drbot-marketplace",
+    "crates/drbot-teams",
+    "crates/drbot-msteams",
+    "crates/drbot-integrations",
+    "crates/drbot-templates",
+    "crates/drbot-privacy",
+    "crates/drbot-costs",
+    "crates/drbot-interrupt",
+    "crates/drbot-explain",
+    # Next-gen competitive features
+    "crates/drbot-offline",
+    "crates/drbot-orchestration",
+    "crates/drbot-predict",
+    "crates/drbot-observe",
+    "crates/drbot-timetravel",
+    "crates/drbot-compress",
+    "crates/drbot-consensus",
+    "crates/drbot-personalize",
+    "crates/drbot-realtime",
+    "crates/drbot-safety",
+    "crates/drbot-search",
+    "crates/drbot-automate",
+    "crates/drbot-aitest",
+    "crates/drbot-snapshot",
+    "crates/drbot-resilience",
+    "crates/drbot-stream",
+    # Tier 1: Revolutionary features
+    "crates/drbot-semcache",
+    "crates/drbot-selfcorrect",
+    "crates/drbot-tooldiscovery",
+    "crates/drbot-chainofthought",
+    "crates/drbot-goals",
+    # Tier 2: Major differentiators
+    "crates/drbot-dynprompt",
+    "crates/drbot-calibrate",
+    "crates/drbot-consolidate",
+    "crates/drbot-intent",
+    "crates/drbot-promptopt",
+    # Tier 3: Competitive edge
+    "crates/drbot-semdiff",
+    "crates/drbot-convgraph",
+    "crates/drbot-activelearn",
+    "crates/drbot-restemplates",
+    "crates/drbot-benchmark",
+    # Tier 4: Future-proofing
+    "crates/drbot-federated",
+    "crates/drbot-a2a",
+    "crates/drbot-a2a-p2p",
+    "crates/drbot-skilltransfer",
+    "crates/drbot-crosslingual",
+    "crates/drbot-attention",
+    # Quick wins
+    "crates/drbot-defaults",
+    "crates/drbot-variants",
+    "crates/drbot-undoredo",
+    "crates/drbot-pinned",
+    "crates/drbot-quickactions",
+    # Overcompete features - Tier 1-5
+    "crates/drbot-mailai",
+    "crates/drbot-schedai",
+    "crates/drbot-docai",
+    "crates/drbot-codeai",
+    "crates/drbot-uniclip",
+    "crates/drbot-connectors",
+    "crates/drbot-homeai",
+    "crates/drbot-webai",
+    "crates/drbot-organize",
+    "crates/drbot-meetai",
+    "crates/drbot-vault",
+    "crates/drbot-audit",
+    "crates/drbot-firewall",
+    "crates/drbot-selective",
+    "crates/drbot-swarm",
+    "crates/drbot-evolve",
+    "crates/drbot-simulate",
+    "crates/drbot-kgraph",
+    # Final tier features
+    "crates/drbot-omnisearch",
+    "crates/drbot-ambient",
+    "crates/drbot-anticipate",
+    "crates/drbot-localai",
+    "crates/drbot-longmem",
+    "crates/drbot-recorder",
+    # Overcompete features - Advanced AI
+    "crates/drbot-multimodal",
+    "crates/drbot-reasoning",
+    "crates/drbot-realworld",
+    "crates/drbot-copilot",
+    "crates/drbot-temporal",
+    "crates/drbot-social",
+    "crates/drbot-expert",
+    "crates/drbot-creative",
+    "crates/drbot-digest",
+    "crates/drbot-delegate",
+    "crates/drbot-verify",
+    "crates/drbot-adapt",
+    "crates/drbot-edge",
+    "crates/drbot-mesh",
+    "crates/drbot-telemetry",
+    # Revolutionary overcompete features
+    "crates/drbot-autonomous",
+    "crates/drbot-reflect",
+    "crates/drbot-multiagent",
+    "crates/drbot-memory-graph",
+    "crates/drbot-guardian",
+    "crates/drbot-synthesize",
+    "crates/drbot-predictive",
+    "crates/drbot-codebase",
+    "crates/drbot-dataops",
+    "crates/drbot-docmind",
+    "crates/drbot-pair",
+    "crates/drbot-teach",
+    "crates/drbot-smart-delegate",
+    "crates/drbot-sovereign",
+    "crates/drbot-explainable",
+    "crates/drbot-persona-engine",
+    "crates/drbot-ritual",
+    "crates/drbot-bridge",
+    # New overcompete crates - Tier 1: Context Superpowers
+    "crates/drbot-fs-watch",
+    "crates/drbot-git-mind",
+    # Tier 2: Voice & Multimodal
+    "crates/drbot-vision",
+    "crates/drbot-transcribe",
+    # Tier 3: Cost & Performance
+    "crates/drbot-smart-router",
+    "crates/drbot-semantic-cache",
+    "crates/drbot-cost-tracker",
+    # Tier 4: Integration & Extensibility
+    "crates/drbot-tools",
+    "crates/drbot-webhooks",
+    "crates/drbot-oauth",
+    # Tier 5: Team & Enterprise
+    "crates/drbot-rbac",
+    "crates/drbot-compliance",
+    # Tier 6: Learning & Adaptation
+    "crates/drbot-style-match",
+    "crates/drbot-preferences",
+    "crates/drbot-feedback-loop",
+    "crates/drbot-eval",
+    # Tier 7: Advanced Search
+    "crates/drbot-hybrid-search",
+    "crates/drbot-rerank",
+    "crates/drbot-citations",
+    # Tier 8: Resilience & Offline
+    "crates/drbot-queue",
+    # Tier 9: Unique Differentiators
+    "crates/drbot-time-travel",
+    "crates/drbot-adversarial",
+    "crates/drbot-simulation",
+    # Tier 10: Developer Tools
+    "crates/drbot-playground",
+    "crates/drbot-sdk-gen",
+    "crates/drbot-debug",
+    # Reliability & Infrastructure
+    "crates/drbot-project-graph",
+    "crates/drbot-shell-sense",
+    "crates/drbot-retry-strategy",
+    "crates/drbot-circuit",
+    "crates/drbot-fallback",
+    # Infrastructure & Observability
+    "crates/drbot-rate-limit",
+    "crates/drbot-health",
+    "crates/drbot-metrics",
+    "crates/drbot-request-log",
+    "crates/drbot-api-version",
+    "crates/drbot-tracing",
+    "crates/drbot-config-hot",
+    "crates/drbot-graceful",
+    "crates/drbot-pool",
+    "crates/drbot-backpressure",
+    "crates/drbot-timeout",
+    "crates/drbot-bulkhead",
+    "crates/drbot-event-bus",
+    "crates/drbot-middleware",
+    "crates/drbot-task-queue",
+    # Distributed patterns
+    "crates/drbot-saga",
+    "crates/drbot-outbox",
+    "crates/drbot-idempotency",
+    "crates/drbot-cqrs",
+    "crates/drbot-event-sourcing",
+    "crates/drbot-pubsub",
+    "crates/drbot-leader",
+    "crates/drbot-lock",
+    "crates/drbot-scheduler",
+    "crates/drbot-workflow-engine",
+    # Service infrastructure
+    "crates/drbot-state-machine",
+    "crates/drbot-registry",
+    "crates/drbot-discovery",
+    "crates/drbot-load-balancer",
+    "crates/drbot-throttle",
+    # Configuration & operational
+    "crates/drbot-feature-flags",
+    "crates/drbot-config-store",
+    "crates/drbot-secrets",
+    "crates/drbot-audit-log",
+    "crates/drbot-notification",
+    # API & communication
+    "crates/drbot-api-gateway",
+    "crates/drbot-graphql",
+    "crates/drbot-grpc",
+    "crates/drbot-sse",
+    "crates/drbot-long-polling",
+    # Data handling
+    "crates/drbot-pagination",
+    "crates/drbot-cursor",
+    "crates/drbot-batch",
+    "crates/drbot-etag",
+    "crates/drbot-content-negotiation",
+    # Validation & transformation
+    "crates/drbot-validation",
+    "crates/drbot-transform",
+    "crates/drbot-sanitize",
+    "crates/drbot-normalize",
+    "crates/drbot-diff",
+    # Encoding & crypto
+    "crates/drbot-crypto",
+    "crates/drbot-encoding",
+    "crates/drbot-hashing",
+    "crates/drbot-serialization",
+    "crates/drbot-formatting",
+    # Networking & IO
+    "crates/drbot-http-client",
+    "crates/drbot-dns",
+    "crates/drbot-tcp",
+    "crates/drbot-file-io",
+    "crates/drbot-temp",
+    # Utility crates
+    "crates/drbot-string",
+    "crates/drbot-collection",
+    "crates/drbot-iter",
+    "crates/drbot-option",
+    "crates/drbot-result",
+    # More utilities
+    "crates/drbot-time",
+    "crates/drbot-random",
+    "crates/drbot-id",
+    "crates/drbot-slug",
+    "crates/drbot-path",
+    # System utilities
+    "crates/drbot-env",
+    "crates/drbot-args",
+    "crates/drbot-process",
+    "crates/drbot-signal-handler",
+    "crates/drbot-semver",
+    # Data format utilities
+    "crates/drbot-json",
+    "crates/drbot-toml-util",
+    "crates/drbot-yaml",
+    "crates/drbot-regex-util",
+    "crates/drbot-glob",
+    # Network utilities
+    "crates/drbot-url",
+    "crates/drbot-ip",
+    "crates/drbot-port",
+    "crates/drbot-mime",
+    "crates/drbot-cookie",
+    # Text processing
+    "crates/drbot-text",
+    "crates/drbot-diff-text",
+    "crates/drbot-template",
+    "crates/drbot-pluralize",
+    "crates/drbot-truncate",
+    # Security/Auth utilities
+    "crates/drbot-jwt",
+    "crates/drbot-password",
+    "crates/drbot-token",
+    "crates/drbot-otp",
+    "crates/drbot-apikey",
+    # Data structure utilities
+    "crates/drbot-lru",
+    "crates/drbot-heap",
+    "crates/drbot-trie",
+    "crates/drbot-bloom",
+    "crates/drbot-bitset",
+    # Async utilities
+    "crates/drbot-async-mutex",
+    "crates/drbot-async-channel",
+    "crates/drbot-async-semaphore",
+    "crates/drbot-async-barrier",
+    "crates/drbot-async-once",
+    # Compression utilities
+    "crates/drbot-gzip",
+    "crates/drbot-zstd",
+    "crates/drbot-lz4",
+    "crates/drbot-snappy",
+    "crates/drbot-brotli",
+    # Math/Statistics utilities
+    "crates/drbot-stats",
+    "crates/drbot-math",
+    "crates/drbot-linalg",
+    "crates/drbot-percentile",
+    "crates/drbot-histogram",
+    # Logging/Debugging utilities
+    "crates/drbot-logger",
+    "crates/drbot-profiler",
+    "crates/drbot-span",
+    "crates/drbot-tracer",
+    "crates/drbot-diagnostic",
+    # Parser/Format utilities
+    "crates/drbot-parser",
+    "crates/drbot-lexer",
+    "crates/drbot-ast",
+    "crates/drbot-pretty",
+    "crates/drbot-color",
+    # Event/Message utilities
+    "crates/drbot-event",
+    "crates/drbot-message",
+    "crates/drbot-envelope",
+    "crates/drbot-channel-util",
+    "crates/drbot-broadcast",
+    # Resource management utilities
+    "crates/drbot-resource",
+    "crates/drbot-lease",
+    "crates/drbot-disposable",
+    "crates/drbot-lifecycle",
+    "crates/drbot-cleanup",
+    # Constraint/Rule utilities
+    "crates/drbot-constraint",
+    "crates/drbot-rule",
+    "crates/drbot-policy",
+    "crates/drbot-assertion",
+    "crates/drbot-guard",
+    # Testing utilities
+    "crates/drbot-mock",
+    "crates/drbot-fixture",
+    "crates/drbot-fuzzer",
+    "crates/drbot-bench",
+    "crates/drbot-testutil",
+    # Scheduling/Time utilities
+    "crates/drbot-interval",
+    "crates/drbot-debounce",
+    "crates/drbot-countdown",
+    "crates/drbot-schedule",
+    "crates/drbot-ticker",
+    # Queue/Buffer utilities
+    "crates/drbot-ringbuf",
+    "crates/drbot-deque",
+    "crates/drbot-stack",
+    "crates/drbot-pqueue",
+    "crates/drbot-buffer",
+    # State/Observer utilities
+    "crates/drbot-state",
+    "crates/drbot-observer",
+    "crates/drbot-slot",
+    "crates/drbot-reactive",
+    "crates/drbot-binding",
+    # Map/Key-Value utilities
+    "crates/drbot-map",
+    "crates/drbot-bimap",
+    "crates/drbot-multimap",
+    "crates/drbot-ordermap",
+    "crates/drbot-expiremap",
+    # Tree/Graph utilities
+    "crates/drbot-tree",
+    "crates/drbot-btree",
+    "crates/drbot-avl",
+    "crates/drbot-digraph",
+    "crates/drbot-dag",
+    # Sequence/Pattern utilities
+    "crates/drbot-sequence",
+    "crates/drbot-pattern",
+    "crates/drbot-matcher",
+    "crates/drbot-wildcard",
+    "crates/drbot-fuzzy",
+    # Conversion/Coercion utilities
+    "crates/drbot-convert",
+    "crates/drbot-cast",
+    "crates/drbot-coerce",
+    "crates/drbot-parse",
+    "crates/drbot-stringify",
+    # Builder/Factory utilities
+    "crates/drbot-builder",
+    "crates/drbot-factory",
+    "crates/drbot-prototype",
+    "crates/drbot-pool-obj",
+    "crates/drbot-flyweight",
+    # Decorator/Proxy utilities
+    "crates/drbot-decorator",
+    "crates/drbot-proxy",
+    "crates/drbot-wrapper",
+    "crates/drbot-adapter",
+    "crates/drbot-facade",
+    # Mediator/Command utilities
+    "crates/drbot-mediator",
+    "crates/drbot-command",
+    "crates/drbot-memento",
+    "crates/drbot-chain",
+    "crates/drbot-visitor",
+    # Strategy/Template utilities
+    "crates/drbot-strategy",
+    "crates/drbot-template-method",
+    "crates/drbot-interpreter",
+    "crates/drbot-iterator-pattern",
+    "crates/drbot-compose",
+    # Null Object/Specification utilities
+    "crates/drbot-null-object",
+    "crates/drbot-specification",
+    "crates/drbot-repository",
+    "crates/drbot-lazy",
+    "crates/drbot-memo",
+    # Concurrency utilities
+    "crates/drbot-sync-primitives",
+    "crates/drbot-worker",
+    "crates/drbot-actor",
+    "crates/drbot-future",
+    "crates/drbot-channel-sync",
+    # Event/State utilities
+    "crates/drbot-event-emitter",
+    "crates/drbot-observable",
+    "crates/drbot-signal-slot",
+    # Retry/Error utilities
+    "crates/drbot-retry",
+    "crates/drbot-error-chain",
+    "crates/drbot-result-ext",
+    "crates/drbot-try-catch",
+    "crates/drbot-finally",
+    # Validation/Guard utilities
+    "crates/drbot-validate",
+    "crates/drbot-precondition",
+    "crates/drbot-invariant",
+    "crates/drbot-contract",
+    "crates/drbot-assume",
+    # Resource/Lifecycle utilities
+    "crates/drbot-resource-pool",
+    "crates/drbot-disposer",
+    "crates/drbot-scope",
+    "crates/drbot-transaction",
+    "crates/drbot-rollback",
+    # Resilience pattern utilities
+    "crates/drbot-circuit-breaker",
+    "crates/drbot-rate-limiter",
+    "crates/drbot-bulkhead-pattern",
+    "crates/drbot-deadline",
+    "crates/drbot-cancellation",
+    # Caching utilities
+    "crates/drbot-cache-store",
+    "crates/drbot-ttl-cache",
+    "crates/drbot-lru-cache",
+    "crates/drbot-write-through",
+    "crates/drbot-cache-aside",
+    # Serialization/Encoding utilities
+    "crates/drbot-codec",
+    "crates/drbot-base64-util",
+    "crates/drbot-hex-util",
+    "crates/drbot-compress-util",
+    "crates/drbot-checksum",
+    # Network/Protocol utilities
+    "crates/drbot-websocket-util",
+    "crates/drbot-http-util",
+    "crates/drbot-request",
+    "crates/drbot-response",
+    "crates/drbot-header",
+    # Stream/IO utilities
+    "crates/drbot-stream-util",
+    "crates/drbot-reader",
+    "crates/drbot-writer",
+    "crates/drbot-pipe",
+    "crates/drbot-sink",
+    # Logging/Monitoring utilities
+    "crates/drbot-log-format",
+    "crates/drbot-log-level",
+    "crates/drbot-log-filter",
+    "crates/drbot-log-context",
+    "crates/drbot-meter",
+    # Parser/Lexer utilities
+    "crates/drbot-tokenizer",
+    "crates/drbot-scanner",
+    "crates/drbot-cursor-parse",
+    "crates/drbot-combinator",
+    "crates/drbot-precedence",
+    # Configuration/Settings utilities
+    "crates/drbot-config-parse",
+    "crates/drbot-env-config",
+    "crates/drbot-config-merge",
+    "crates/drbot-config-validate",
+    "crates/drbot-config-default",
+    # Type/Trait utilities
+    "crates/drbot-type-id",
+    "crates/drbot-any-ext",
+    "crates/drbot-downcast",
+    "crates/drbot-type-map",
+    "crates/drbot-type-name",
+    # Wrapper/Container utilities
+    "crates/drbot-cell",
+    "crates/drbot-refcell",
+    "crates/drbot-rc",
+    "crates/drbot-arc",
+    "crates/drbot-cow",
+    # Tuple/Pair utilities
+    "crates/drbot-tuple",
+    "crates/drbot-pair-util",
+    "crates/drbot-triple",
+    "crates/drbot-either",
+    "crates/drbot-unit",
+    # Numeric/Math utilities
+    "crates/drbot-saturating",
+    "crates/drbot-wrapping",
+    "crates/drbot-checked",
+    "crates/drbot-nonzero",
+    "crates/drbot-bounded",
+    # Functional utilities
+    "crates/drbot-fn-util",
+    "crates/drbot-closure",
+    "crates/drbot-curry",
+    "crates/drbot-partial",
+    "crates/drbot-pipe-fn",
+    # Comparison/Ordering utilities
+    "crates/drbot-cmp",
+    "crates/drbot-ord-ext",
+    "crates/drbot-eq-ext",
+    "crates/drbot-min-max",
+    "crates/drbot-clamp",
+    # Hash/Identity utilities
+    "crates/drbot-hash-ext",
+    "crates/drbot-identity",
+    "crates/drbot-fingerprint",
+    "crates/drbot-signature",
+    "crates/drbot-digest-util",
+    # Debug/Display utilities
+    "crates/drbot-debug-ext",
+    "crates/drbot-display-ext",
+    "crates/drbot-format-util",
+    "crates/drbot-repr",
+    "crates/drbot-inspect",
+    # Copy/Clone utilities
+    "crates/drbot-clone-ext",
+    "crates/drbot-copy-ext",
+    "crates/drbot-duplicate",
+    "crates/drbot-replica",
+    "crates/drbot-snapshot-util",
+    # Default/Init utilities
+    "crates/drbot-default-ext",
+    "crates/drbot-init",
+    "crates/drbot-zero",
+    "crates/drbot-empty",
+    "crates/drbot-uninit",
+    # Drop/Cleanup utilities
+    "crates/drbot-drop-ext",
+    "crates/drbot-destructor",
+    "crates/drbot-release",
+    "crates/drbot-finalize",
+    "crates/drbot-reclaim",
+    # Send/Sync utilities
+    "crates/drbot-send",
+    "crates/drbot-sync-marker",
+    "crates/drbot-thread-safe",
+    "crates/drbot-atomic-ext",
+    "crates/drbot-cell-ext",
+    # Pointer utilities
+    "crates/drbot-ptr",
+    "crates/drbot-ref-util",
+    "crates/drbot-pin-util",
+    "crates/drbot-box-ext",
+    "crates/drbot-raw-ptr",
+    # Memory/Layout utilities
+    "crates/drbot-mem-util",
+    "crates/drbot-alloc-util",
+    "crates/drbot-layout",
+    "crates/drbot-align",
+    "crates/drbot-size",
+    # Borrow/Lifetime utilities
+    "crates/drbot-borrow-ext",
+    "crates/drbot-lifetime-util",
+    "crates/drbot-reborrow",
+    "crates/drbot-ref-count",
+    "crates/drbot-weak-util",
+    # Slice/Array utilities
+    "crates/drbot-slice-util",
+    "crates/drbot-array-util",
+    "crates/drbot-vec-ext",
+    "crates/drbot-chunk",
+    "crates/drbot-window",
+    # String extension utilities
+    "crates/drbot-str-ext",
+    "crates/drbot-string-builder",
+    "crates/drbot-str-case",
+    "crates/drbot-str-split",
+    "crates/drbot-str-join",
+    # Formal verification
+    "crates/drbot-kani",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["David"]
+license = "MIT"
+repository = "https://github.com/david/drbot"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+async-recursion = "1.1"
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
+# HTTP
+axum = { version = "0.8", features = ["ws", "macros"] }
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls", "multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Config
+config = "0.14"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Crypto
+ring = "0.17"
+rustls = "0.23"
+jsonwebtoken = "9"
+
+# Image processing
+image = "0.25"
+
+# UUID
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Regex
+regex = "1.11"
+
+# Bytes
+bytes = "1.9"
+
+# Archives / Compression
+flate2 = "1.0"
+tar = "0.4"
+zip = "2"
+
+# Docker
+bollard = "0.18"
+
+# mDNS/Bonjour
+mdns-sd = "0.11"
+
+# WebSocket client
+rust_socketio = "0.6"
+
+# Solana
+solana-sdk = "2.0"
+solana-client = "2.0"
+spl-token = "6.0"
+spl-associated-token-account = "4.0"
+bs58 = "0.5"
+base64 = "0.22"
+bincode = "1.3"
+lazy_static = "1.5"
+
+# Internal crates
+drbot-core = { path = "crates/drbot-core" }
+drbot-protocol = { path = "crates/drbot-protocol" }
+drbot-gateway = { path = "crates/drbot-gateway" }
+drbot-providers = { path = "crates/drbot-providers" }
+drbot-anthropic = { path = "crates/drbot-anthropic" }
+drbot-openai = { path = "crates/drbot-openai" }
+drbot-bedrock = { path = "crates/drbot-bedrock" }
+drbot-ollama = { path = "crates/drbot-ollama" }
+drbot-channels = { path = "crates/drbot-channels" }
+drbot-whatsapp = { path = "crates/drbot-whatsapp" }
+drbot-telegram = { path = "crates/drbot-telegram" }
+drbot-slack = { path = "crates/drbot-slack" }
+drbot-discord = { path = "crates/drbot-discord" }
+drbot-signal = { path = "crates/drbot-signal" }
+drbot-imessage = { path = "crates/drbot-imessage" }
+drbot-matrix = { path = "crates/drbot-matrix" }
+drbot-webchat = { path = "crates/drbot-webchat" }
+drbot-sessions = { path = "crates/drbot-sessions" }
+drbot-memory = { path = "crates/drbot-memory" }
+drbot-browser = { path = "crates/drbot-browser" }
+drbot-cron = { path = "crates/drbot-cron" }
+drbot-hooks = { path = "crates/drbot-hooks" }
+drbot-plugins = { path = "crates/drbot-plugins" }
+drbot-tui = { path = "crates/drbot-tui" }
+drbot-cli = { path = "crates/drbot-cli" }
+drbot-media = { path = "crates/drbot-media" }
+# Next-gen crates
+drbot-mcp = { path = "crates/drbot-mcp" }
+drbot-router = { path = "crates/drbot-router" }
+drbot-knowledge = { path = "crates/drbot-knowledge" }
+drbot-agents = { path = "crates/drbot-agents" }
+drbot-voice = { path = "crates/drbot-voice" }
+drbot-workflows = { path = "crates/drbot-workflows" }
+drbot-context = { path = "crates/drbot-context" }
+drbot-personas = { path = "crates/drbot-personas" }
+drbot-proactive = { path = "crates/drbot-proactive" }
+drbot-export = { path = "crates/drbot-export" }
+drbot-collab = { path = "crates/drbot-collab" }
+drbot-hotkey = { path = "crates/drbot-hotkey" }
+drbot-screen = { path = "crates/drbot-screen" }
+drbot-devtools = { path = "crates/drbot-devtools" }
+drbot-sync = { path = "crates/drbot-sync" }
+drbot-computer = { path = "crates/drbot-computer" }
+drbot-cache = { path = "crates/drbot-cache" }
+drbot-sandbox = { path = "crates/drbot-sandbox" }
+drbot-graph = { path = "crates/drbot-graph" }
+drbot-nlcmd = { path = "crates/drbot-nlcmd" }
+drbot-gitconv = { path = "crates/drbot-gitconv" }
+drbot-analytics = { path = "crates/drbot-analytics" }
+drbot-clipboard = { path = "crates/drbot-clipboard" }
+drbot-learning = { path = "crates/drbot-learning" }
+drbot-branch = { path = "crates/drbot-branch" }
+# Feature parity crates
+drbot-pairing = { path = "crates/drbot-pairing" }
+drbot-docker-sandbox = { path = "crates/drbot-docker-sandbox" }
+drbot-mobile = { path = "crates/drbot-mobile" }
+drbot-googlechat = { path = "crates/drbot-googlechat" }
+drbot-bluebubbles = { path = "crates/drbot-bluebubbles" }
+drbot-skills = { path = "crates/drbot-skills" }
+drbot-daemon = { path = "crates/drbot-daemon" }
+drbot-update = { path = "crates/drbot-update" }
+drbot-canvas = { path = "crates/drbot-canvas" }
+drbot-canvas-protocol = { path = "crates/drbot-canvas-protocol" }
+drbot-solana = { path = "crates/drbot-solana" }
+drbot-otc-escrow-program = { path = "crates/drbot-otc-escrow-program" }
+# Competitive edge crates
+drbot-marketplace = { path = "crates/drbot-marketplace" }
+drbot-teams = { path = "crates/drbot-teams" }
+drbot-msteams = { path = "crates/drbot-msteams" }
+drbot-integrations = { path = "crates/drbot-integrations" }
+drbot-templates = { path = "crates/drbot-templates" }
+drbot-privacy = { path = "crates/drbot-privacy" }
+drbot-costs = { path = "crates/drbot-costs" }
+drbot-interrupt = { path = "crates/drbot-interrupt" }
+drbot-explain = { path = "crates/drbot-explain" }
+# Next-gen competitive crates
+drbot-offline = { path = "crates/drbot-offline" }
+drbot-orchestration = { path = "crates/drbot-orchestration" }
+drbot-predict = { path = "crates/drbot-predict" }
+drbot-observe = { path = "crates/drbot-observe" }
+drbot-timetravel = { path = "crates/drbot-timetravel" }
+drbot-compress = { path = "crates/drbot-compress" }
+drbot-consensus = { path = "crates/drbot-consensus" }
+drbot-personalize = { path = "crates/drbot-personalize" }
+drbot-realtime = { path = "crates/drbot-realtime" }
+drbot-safety = { path = "crates/drbot-safety" }
+drbot-search = { path = "crates/drbot-search" }
+drbot-automate = { path = "crates/drbot-automate" }
+drbot-aitest = { path = "crates/drbot-aitest" }
+drbot-snapshot = { path = "crates/drbot-snapshot" }
+drbot-resilience = { path = "crates/drbot-resilience" }
+drbot-stream = { path = "crates/drbot-stream" }
+# Tier 1: Revolutionary features
+drbot-semcache = { path = "crates/drbot-semcache" }
+drbot-selfcorrect = { path = "crates/drbot-selfcorrect" }
+drbot-tooldiscovery = { path = "crates/drbot-tooldiscovery" }
+drbot-chainofthought = { path = "crates/drbot-chainofthought" }
+drbot-goals = { path = "crates/drbot-goals" }
+# Tier 2: Major differentiators
+drbot-dynprompt = { path = "crates/drbot-dynprompt" }
+drbot-calibrate = { path = "crates/drbot-calibrate" }
+drbot-consolidate = { path = "crates/drbot-consolidate" }
+drbot-intent = { path = "crates/drbot-intent" }
+drbot-promptopt = { path = "crates/drbot-promptopt" }
+# Tier 3: Competitive edge
+drbot-semdiff = { path = "crates/drbot-semdiff" }
+drbot-convgraph = { path = "crates/drbot-convgraph" }
+drbot-activelearn = { path = "crates/drbot-activelearn" }
+drbot-restemplates = { path = "crates/drbot-restemplates" }
+drbot-benchmark = { path = "crates/drbot-benchmark" }
+# Tier 4: Future-proofing
+drbot-federated = { path = "crates/drbot-federated" }
+drbot-a2a = { path = "crates/drbot-a2a" }
+drbot-a2a-p2p = { path = "crates/drbot-a2a-p2p" }
+drbot-skilltransfer = { path = "crates/drbot-skilltransfer" }
+drbot-crosslingual = { path = "crates/drbot-crosslingual" }
+drbot-attention = { path = "crates/drbot-attention" }
+# Quick wins
+drbot-defaults = { path = "crates/drbot-defaults" }
+drbot-variants = { path = "crates/drbot-variants" }
+drbot-undoredo = { path = "crates/drbot-undoredo" }
+drbot-pinned = { path = "crates/drbot-pinned" }
+drbot-quickactions = { path = "crates/drbot-quickactions" }
+# Overcompete features
+drbot-mailai = { path = "crates/drbot-mailai" }
+drbot-schedai = { path = "crates/drbot-schedai" }
+drbot-docai = { path = "crates/drbot-docai" }
+drbot-codeai = { path = "crates/drbot-codeai" }
+drbot-uniclip = { path = "crates/drbot-uniclip" }
+drbot-connectors = { path = "crates/drbot-connectors" }
+drbot-homeai = { path = "crates/drbot-homeai" }
+drbot-webai = { path = "crates/drbot-webai" }
+drbot-organize = { path = "crates/drbot-organize" }
+drbot-meetai = { path = "crates/drbot-meetai" }
+drbot-vault = { path = "crates/drbot-vault" }
+drbot-audit = { path = "crates/drbot-audit" }
+drbot-firewall = { path = "crates/drbot-firewall" }
+drbot-selective = { path = "crates/drbot-selective" }
+drbot-swarm = { path = "crates/drbot-swarm" }
+drbot-evolve = { path = "crates/drbot-evolve" }
+drbot-simulate = { path = "crates/drbot-simulate" }
+drbot-kgraph = { path = "crates/drbot-kgraph" }
+# Final tier features
+drbot-omnisearch = { path = "crates/drbot-omnisearch" }
+drbot-ambient = { path = "crates/drbot-ambient" }
+drbot-anticipate = { path = "crates/drbot-anticipate" }
+drbot-localai = { path = "crates/drbot-localai" }
+drbot-longmem = { path = "crates/drbot-longmem" }
+drbot-recorder = { path = "crates/drbot-recorder" }
+# Advanced AI features
+drbot-multimodal = { path = "crates/drbot-multimodal" }
+drbot-reasoning = { path = "crates/drbot-reasoning" }
+drbot-realworld = { path = "crates/drbot-realworld" }
+drbot-copilot = { path = "crates/drbot-copilot" }
+drbot-temporal = { path = "crates/drbot-temporal" }
+drbot-social = { path = "crates/drbot-social" }
+drbot-expert = { path = "crates/drbot-expert" }
+drbot-creative = { path = "crates/drbot-creative" }
+drbot-digest = { path = "crates/drbot-digest" }
+drbot-delegate = { path = "crates/drbot-delegate" }
+drbot-verify = { path = "crates/drbot-verify" }
+drbot-adapt = { path = "crates/drbot-adapt" }
+drbot-edge = { path = "crates/drbot-edge" }
+drbot-mesh = { path = "crates/drbot-mesh" }
+drbot-telemetry = { path = "crates/drbot-telemetry" }
+# Revolutionary overcompete crates
+drbot-autonomous = { path = "crates/drbot-autonomous" }
+drbot-reflect = { path = "crates/drbot-reflect" }
+drbot-multiagent = { path = "crates/drbot-multiagent" }
+drbot-memory-graph = { path = "crates/drbot-memory-graph" }
+drbot-guardian = { path = "crates/drbot-guardian" }
+drbot-synthesize = { path = "crates/drbot-synthesize" }
+drbot-predictive = { path = "crates/drbot-predictive" }
+drbot-codebase = { path = "crates/drbot-codebase" }
+drbot-dataops = { path = "crates/drbot-dataops" }
+drbot-docmind = { path = "crates/drbot-docmind" }
+drbot-pair = { path = "crates/drbot-pair" }
+drbot-teach = { path = "crates/drbot-teach" }
+drbot-smart-delegate = { path = "crates/drbot-smart-delegate" }
+drbot-sovereign = { path = "crates/drbot-sovereign" }
+drbot-explainable = { path = "crates/drbot-explainable" }
+drbot-persona-engine = { path = "crates/drbot-persona-engine" }
+drbot-ritual = { path = "crates/drbot-ritual" }
+drbot-bridge = { path = "crates/drbot-bridge" }
+# New overcompete crates
+drbot-fs-watch = { path = "crates/drbot-fs-watch" }
+drbot-git-mind = { path = "crates/drbot-git-mind" }
+drbot-vision = { path = "crates/drbot-vision" }
+drbot-transcribe = { path = "crates/drbot-transcribe" }
+drbot-smart-router = { path = "crates/drbot-smart-router" }
+drbot-semantic-cache = { path = "crates/drbot-semantic-cache" }
+drbot-cost-tracker = { path = "crates/drbot-cost-tracker" }
+drbot-tools = { path = "crates/drbot-tools" }
+drbot-webhooks = { path = "crates/drbot-webhooks" }
+drbot-oauth = { path = "crates/drbot-oauth" }
+drbot-rbac = { path = "crates/drbot-rbac" }
+drbot-compliance = { path = "crates/drbot-compliance" }
+drbot-style-match = { path = "crates/drbot-style-match" }
+drbot-preferences = { path = "crates/drbot-preferences" }
+drbot-feedback-loop = { path = "crates/drbot-feedback-loop" }
+drbot-eval = { path = "crates/drbot-eval" }
+drbot-hybrid-search = { path = "crates/drbot-hybrid-search" }
+drbot-rerank = { path = "crates/drbot-rerank" }
+drbot-citations = { path = "crates/drbot-citations" }
+drbot-queue = { path = "crates/drbot-queue" }
+drbot-time-travel = { path = "crates/drbot-time-travel" }
+drbot-adversarial = { path = "crates/drbot-adversarial" }
+drbot-simulation = { path = "crates/drbot-simulation" }
+drbot-playground = { path = "crates/drbot-playground" }
+drbot-sdk-gen = { path = "crates/drbot-sdk-gen" }
+drbot-debug = { path = "crates/drbot-debug" }
+# Reliability & Infrastructure crates
+drbot-project-graph = { path = "crates/drbot-project-graph" }
+drbot-shell-sense = { path = "crates/drbot-shell-sense" }
+drbot-retry-strategy = { path = "crates/drbot-retry-strategy" }
+drbot-circuit = { path = "crates/drbot-circuit" }
+drbot-fallback = { path = "crates/drbot-fallback" }
+# Infrastructure & Observability crates
+drbot-rate-limit = { path = "crates/drbot-rate-limit" }
+drbot-health = { path = "crates/drbot-health" }
+drbot-metrics = { path = "crates/drbot-metrics" }
+drbot-request-log = { path = "crates/drbot-request-log" }
+drbot-api-version = { path = "crates/drbot-api-version" }
+drbot-tracing = { path = "crates/drbot-tracing" }
+drbot-config-hot = { path = "crates/drbot-config-hot" }
+drbot-graceful = { path = "crates/drbot-graceful" }
+drbot-pool = { path = "crates/drbot-pool" }
+drbot-backpressure = { path = "crates/drbot-backpressure" }
+drbot-timeout = { path = "crates/drbot-timeout" }
+drbot-bulkhead = { path = "crates/drbot-bulkhead" }
+drbot-event-bus = { path = "crates/drbot-event-bus" }
+drbot-middleware = { path = "crates/drbot-middleware" }
+drbot-task-queue = { path = "crates/drbot-task-queue" }
+# Distributed patterns
+drbot-saga = { path = "crates/drbot-saga" }
+drbot-outbox = { path = "crates/drbot-outbox" }
+drbot-idempotency = { path = "crates/drbot-idempotency" }
+drbot-cqrs = { path = "crates/drbot-cqrs" }
+drbot-event-sourcing = { path = "crates/drbot-event-sourcing" }
+drbot-pubsub = { path = "crates/drbot-pubsub" }
+drbot-leader = { path = "crates/drbot-leader" }
+drbot-lock = { path = "crates/drbot-lock" }
+drbot-scheduler = { path = "crates/drbot-scheduler" }
+drbot-workflow-engine = { path = "crates/drbot-workflow-engine" }
+# Service infrastructure
+drbot-state-machine = { path = "crates/drbot-state-machine" }
+drbot-registry = { path = "crates/drbot-registry" }
+drbot-discovery = { path = "crates/drbot-discovery" }
+drbot-load-balancer = { path = "crates/drbot-load-balancer" }
+drbot-throttle = { path = "crates/drbot-throttle" }
+# Configuration & operational
+drbot-feature-flags = { path = "crates/drbot-feature-flags" }
+drbot-config-store = { path = "crates/drbot-config-store" }
+drbot-secrets = { path = "crates/drbot-secrets" }
+drbot-audit-log = { path = "crates/drbot-audit-log" }
+drbot-notification = { path = "crates/drbot-notification" }
+# API & communication
+drbot-api-gateway = { path = "crates/drbot-api-gateway" }
+drbot-graphql = { path = "crates/drbot-graphql" }
+drbot-grpc = { path = "crates/drbot-grpc" }
+drbot-sse = { path = "crates/drbot-sse" }
+drbot-long-polling = { path = "crates/drbot-long-polling" }
+# Data handling
+drbot-pagination = { path = "crates/drbot-pagination" }
+drbot-cursor = { path = "crates/drbot-cursor" }
+drbot-batch = { path = "crates/drbot-batch" }
+drbot-etag = { path = "crates/drbot-etag" }
+drbot-content-negotiation = { path = "crates/drbot-content-negotiation" }
+# Validation & transformation
+drbot-validation = { path = "crates/drbot-validation" }
+drbot-transform = { path = "crates/drbot-transform" }
+drbot-sanitize = { path = "crates/drbot-sanitize" }
+drbot-normalize = { path = "crates/drbot-normalize" }
+drbot-diff = { path = "crates/drbot-diff" }
+# Encoding & crypto
+drbot-crypto = { path = "crates/drbot-crypto" }
+drbot-encoding = { path = "crates/drbot-encoding" }
+drbot-hashing = { path = "crates/drbot-hashing" }
+drbot-serialization = { path = "crates/drbot-serialization" }
+drbot-formatting = { path = "crates/drbot-formatting" }
+# Networking & IO
+drbot-http-client = { path = "crates/drbot-http-client" }
+drbot-dns = { path = "crates/drbot-dns" }
+drbot-tcp = { path = "crates/drbot-tcp" }
+drbot-file-io = { path = "crates/drbot-file-io" }
+drbot-temp = { path = "crates/drbot-temp" }
+# Utility crates
+drbot-string = { path = "crates/drbot-string" }
+drbot-collection = { path = "crates/drbot-collection" }
+drbot-iter = { path = "crates/drbot-iter" }
+drbot-option = { path = "crates/drbot-option" }
+drbot-result = { path = "crates/drbot-result" }
+# More utilities
+drbot-time = { path = "crates/drbot-time" }
+drbot-random = { path = "crates/drbot-random" }
+drbot-id = { path = "crates/drbot-id" }
+drbot-slug = { path = "crates/drbot-slug" }
+drbot-path = { path = "crates/drbot-path" }
+# System utilities
+drbot-env = { path = "crates/drbot-env" }
+drbot-args = { path = "crates/drbot-args" }
+drbot-process = { path = "crates/drbot-process" }
+drbot-signal-handler = { path = "crates/drbot-signal-handler" }
+drbot-semver = { path = "crates/drbot-semver" }
+# Data format utilities
+drbot-json = { path = "crates/drbot-json" }
+drbot-toml-util = { path = "crates/drbot-toml-util" }
+drbot-yaml = { path = "crates/drbot-yaml" }
+drbot-regex-util = { path = "crates/drbot-regex-util" }
+drbot-glob = { path = "crates/drbot-glob" }
+# Network utilities
+drbot-url = { path = "crates/drbot-url" }
+drbot-ip = { path = "crates/drbot-ip" }
+drbot-port = { path = "crates/drbot-port" }
+drbot-mime = { path = "crates/drbot-mime" }
+drbot-cookie = { path = "crates/drbot-cookie" }
+# Text processing
+drbot-text = { path = "crates/drbot-text" }
+drbot-diff-text = { path = "crates/drbot-diff-text" }
+drbot-template = { path = "crates/drbot-template" }
+drbot-pluralize = { path = "crates/drbot-pluralize" }
+drbot-truncate = { path = "crates/drbot-truncate" }
+# Security/Auth utilities
+drbot-jwt = { path = "crates/drbot-jwt" }
+drbot-password = { path = "crates/drbot-password" }
+drbot-token = { path = "crates/drbot-token" }
+drbot-otp = { path = "crates/drbot-otp" }
+drbot-apikey = { path = "crates/drbot-apikey" }
+# Data structure utilities
+drbot-lru = { path = "crates/drbot-lru" }
+drbot-heap = { path = "crates/drbot-heap" }
+drbot-trie = { path = "crates/drbot-trie" }
+drbot-bloom = { path = "crates/drbot-bloom" }
+drbot-bitset = { path = "crates/drbot-bitset" }
+# Async utilities
+drbot-async-mutex = { path = "crates/drbot-async-mutex" }
+drbot-async-channel = { path = "crates/drbot-async-channel" }
+drbot-async-semaphore = { path = "crates/drbot-async-semaphore" }
+drbot-async-barrier = { path = "crates/drbot-async-barrier" }
+drbot-async-once = { path = "crates/drbot-async-once" }
+# Compression utilities
+drbot-gzip = { path = "crates/drbot-gzip" }
+drbot-zstd = { path = "crates/drbot-zstd" }
+drbot-lz4 = { path = "crates/drbot-lz4" }
+drbot-snappy = { path = "crates/drbot-snappy" }
+drbot-brotli = { path = "crates/drbot-brotli" }
+# Math/Statistics utilities
+drbot-stats = { path = "crates/drbot-stats" }
+drbot-math = { path = "crates/drbot-math" }
+drbot-linalg = { path = "crates/drbot-linalg" }
+drbot-percentile = { path = "crates/drbot-percentile" }
+drbot-histogram = { path = "crates/drbot-histogram" }
+# Logging/Debugging utilities
+drbot-logger = { path = "crates/drbot-logger" }
+drbot-profiler = { path = "crates/drbot-profiler" }
+drbot-span = { path = "crates/drbot-span" }
+drbot-tracer = { path = "crates/drbot-tracer" }
+drbot-diagnostic = { path = "crates/drbot-diagnostic" }
+# Parser/Format utilities
+drbot-parser = { path = "crates/drbot-parser" }
+drbot-lexer = { path = "crates/drbot-lexer" }
+drbot-ast = { path = "crates/drbot-ast" }
+drbot-pretty = { path = "crates/drbot-pretty" }
+drbot-color = { path = "crates/drbot-color" }
+# Event/Message utilities
+drbot-event = { path = "crates/drbot-event" }
+drbot-message = { path = "crates/drbot-message" }
+drbot-envelope = { path = "crates/drbot-envelope" }
+drbot-channel-util = { path = "crates/drbot-channel-util" }
+drbot-broadcast = { path = "crates/drbot-broadcast" }
+# Resource management utilities
+drbot-resource = { path = "crates/drbot-resource" }
+drbot-lease = { path = "crates/drbot-lease" }
+drbot-disposable = { path = "crates/drbot-disposable" }
+drbot-lifecycle = { path = "crates/drbot-lifecycle" }
+drbot-cleanup = { path = "crates/drbot-cleanup" }
+# Constraint/Rule utilities
+drbot-constraint = { path = "crates/drbot-constraint" }
+drbot-rule = { path = "crates/drbot-rule" }
+drbot-policy = { path = "crates/drbot-policy" }
+drbot-assertion = { path = "crates/drbot-assertion" }
+drbot-guard = { path = "crates/drbot-guard" }
+# Testing utilities
+drbot-mock = { path = "crates/drbot-mock" }
+drbot-fixture = { path = "crates/drbot-fixture" }
+drbot-fuzzer = { path = "crates/drbot-fuzzer" }
+drbot-bench = { path = "crates/drbot-bench" }
+drbot-testutil = { path = "crates/drbot-testutil" }
+# Scheduling/Time utilities
+drbot-interval = { path = "crates/drbot-interval" }
+drbot-debounce = { path = "crates/drbot-debounce" }
+drbot-countdown = { path = "crates/drbot-countdown" }
+drbot-schedule = { path = "crates/drbot-schedule" }
+drbot-ticker = { path = "crates/drbot-ticker" }
+# Queue/Buffer utilities
+drbot-ringbuf = { path = "crates/drbot-ringbuf" }
+drbot-deque = { path = "crates/drbot-deque" }
+drbot-stack = { path = "crates/drbot-stack" }
+drbot-pqueue = { path = "crates/drbot-pqueue" }
+drbot-buffer = { path = "crates/drbot-buffer" }
+# State/Observer utilities
+drbot-state = { path = "crates/drbot-state" }
+drbot-observer = { path = "crates/drbot-observer" }
+drbot-slot = { path = "crates/drbot-slot" }
+drbot-reactive = { path = "crates/drbot-reactive" }
+drbot-binding = { path = "crates/drbot-binding" }
+# Map/Key-Value utilities
+drbot-map = { path = "crates/drbot-map" }
+drbot-bimap = { path = "crates/drbot-bimap" }
+drbot-multimap = { path = "crates/drbot-multimap" }
+drbot-ordermap = { path = "crates/drbot-ordermap" }
+drbot-expiremap = { path = "crates/drbot-expiremap" }
+# Tree/Graph utilities
+drbot-tree = { path = "crates/drbot-tree" }
+drbot-btree = { path = "crates/drbot-btree" }
+drbot-avl = { path = "crates/drbot-avl" }
+drbot-digraph = { path = "crates/drbot-digraph" }
+drbot-dag = { path = "crates/drbot-dag" }
+# Sequence/Pattern utilities
+drbot-sequence = { path = "crates/drbot-sequence" }
+drbot-pattern = { path = "crates/drbot-pattern" }
+drbot-matcher = { path = "crates/drbot-matcher" }
+drbot-wildcard = { path = "crates/drbot-wildcard" }
+drbot-fuzzy = { path = "crates/drbot-fuzzy" }
+# Conversion/Coercion utilities
+drbot-convert = { path = "crates/drbot-convert" }
+drbot-cast = { path = "crates/drbot-cast" }
+drbot-coerce = { path = "crates/drbot-coerce" }
+drbot-parse = { path = "crates/drbot-parse" }
+drbot-stringify = { path = "crates/drbot-stringify" }
+# Builder/Factory utilities
+drbot-builder = { path = "crates/drbot-builder" }
+drbot-factory = { path = "crates/drbot-factory" }
+drbot-prototype = { path = "crates/drbot-prototype" }
+drbot-pool-obj = { path = "crates/drbot-pool-obj" }
+drbot-flyweight = { path = "crates/drbot-flyweight" }
+# Decorator/Proxy utilities
+drbot-decorator = { path = "crates/drbot-decorator" }
+drbot-proxy = { path = "crates/drbot-proxy" }
+drbot-wrapper = { path = "crates/drbot-wrapper" }
+drbot-adapter = { path = "crates/drbot-adapter" }
+drbot-facade = { path = "crates/drbot-facade" }
+# Mediator/Command utilities
+drbot-mediator = { path = "crates/drbot-mediator" }
+drbot-command = { path = "crates/drbot-command" }
+drbot-memento = { path = "crates/drbot-memento" }
+drbot-chain = { path = "crates/drbot-chain" }
+drbot-visitor = { path = "crates/drbot-visitor" }
+# Strategy/Template utilities
+drbot-strategy = { path = "crates/drbot-strategy" }
+drbot-template-method = { path = "crates/drbot-template-method" }
+drbot-interpreter = { path = "crates/drbot-interpreter" }
+drbot-iterator-pattern = { path = "crates/drbot-iterator-pattern" }
+drbot-compose = { path = "crates/drbot-compose" }
+# Null Object/Specification utilities
+drbot-null-object = { path = "crates/drbot-null-object" }
+drbot-specification = { path = "crates/drbot-specification" }
+drbot-repository = { path = "crates/drbot-repository" }
+drbot-lazy = { path = "crates/drbot-lazy" }
+drbot-memo = { path = "crates/drbot-memo" }
+# Concurrency utilities
+drbot-sync-primitives = { path = "crates/drbot-sync-primitives" }
+drbot-worker = { path = "crates/drbot-worker" }
+drbot-actor = { path = "crates/drbot-actor" }
+drbot-future = { path = "crates/drbot-future" }
+drbot-channel-sync = { path = "crates/drbot-channel-sync" }
+# Event/State utilities
+drbot-event-emitter = { path = "crates/drbot-event-emitter" }
+drbot-observable = { path = "crates/drbot-observable" }
+drbot-signal-slot = { path = "crates/drbot-signal-slot" }
+# Retry/Error utilities
+drbot-retry = { path = "crates/drbot-retry" }
+drbot-error-chain = { path = "crates/drbot-error-chain" }
+drbot-result-ext = { path = "crates/drbot-result-ext" }
+drbot-try-catch = { path = "crates/drbot-try-catch" }
+drbot-finally = { path = "crates/drbot-finally" }
+# Validation/Guard utilities
+drbot-validate = { path = "crates/drbot-validate" }
+drbot-precondition = { path = "crates/drbot-precondition" }
+drbot-invariant = { path = "crates/drbot-invariant" }
+drbot-contract = { path = "crates/drbot-contract" }
+drbot-assume = { path = "crates/drbot-assume" }
+# Resource/Lifecycle utilities
+drbot-resource-pool = { path = "crates/drbot-resource-pool" }
+drbot-disposer = { path = "crates/drbot-disposer" }
+drbot-scope = { path = "crates/drbot-scope" }
+drbot-transaction = { path = "crates/drbot-transaction" }
+drbot-rollback = { path = "crates/drbot-rollback" }
+# Resilience pattern utilities
+drbot-circuit-breaker = { path = "crates/drbot-circuit-breaker" }
+drbot-rate-limiter = { path = "crates/drbot-rate-limiter" }
+drbot-bulkhead-pattern = { path = "crates/drbot-bulkhead-pattern" }
+drbot-deadline = { path = "crates/drbot-deadline" }
+drbot-cancellation = { path = "crates/drbot-cancellation" }
+# Caching utilities
+drbot-cache-store = { path = "crates/drbot-cache-store" }
+drbot-ttl-cache = { path = "crates/drbot-ttl-cache" }
+drbot-lru-cache = { path = "crates/drbot-lru-cache" }
+drbot-write-through = { path = "crates/drbot-write-through" }
+drbot-cache-aside = { path = "crates/drbot-cache-aside" }
+# Serialization/Encoding utilities
+drbot-codec = { path = "crates/drbot-codec" }
+drbot-base64-util = { path = "crates/drbot-base64-util" }
+drbot-hex-util = { path = "crates/drbot-hex-util" }
+drbot-compress-util = { path = "crates/drbot-compress-util" }
+drbot-checksum = { path = "crates/drbot-checksum" }
+# Network/Protocol utilities
+drbot-websocket-util = { path = "crates/drbot-websocket-util" }
+drbot-http-util = { path = "crates/drbot-http-util" }
+drbot-request = { path = "crates/drbot-request" }
+drbot-response = { path = "crates/drbot-response" }
+drbot-header = { path = "crates/drbot-header" }
+# Stream/IO utilities
+drbot-stream-util = { path = "crates/drbot-stream-util" }
+drbot-reader = { path = "crates/drbot-reader" }
+drbot-writer = { path = "crates/drbot-writer" }
+drbot-pipe = { path = "crates/drbot-pipe" }
+drbot-sink = { path = "crates/drbot-sink" }
+# Logging/Monitoring utilities
+drbot-log-format = { path = "crates/drbot-log-format" }
+drbot-log-level = { path = "crates/drbot-log-level" }
+drbot-log-filter = { path = "crates/drbot-log-filter" }
+drbot-log-context = { path = "crates/drbot-log-context" }
+drbot-meter = { path = "crates/drbot-meter" }
+# Parser/Lexer utilities
+drbot-tokenizer = { path = "crates/drbot-tokenizer" }
+drbot-scanner = { path = "crates/drbot-scanner" }
+drbot-cursor-parse = { path = "crates/drbot-cursor-parse" }
+drbot-combinator = { path = "crates/drbot-combinator" }
+drbot-precedence = { path = "crates/drbot-precedence" }
+# Configuration/Settings utilities
+drbot-config-parse = { path = "crates/drbot-config-parse" }
+drbot-env-config = { path = "crates/drbot-env-config" }
+drbot-config-merge = { path = "crates/drbot-config-merge" }
+drbot-config-validate = { path = "crates/drbot-config-validate" }
+drbot-config-default = { path = "crates/drbot-config-default" }
+# Type/Trait utilities
+drbot-type-id = { path = "crates/drbot-type-id" }
+drbot-any-ext = { path = "crates/drbot-any-ext" }
+drbot-downcast = { path = "crates/drbot-downcast" }
+drbot-type-map = { path = "crates/drbot-type-map" }
+drbot-type-name = { path = "crates/drbot-type-name" }
+# Wrapper/Container utilities
+drbot-cell = { path = "crates/drbot-cell" }
+drbot-refcell = { path = "crates/drbot-refcell" }
+drbot-rc = { path = "crates/drbot-rc" }
+drbot-arc = { path = "crates/drbot-arc" }
+drbot-cow = { path = "crates/drbot-cow" }
+# Tuple/Pair utilities
+drbot-tuple = { path = "crates/drbot-tuple" }
+drbot-pair-util = { path = "crates/drbot-pair-util" }
+drbot-triple = { path = "crates/drbot-triple" }
+drbot-either = { path = "crates/drbot-either" }
+drbot-unit = { path = "crates/drbot-unit" }
+# Numeric/Math utilities
+drbot-saturating = { path = "crates/drbot-saturating" }
+drbot-wrapping = { path = "crates/drbot-wrapping" }
+drbot-checked = { path = "crates/drbot-checked" }
+drbot-nonzero = { path = "crates/drbot-nonzero" }
+drbot-bounded = { path = "crates/drbot-bounded" }
+# Functional utilities
+drbot-fn-util = { path = "crates/drbot-fn-util" }
+drbot-closure = { path = "crates/drbot-closure" }
+drbot-curry = { path = "crates/drbot-curry" }
+drbot-partial = { path = "crates/drbot-partial" }
+drbot-pipe-fn = { path = "crates/drbot-pipe-fn" }
+# Comparison/Ordering utilities
+drbot-cmp = { path = "crates/drbot-cmp" }
+drbot-ord-ext = { path = "crates/drbot-ord-ext" }
+drbot-eq-ext = { path = "crates/drbot-eq-ext" }
+drbot-min-max = { path = "crates/drbot-min-max" }
+drbot-clamp = { path = "crates/drbot-clamp" }
+# Hash/Identity utilities
+drbot-hash-ext = { path = "crates/drbot-hash-ext" }
+drbot-identity = { path = "crates/drbot-identity" }
+drbot-fingerprint = { path = "crates/drbot-fingerprint" }
+drbot-signature = { path = "crates/drbot-signature" }
+drbot-digest-util = { path = "crates/drbot-digest-util" }
+# Debug/Display utilities
+drbot-debug-ext = { path = "crates/drbot-debug-ext" }
+drbot-display-ext = { path = "crates/drbot-display-ext" }
+drbot-format-util = { path = "crates/drbot-format-util" }
+drbot-repr = { path = "crates/drbot-repr" }
+drbot-inspect = { path = "crates/drbot-inspect" }
+# Copy/Clone utilities
+drbot-clone-ext = { path = "crates/drbot-clone-ext" }
+drbot-copy-ext = { path = "crates/drbot-copy-ext" }
+drbot-duplicate = { path = "crates/drbot-duplicate" }
+drbot-replica = { path = "crates/drbot-replica" }
+drbot-snapshot-util = { path = "crates/drbot-snapshot-util" }
+# Default/Init utilities
+drbot-default-ext = { path = "crates/drbot-default-ext" }
+drbot-init = { path = "crates/drbot-init" }
+drbot-zero = { path = "crates/drbot-zero" }
+drbot-empty = { path = "crates/drbot-empty" }
+drbot-uninit = { path = "crates/drbot-uninit" }
+# Drop/Cleanup utilities
+drbot-drop-ext = { path = "crates/drbot-drop-ext" }
+drbot-destructor = { path = "crates/drbot-destructor" }
+drbot-release = { path = "crates/drbot-release" }
+drbot-finalize = { path = "crates/drbot-finalize" }
+drbot-reclaim = { path = "crates/drbot-reclaim" }
+# Send/Sync utilities
+drbot-send = { path = "crates/drbot-send" }
+drbot-sync-marker = { path = "crates/drbot-sync-marker" }
+drbot-thread-safe = { path = "crates/drbot-thread-safe" }
+drbot-atomic-ext = { path = "crates/drbot-atomic-ext" }
+drbot-cell-ext = { path = "crates/drbot-cell-ext" }
+# Pointer utilities
+drbot-ptr = { path = "crates/drbot-ptr" }
+drbot-ref-util = { path = "crates/drbot-ref-util" }
+drbot-pin-util = { path = "crates/drbot-pin-util" }
+drbot-box-ext = { path = "crates/drbot-box-ext" }
+drbot-raw-ptr = { path = "crates/drbot-raw-ptr" }
+# Memory/Layout utilities
+drbot-mem-util = { path = "crates/drbot-mem-util" }
+drbot-alloc-util = { path = "crates/drbot-alloc-util" }
+drbot-layout = { path = "crates/drbot-layout" }
+drbot-align = { path = "crates/drbot-align" }
+drbot-size = { path = "crates/drbot-size" }
+# Borrow/Lifetime utilities
+drbot-borrow-ext = { path = "crates/drbot-borrow-ext" }
+drbot-lifetime-util = { path = "crates/drbot-lifetime-util" }
+drbot-reborrow = { path = "crates/drbot-reborrow" }
+drbot-ref-count = { path = "crates/drbot-ref-count" }
+drbot-weak-util = { path = "crates/drbot-weak-util" }
+# Slice/Array utilities
+drbot-slice-util = { path = "crates/drbot-slice-util" }
+drbot-array-util = { path = "crates/drbot-array-util" }
+drbot-vec-ext = { path = "crates/drbot-vec-ext" }
+drbot-chunk = { path = "crates/drbot-chunk" }
+drbot-window = { path = "crates/drbot-window" }
+# String extension utilities
+drbot-str-ext = { path = "crates/drbot-str-ext" }
+drbot-string-builder = { path = "crates/drbot-string-builder" }
+drbot-str-case = { path = "crates/drbot-str-case" }
+drbot-str-split = { path = "crates/drbot-str-split" }
+drbot-str-join = { path = "crates/drbot-str-join" }
+# Formal verification
+drbot-kani = { path = "crates/drbot-kani" }
+
+[package]
+name = "drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+drbot-core.workspace = true
+drbot-protocol.workspace = true
+drbot-gateway.workspace = true
+drbot-providers.workspace = true
+drbot-anthropic.workspace = true
+drbot-openai.workspace = true
+drbot-ollama.workspace = true
+drbot-sessions.workspace = true
+drbot-context.workspace = true
+drbot-personas.workspace = true
+drbot-router.workspace = true
+drbot-tui.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
+toml.workspace = true
+
+[[example]]
+name = "basic_chat"
+path = "examples/basic_chat.rs"
+
+[[example]]
+name = "streaming"
+path = "examples/streaming.rs"
+
+[[example]]
+name = "multi_provider"
+path = "examples/multi_provider.rs"
+
+[[example]]
+name = "gateway_client"
+path = "examples/gateway_client.rs"

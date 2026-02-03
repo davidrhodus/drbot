@@ -1,0 +1,18 @@
+[package]
+name = "drbot-proactive"
+version.workspace = true
+edition.workspace = true
+description = "Proactive assistant engine for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-knowledge = { path = "../drbot-knowledge" }
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true

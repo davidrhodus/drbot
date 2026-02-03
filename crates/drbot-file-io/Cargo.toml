@@ -1,0 +1,13 @@
+[package]
+name = "drbot-file-io"
+description = "File I/O utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+async-recursion.workspace = true
+serde.workspace = true
+serde_json.workspace = true

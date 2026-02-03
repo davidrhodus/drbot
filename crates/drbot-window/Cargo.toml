@@ -1,0 +1,8 @@
+[package]
+name = "drbot-window"
+version.workspace = true
+edition.workspace = true
+description = "Sliding window utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

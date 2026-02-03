@@ -1,0 +1,10 @@
+[package]
+name = "drbot-regex-util"
+version.workspace = true
+edition.workspace = true
+description = "Regex utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+regex.workspace = true

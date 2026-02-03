@@ -1,0 +1,8 @@
+[package]
+name = "drbot-codec"
+version.workspace = true
+edition.workspace = true
+description = "Generic codec trait for drbot"
+
+[dependencies]
+thiserror.workspace = true

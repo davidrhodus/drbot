@@ -1,0 +1,8 @@
+[package]
+name = "drbot-config-merge"
+version.workspace = true
+edition.workspace = true
+description = "Configuration merging utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

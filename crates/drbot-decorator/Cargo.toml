@@ -1,0 +1,8 @@
+[package]
+name = "drbot-decorator"
+version.workspace = true
+edition.workspace = true
+description = "Decorator pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

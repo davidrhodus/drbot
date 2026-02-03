@@ -1,0 +1,10 @@
+[package]
+name = "drbot-gzip"
+description = "Gzip compression for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

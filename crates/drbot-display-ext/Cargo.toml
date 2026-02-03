@@ -1,0 +1,8 @@
+[package]
+name = "drbot-display-ext"
+version.workspace = true
+edition.workspace = true
+description = "Display trait extensions for drbot"
+
+[dependencies]
+thiserror.workspace = true

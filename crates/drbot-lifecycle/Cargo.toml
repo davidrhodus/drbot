@@ -1,0 +1,11 @@
+[package]
+name = "drbot-lifecycle"
+version.workspace = true
+edition.workspace = true
+description = "Lifecycle management for drbot components"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

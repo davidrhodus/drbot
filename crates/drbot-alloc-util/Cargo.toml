@@ -1,0 +1,8 @@
+[package]
+name = "drbot-alloc-util"
+version.workspace = true
+edition.workspace = true
+description = "Allocation utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

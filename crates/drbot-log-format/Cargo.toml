@@ -1,0 +1,8 @@
+[package]
+name = "drbot-log-format"
+version.workspace = true
+edition.workspace = true
+description = "Log formatting utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

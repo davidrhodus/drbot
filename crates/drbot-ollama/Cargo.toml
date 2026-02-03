@@ -1,0 +1,19 @@
+[package]
+name = "drbot-ollama"
+version.workspace = true
+edition.workspace = true
+description = "Local Ollama provider for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true

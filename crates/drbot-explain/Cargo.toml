@@ -1,0 +1,15 @@
+[package]
+name = "drbot-explain"
+version.workspace = true
+edition.workspace = true
+description = "Explainability and reasoning transparency for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true

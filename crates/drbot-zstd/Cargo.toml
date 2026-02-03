@@ -1,0 +1,10 @@
+[package]
+name = "drbot-zstd"
+description = "Zstandard compression for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

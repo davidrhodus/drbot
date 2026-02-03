@@ -1,0 +1,8 @@
+[package]
+name = "drbot-ttl-cache"
+version.workspace = true
+edition.workspace = true
+description = "TTL-based cache for drbot"
+
+[dependencies]
+thiserror.workspace = true

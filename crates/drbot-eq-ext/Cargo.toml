@@ -1,0 +1,8 @@
+[package]
+name = "drbot-eq-ext"
+version.workspace = true
+edition.workspace = true
+description = "Equality extension utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

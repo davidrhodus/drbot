@@ -1,0 +1,11 @@
+[package]
+name = "drbot-process"
+version.workspace = true
+edition.workspace = true
+description = "Process spawning and management for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

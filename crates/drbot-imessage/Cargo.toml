@@ -1,0 +1,19 @@
+[package]
+name = "drbot-imessage"
+version.workspace = true
+edition.workspace = true
+description = "iMessage channel for drbot (macOS only)"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-channels.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dirs = "5.0"

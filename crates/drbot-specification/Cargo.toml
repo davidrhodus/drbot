@@ -1,0 +1,8 @@
+[package]
+name = "drbot-specification"
+version.workspace = true
+edition.workspace = true
+description = "Specification pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

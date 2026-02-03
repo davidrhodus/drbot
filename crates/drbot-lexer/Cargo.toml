@@ -1,0 +1,9 @@
+[package]
+name = "drbot-lexer"
+version.workspace = true
+edition.workspace = true
+description = "Lexer utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-rollback"
+version.workspace = true
+edition.workspace = true
+description = "Rollback support for drbot"
+
+[dependencies]
+thiserror.workspace = true

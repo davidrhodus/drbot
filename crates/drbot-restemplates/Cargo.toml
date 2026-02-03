@@ -1,0 +1,17 @@
+[package]
+name = "drbot-restemplates"
+version.workspace = true
+edition.workspace = true
+description = "Response templates for drbot - customizable output formats"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+regex.workspace = true

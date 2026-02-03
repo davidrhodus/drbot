@@ -1,0 +1,8 @@
+[package]
+name = "drbot-map"
+version.workspace = true
+edition.workspace = true
+description = "Generic map utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

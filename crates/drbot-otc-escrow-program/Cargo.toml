@@ -1,0 +1,19 @@
+[package]
+name = "drbot-otc-escrow-program"
+version.workspace = true
+edition.workspace = true
+description = "On-chain escrow program for drbot OTC settlement (native SOL + SPL token DvP)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+borsh = { version = "1.5", features = ["derive"] }
+solana-program = "2.0"
+spl-associated-token-account = { workspace = true, features = ["no-entrypoint"] }
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+
+[dev-dependencies]
+solana-program-test = "2.0"
+solana-sdk = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

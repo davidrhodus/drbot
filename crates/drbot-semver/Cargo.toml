@@ -1,0 +1,13 @@
+[package]
+name = "drbot-semver"
+version.workspace = true
+edition.workspace = true
+description = "Semantic versioning for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

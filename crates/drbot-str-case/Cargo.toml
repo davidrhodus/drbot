@@ -1,0 +1,8 @@
+[package]
+name = "drbot-str-case"
+version.workspace = true
+edition.workspace = true
+description = "String case conversion for drbot"
+
+[dependencies]
+thiserror.workspace = true

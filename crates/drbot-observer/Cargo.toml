@@ -1,0 +1,8 @@
+[package]
+name = "drbot-observer"
+version.workspace = true
+edition.workspace = true
+description = "Observer pattern implementation for drbot"
+
+[dependencies]
+thiserror.workspace = true

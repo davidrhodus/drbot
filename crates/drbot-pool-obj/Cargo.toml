@@ -1,0 +1,8 @@
+[package]
+name = "drbot-pool-obj"
+version.workspace = true
+edition.workspace = true
+description = "Object pool pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

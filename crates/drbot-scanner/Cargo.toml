@@ -1,0 +1,8 @@
+[package]
+name = "drbot-scanner"
+version.workspace = true
+edition.workspace = true
+description = "Text scanning utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

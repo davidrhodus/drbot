@@ -1,0 +1,8 @@
+[package]
+name = "drbot-fuzzer"
+version.workspace = true
+edition.workspace = true
+description = "Fuzzing utilities for drbot testing"
+
+[dependencies]
+thiserror.workspace = true

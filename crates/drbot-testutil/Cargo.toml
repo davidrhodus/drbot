@@ -1,0 +1,8 @@
+[package]
+name = "drbot-testutil"
+version.workspace = true
+edition.workspace = true
+description = "Test utility helpers for drbot"
+
+[dependencies]
+thiserror.workspace = true

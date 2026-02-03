@@ -1,0 +1,9 @@
+[package]
+name = "drbot-pretty"
+version.workspace = true
+edition.workspace = true
+description = "Pretty printing utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "drbot-lz4"
+description = "LZ4 compression for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

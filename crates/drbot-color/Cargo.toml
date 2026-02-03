@@ -1,0 +1,9 @@
+[package]
+name = "drbot-color"
+version.workspace = true
+edition.workspace = true
+description = "Color utilities and terminal colors for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-bench"
+version.workspace = true
+edition.workspace = true
+description = "Benchmarking utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

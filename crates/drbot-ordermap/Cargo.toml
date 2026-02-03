@@ -1,0 +1,8 @@
+[package]
+name = "drbot-ordermap"
+version.workspace = true
+edition.workspace = true
+description = "Ordered map (insertion order) for drbot"
+
+[dependencies]
+thiserror.workspace = true

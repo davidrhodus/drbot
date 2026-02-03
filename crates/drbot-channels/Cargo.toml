@@ -1,0 +1,13 @@
+[package]
+name = "drbot-channels"
+version.workspace = true
+edition.workspace = true
+description = "Channel abstraction layer for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

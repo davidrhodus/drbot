@@ -1,0 +1,10 @@
+[package]
+name = "drbot-template"
+version.workspace = true
+edition.workspace = true
+description = "Simple template engine for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+regex.workspace = true

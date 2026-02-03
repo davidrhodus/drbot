@@ -1,0 +1,11 @@
+[package]
+name = "drbot-assertion"
+version.workspace = true
+edition.workspace = true
+description = "Assertion and invariant checking for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

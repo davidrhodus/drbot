@@ -1,0 +1,8 @@
+[package]
+name = "drbot-invariant"
+version.workspace = true
+edition.workspace = true
+description = "Invariant checking for drbot"
+
+[dependencies]
+thiserror.workspace = true

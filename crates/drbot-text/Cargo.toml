@@ -1,0 +1,9 @@
+[package]
+name = "drbot-text"
+version.workspace = true
+edition.workspace = true
+description = "Text manipulation utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "drbot-router"
+version.workspace = true
+edition.workspace = true
+description = "Multi-model routing and orchestration for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

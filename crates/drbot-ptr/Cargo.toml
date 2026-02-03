@@ -1,0 +1,8 @@
+[package]
+name = "drbot-ptr"
+version.workspace = true
+edition.workspace = true
+description = "Pointer utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "drbot-crypto"
+description = "Cryptographic utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+async-trait.workspace = true
+tokio.workspace = true

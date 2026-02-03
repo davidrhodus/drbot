@@ -1,0 +1,10 @@
+[package]
+name = "drbot-rule"
+version.workspace = true
+edition.workspace = true
+description = "Rule engine and evaluation for drbot"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

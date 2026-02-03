@@ -1,0 +1,8 @@
+[package]
+name = "drbot-duplicate"
+version.workspace = true
+edition.workspace = true
+description = "Duplication utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

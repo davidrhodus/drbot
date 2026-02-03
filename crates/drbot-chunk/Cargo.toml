@@ -1,0 +1,8 @@
+[package]
+name = "drbot-chunk"
+version.workspace = true
+edition.workspace = true
+description = "Chunking utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "drbot-googlechat"
+version.workspace = true
+edition.workspace = true
+description = "Google Chat channel integration for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-channels.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+jsonwebtoken.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

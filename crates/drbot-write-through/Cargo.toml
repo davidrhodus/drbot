@@ -1,0 +1,8 @@
+[package]
+name = "drbot-write-through"
+version.workspace = true
+edition.workspace = true
+description = "Write-through cache pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

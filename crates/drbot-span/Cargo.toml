@@ -1,0 +1,10 @@
+[package]
+name = "drbot-span"
+version.workspace = true
+edition.workspace = true
+description = "Span and scope tracking for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true

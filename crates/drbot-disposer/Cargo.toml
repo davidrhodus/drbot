@@ -1,0 +1,8 @@
+[package]
+name = "drbot-disposer"
+version.workspace = true
+edition.workspace = true
+description = "Resource disposal for drbot"
+
+[dependencies]
+thiserror.workspace = true

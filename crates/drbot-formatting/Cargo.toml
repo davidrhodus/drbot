@@ -1,0 +1,10 @@
+[package]
+name = "drbot-formatting"
+description = "Text and data formatting for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+chrono.workspace = true

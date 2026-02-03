@@ -1,0 +1,8 @@
+[package]
+name = "drbot-try-catch"
+version.workspace = true
+edition.workspace = true
+description = "Try/catch style error handling for drbot"
+
+[dependencies]
+thiserror.workspace = true

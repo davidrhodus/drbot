@@ -1,0 +1,8 @@
+[package]
+name = "drbot-signal-slot"
+version.workspace = true
+edition.workspace = true
+description = "Signal-slot pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-replica"
+version.workspace = true
+edition.workspace = true
+description = "Replica and copy management for drbot"
+
+[dependencies]
+thiserror.workspace = true

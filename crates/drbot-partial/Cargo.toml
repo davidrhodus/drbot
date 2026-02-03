@@ -1,0 +1,8 @@
+[package]
+name = "drbot-partial"
+version.workspace = true
+edition.workspace = true
+description = "Partial application utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

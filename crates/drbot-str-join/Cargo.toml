@@ -1,0 +1,8 @@
+[package]
+name = "drbot-str-join"
+version.workspace = true
+edition.workspace = true
+description = "String joining utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

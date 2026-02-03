@@ -1,0 +1,11 @@
+[package]
+name = "drbot-async-barrier"
+description = "Async barrier for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

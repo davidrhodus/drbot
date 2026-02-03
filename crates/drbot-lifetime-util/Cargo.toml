@@ -1,0 +1,8 @@
+[package]
+name = "drbot-lifetime-util"
+version.workspace = true
+edition.workspace = true
+description = "Lifetime utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

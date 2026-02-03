@@ -1,0 +1,12 @@
+[package]
+name = "drbot-message"
+version.workspace = true
+edition.workspace = true
+description = "Message types and utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true

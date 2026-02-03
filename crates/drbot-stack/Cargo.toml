@@ -1,0 +1,11 @@
+[package]
+name = "drbot-stack"
+version.workspace = true
+edition.workspace = true
+description = "Stack implementations for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

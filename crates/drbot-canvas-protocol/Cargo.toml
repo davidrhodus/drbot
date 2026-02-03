@@ -1,0 +1,18 @@
+[package]
+name = "drbot-canvas-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Canvas wire protocol definitions for drbot"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

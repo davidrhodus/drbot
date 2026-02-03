@@ -1,0 +1,8 @@
+[package]
+name = "drbot-mock"
+version.workspace = true
+edition.workspace = true
+description = "Mocking utilities for drbot testing"
+
+[dependencies]
+thiserror.workspace = true

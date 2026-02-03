@@ -1,0 +1,22 @@
+[package]
+name = "drbot-screen"
+version.workspace = true
+edition.workspace = true
+description = "Screen context reading for drbot using accessibility APIs"
+
+[dependencies]
+drbot-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+image.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"

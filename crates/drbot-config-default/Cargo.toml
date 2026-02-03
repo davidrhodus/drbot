@@ -1,0 +1,8 @@
+[package]
+name = "drbot-config-default"
+version.workspace = true
+edition.workspace = true
+description = "Default configuration handling for drbot"
+
+[dependencies]
+thiserror.workspace = true

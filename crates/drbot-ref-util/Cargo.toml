@@ -1,0 +1,8 @@
+[package]
+name = "drbot-ref-util"
+version.workspace = true
+edition.workspace = true
+description = "Reference utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

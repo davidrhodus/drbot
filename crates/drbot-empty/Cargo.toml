@@ -1,0 +1,8 @@
+[package]
+name = "drbot-empty"
+version.workspace = true
+edition.workspace = true
+description = "Empty value utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

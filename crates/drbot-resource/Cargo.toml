@@ -1,0 +1,10 @@
+[package]
+name = "drbot-resource"
+version.workspace = true
+edition.workspace = true
+description = "Resource management utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

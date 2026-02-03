@@ -1,0 +1,12 @@
+[package]
+name = "drbot-toml-util"
+version.workspace = true
+edition.workspace = true
+description = "TOML utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

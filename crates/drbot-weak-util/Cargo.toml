@@ -1,0 +1,8 @@
+[package]
+name = "drbot-weak-util"
+version.workspace = true
+edition.workspace = true
+description = "Weak reference utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-release"
+version.workspace = true
+edition.workspace = true
+description = "Resource release utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

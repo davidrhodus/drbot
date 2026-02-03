@@ -1,0 +1,8 @@
+[package]
+name = "drbot-cow"
+version.workspace = true
+edition.workspace = true
+description = "Copy-on-write utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

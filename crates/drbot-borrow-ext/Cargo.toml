@@ -1,0 +1,11 @@
+[package]
+name = "drbot-borrow-ext"
+version.workspace = true
+edition.workspace = true
+description = "Borrow trait extensions for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

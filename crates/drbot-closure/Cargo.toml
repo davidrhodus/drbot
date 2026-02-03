@@ -1,0 +1,8 @@
+[package]
+name = "drbot-closure"
+version.workspace = true
+edition.workspace = true
+description = "Closure utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

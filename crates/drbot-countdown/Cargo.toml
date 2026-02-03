@@ -1,0 +1,9 @@
+[package]
+name = "drbot-countdown"
+version.workspace = true
+edition.workspace = true
+description = "Countdown and deadline utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true

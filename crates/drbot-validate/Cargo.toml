@@ -1,0 +1,8 @@
+[package]
+name = "drbot-validate"
+version.workspace = true
+edition.workspace = true
+description = "Input validation for drbot"
+
+[dependencies]
+thiserror.workspace = true

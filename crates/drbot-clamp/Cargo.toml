@@ -1,0 +1,11 @@
+[package]
+name = "drbot-clamp"
+version.workspace = true
+edition.workspace = true
+description = "Clamping utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

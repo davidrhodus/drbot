@@ -1,0 +1,8 @@
+[package]
+name = "drbot-pipe-fn"
+version.workspace = true
+edition.workspace = true
+description = "Function piping utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

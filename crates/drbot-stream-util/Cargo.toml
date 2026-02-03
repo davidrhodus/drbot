@@ -1,0 +1,8 @@
+[package]
+name = "drbot-stream-util"
+version.workspace = true
+edition.workspace = true
+description = "Stream processing utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

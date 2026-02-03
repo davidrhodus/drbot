@@ -1,0 +1,8 @@
+[package]
+name = "drbot-tokenizer"
+version.workspace = true
+edition.workspace = true
+description = "Tokenization utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

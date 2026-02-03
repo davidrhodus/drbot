@@ -1,0 +1,8 @@
+[package]
+name = "drbot-slice-util"
+version.workspace = true
+edition.workspace = true
+description = "Slice utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

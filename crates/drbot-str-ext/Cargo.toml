@@ -1,0 +1,8 @@
+[package]
+name = "drbot-str-ext"
+version.workspace = true
+edition.workspace = true
+description = "String slice extensions for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "drbot-selfcorrect"
+version.workspace = true
+edition.workspace = true
+description = "Self-correction loop for drbot - AI detects and fixes its own mistakes"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

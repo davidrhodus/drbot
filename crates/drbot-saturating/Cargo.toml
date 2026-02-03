@@ -1,0 +1,8 @@
+[package]
+name = "drbot-saturating"
+version.workspace = true
+edition.workspace = true
+description = "Saturating arithmetic utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

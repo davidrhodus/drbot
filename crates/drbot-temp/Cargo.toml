@@ -1,0 +1,10 @@
+[package]
+name = "drbot-temp"
+description = "Temporary file/directory utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

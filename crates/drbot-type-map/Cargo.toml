@@ -1,0 +1,8 @@
+[package]
+name = "drbot-type-map"
+version.workspace = true
+edition.workspace = true
+description = "Type-keyed map for drbot"
+
+[dependencies]
+thiserror.workspace = true

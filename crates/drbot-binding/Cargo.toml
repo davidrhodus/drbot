@@ -1,0 +1,8 @@
+[package]
+name = "drbot-binding"
+version.workspace = true
+edition.workspace = true
+description = "Data binding utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

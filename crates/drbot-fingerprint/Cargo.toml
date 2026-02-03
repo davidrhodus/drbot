@@ -1,0 +1,8 @@
+[package]
+name = "drbot-fingerprint"
+version.workspace = true
+edition.workspace = true
+description = "Content fingerprinting for drbot"
+
+[dependencies]
+thiserror.workspace = true

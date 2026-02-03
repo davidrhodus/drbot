@@ -1,0 +1,8 @@
+[package]
+name = "drbot-config-validate"
+version.workspace = true
+edition.workspace = true
+description = "Configuration validation utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

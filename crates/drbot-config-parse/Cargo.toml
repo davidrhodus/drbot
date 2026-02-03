@@ -1,0 +1,8 @@
+[package]
+name = "drbot-config-parse"
+version.workspace = true
+edition.workspace = true
+description = "Configuration parsing utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

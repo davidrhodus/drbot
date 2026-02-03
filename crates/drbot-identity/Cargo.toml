@@ -1,0 +1,8 @@
+[package]
+name = "drbot-identity"
+version.workspace = true
+edition.workspace = true
+description = "Identity and equality utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-expiremap"
+version.workspace = true
+edition.workspace = true
+description = "Map with expiring entries for drbot"
+
+[dependencies]
+thiserror.workspace = true

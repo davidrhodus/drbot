@@ -1,0 +1,8 @@
+[package]
+name = "drbot-retry"
+version.workspace = true
+edition.workspace = true
+description = "Retry logic with backoff for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-type-name"
+version.workspace = true
+edition.workspace = true
+description = "Type name utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

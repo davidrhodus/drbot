@@ -1,0 +1,9 @@
+[package]
+name = "drbot-ticker"
+version.workspace = true
+edition.workspace = true
+description = "Ticker and periodic execution for drbot"
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

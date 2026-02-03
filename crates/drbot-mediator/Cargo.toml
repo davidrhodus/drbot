@@ -1,0 +1,8 @@
+[package]
+name = "drbot-mediator"
+version.workspace = true
+edition.workspace = true
+description = "Mediator pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

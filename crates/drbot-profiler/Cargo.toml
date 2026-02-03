@@ -1,0 +1,10 @@
+[package]
+name = "drbot-profiler"
+version.workspace = true
+edition.workspace = true
+description = "Performance profiling utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true

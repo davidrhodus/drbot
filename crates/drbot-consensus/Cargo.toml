@@ -1,0 +1,20 @@
+[package]
+name = "drbot-consensus"
+version.workspace = true
+edition.workspace = true
+description = "Multi-model consensus and voting for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+futures.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

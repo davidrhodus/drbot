@@ -1,0 +1,8 @@
+[package]
+name = "drbot-rc"
+version.workspace = true
+edition.workspace = true
+description = "Reference counting utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

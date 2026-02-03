@@ -1,0 +1,8 @@
+[package]
+name = "drbot-constraint"
+version.workspace = true
+edition.workspace = true
+description = "Constraint satisfaction and validation for drbot"
+
+[dependencies]
+thiserror.workspace = true

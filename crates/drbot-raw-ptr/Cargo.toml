@@ -1,0 +1,8 @@
+[package]
+name = "drbot-raw-ptr"
+version.workspace = true
+edition.workspace = true
+description = "Raw pointer utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

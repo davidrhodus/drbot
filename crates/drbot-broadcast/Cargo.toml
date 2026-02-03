@@ -1,0 +1,10 @@
+[package]
+name = "drbot-broadcast"
+version.workspace = true
+edition.workspace = true
+description = "Broadcast channel utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

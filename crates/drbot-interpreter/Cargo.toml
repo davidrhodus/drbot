@@ -1,0 +1,8 @@
+[package]
+name = "drbot-interpreter"
+version.workspace = true
+edition.workspace = true
+description = "Interpreter pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

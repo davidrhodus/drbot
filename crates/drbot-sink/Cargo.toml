@@ -1,0 +1,8 @@
+[package]
+name = "drbot-sink"
+version.workspace = true
+edition.workspace = true
+description = "Sink utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

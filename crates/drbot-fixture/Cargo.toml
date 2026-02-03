@@ -1,0 +1,8 @@
+[package]
+name = "drbot-fixture"
+version.workspace = true
+edition.workspace = true
+description = "Test fixture utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "drbot-slot"
+version.workspace = true
+edition.workspace = true
+description = "Signal/slot pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

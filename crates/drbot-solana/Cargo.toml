@@ -1,0 +1,64 @@
+[package]
+name = "drbot-solana"
+version = "0.1.0"
+edition = "2021"
+description = "Solana blockchain integration for drbot"
+license = "MIT"
+authors = ["drbot contributors"]
+repository = "https://github.com/drbot/drbot"
+keywords = ["solana", "blockchain", "defi", "trading"]
+categories = ["cryptocurrency"]
+
+[[bin]]
+name = "solana-agent"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "solana-agent-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-tools.workspace = true
+drbot-skills.workspace = true
+drbot-plugins.workspace = true
+drbot-http-client.workspace = true
+drbot-secrets.workspace = true
+drbot-a2a.workspace = true
+drbot-otc-escrow-program.workspace = true
+
+# Solana dependencies
+solana-sdk.workspace = true
+solana-client.workspace = true
+spl-token.workspace = true
+spl-associated-token-account.workspace = true
+bs58.workspace = true
+base64.workspace = true
+bincode.workspace = true
+lazy_static.workspace = true
+borsh = "1.5"
+
+# Common dependencies
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+async-trait.workspace = true
+tracing.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["json"] }
+uuid = { workspace = true, features = ["v4"] }
+rand = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+solana-account-decoder = "2"
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3.14"
+drbot-a2a-p2p.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = []

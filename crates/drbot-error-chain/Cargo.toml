@@ -1,0 +1,8 @@
+[package]
+name = "drbot-error-chain"
+version.workspace = true
+edition.workspace = true
+description = "Error chaining and wrapping for drbot"
+
+[dependencies]
+thiserror.workspace = true

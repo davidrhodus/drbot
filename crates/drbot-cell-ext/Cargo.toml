@@ -1,0 +1,8 @@
+[package]
+name = "drbot-cell-ext"
+version.workspace = true
+edition.workspace = true
+description = "Cell type extensions for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "drbot-event-bus"
+version.workspace = true
+edition.workspace = true
+description = "In-process event bus for drbot"
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

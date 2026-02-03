@@ -1,0 +1,8 @@
+[package]
+name = "drbot-command"
+version.workspace = true
+edition.workspace = true
+description = "Command pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

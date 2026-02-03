@@ -1,0 +1,11 @@
+[package]
+name = "drbot-password"
+description = "Password hashing and validation for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ring.workspace = true

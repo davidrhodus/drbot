@@ -1,0 +1,8 @@
+[package]
+name = "drbot-thread-safe"
+version.workspace = true
+edition.workspace = true
+description = "Thread-safety utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

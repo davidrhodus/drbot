@@ -1,0 +1,9 @@
+[package]
+name = "drbot-mime"
+version.workspace = true
+edition.workspace = true
+description = "MIME type handling for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

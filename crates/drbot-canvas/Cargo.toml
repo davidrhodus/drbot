@@ -1,0 +1,23 @@
+[package]
+name = "drbot-canvas"
+version.workspace = true
+edition.workspace = true
+description = "Visual canvas/A2UI system for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-canvas-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

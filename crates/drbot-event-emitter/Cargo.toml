@@ -1,0 +1,8 @@
+[package]
+name = "drbot-event-emitter"
+version.workspace = true
+edition.workspace = true
+description = "Event emitter pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

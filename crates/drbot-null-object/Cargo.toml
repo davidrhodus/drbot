@@ -1,0 +1,8 @@
+[package]
+name = "drbot-null-object"
+version.workspace = true
+edition.workspace = true
+description = "Null object pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

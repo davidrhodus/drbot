@@ -1,0 +1,10 @@
+[package]
+name = "drbot-dns"
+description = "DNS utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true

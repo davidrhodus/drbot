@@ -1,0 +1,8 @@
+[package]
+name = "drbot-tree"
+version.workspace = true
+edition.workspace = true
+description = "Generic tree data structure for drbot"
+
+[dependencies]
+thiserror.workspace = true

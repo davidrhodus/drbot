@@ -1,0 +1,572 @@
+name: Kani Verification
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/drbot-kani/**'
+      - 'crates/drbot-core/src/**'
+      - 'crates/drbot-memory/src/**'
+      - 'crates/drbot-state-machine/src/**'
+      - 'crates/drbot-circuit/src/**'
+      - 'crates/drbot-rate-limit/src/**'
+      - 'crates/drbot-router/src/**'
+      - 'crates/drbot-consensus/src/**'
+      - 'crates/drbot-leader/src/**'
+      - 'crates/drbot-saga/src/**'
+      - 'crates/drbot-event-sourcing/src/**'
+      - 'crates/drbot-lock/src/**'
+      - 'crates/drbot-retry-strategy/src/**'
+      - 'crates/drbot-bloom/src/**'
+      - 'crates/drbot-ringbuf/src/**'
+      - 'crates/drbot-throttle/src/**'
+      - 'crates/drbot-lru/src/**'
+      - 'crates/drbot-heap/src/**'
+      - 'crates/drbot-checksum/src/**'
+      - 'crates/drbot-bitset/src/**'
+      - 'crates/drbot-histogram/src/**'
+      - 'crates/drbot-percentile/src/**'
+      - 'crates/drbot-backpressure/src/**'
+      - 'crates/drbot-id/src/**'
+      - 'crates/drbot-idempotency/src/**'
+      - 'crates/drbot-deque/src/**'
+      - 'crates/drbot-pqueue/src/**'
+      - 'crates/drbot-semver/src/**'
+      - 'crates/drbot-interval/src/**'
+      - 'crates/drbot-trie/src/**'
+      - 'crates/drbot-bimap/src/**'
+      - 'crates/drbot-dag/src/**'
+      - 'crates/drbot-stack/src/**'
+      - 'crates/drbot-multimap/src/**'
+      - 'crates/drbot-avl/src/**'
+      - 'crates/drbot-bounded/src/**'
+      - 'crates/drbot-vec-ext/src/**'
+      - 'crates/drbot-result-ext/src/**'
+      - 'crates/drbot-array-util/src/**'
+      - 'crates/drbot-either/src/**'
+      - 'crates/drbot-triple/src/**'
+      - 'crates/drbot-clamp/src/**'
+      - 'crates/drbot-convert/src/**'
+      - 'crates/drbot-base64-util/src/**'
+      - 'crates/drbot-borrow-ext/src/**'
+      - 'crates/drbot-box-ext/src/**'
+      - 'crates/drbot-assertion/src/**'
+      - 'crates/drbot-assume/src/**'
+      - 'crates/drbot-any-ext/src/**'
+      - 'crates/drbot-cmp/src/**'
+      - 'crates/drbot-default-ext/src/**'
+      - 'crates/drbot-fn-util/src/**'
+      - 'crates/drbot-math/src/**'
+      - 'crates/drbot-ord-ext/src/**'
+      - 'crates/drbot-lazy/src/**'
+      - 'crates/drbot-guard/src/**'
+      - 'crates/drbot-slot/src/**'
+      - 'crates/drbot-unit/src/**'
+      - 'crates/drbot-builder/src/**'
+      - 'crates/drbot-arc/src/**'
+      - 'crates/drbot-cast/src/**'
+      - 'crates/drbot-atomic-ext/src/**'
+      - 'crates/drbot-buffer/src/**'
+      - 'crates/drbot-checked/src/**'
+  pull_request:
+    paths:
+      - 'crates/drbot-kani/**'
+      - 'crates/drbot-core/src/**'
+      - 'crates/drbot-memory/src/**'
+      - 'crates/drbot-state-machine/src/**'
+      - 'crates/drbot-circuit/src/**'
+      - 'crates/drbot-rate-limit/src/**'
+      - 'crates/drbot-router/src/**'
+      - 'crates/drbot-consensus/src/**'
+      - 'crates/drbot-leader/src/**'
+      - 'crates/drbot-saga/src/**'
+      - 'crates/drbot-event-sourcing/src/**'
+      - 'crates/drbot-lock/src/**'
+      - 'crates/drbot-retry-strategy/src/**'
+      - 'crates/drbot-bloom/src/**'
+      - 'crates/drbot-ringbuf/src/**'
+      - 'crates/drbot-throttle/src/**'
+      - 'crates/drbot-lru/src/**'
+      - 'crates/drbot-heap/src/**'
+      - 'crates/drbot-checksum/src/**'
+      - 'crates/drbot-bitset/src/**'
+      - 'crates/drbot-histogram/src/**'
+      - 'crates/drbot-percentile/src/**'
+      - 'crates/drbot-backpressure/src/**'
+      - 'crates/drbot-id/src/**'
+      - 'crates/drbot-idempotency/src/**'
+      - 'crates/drbot-deque/src/**'
+      - 'crates/drbot-pqueue/src/**'
+      - 'crates/drbot-semver/src/**'
+      - 'crates/drbot-interval/src/**'
+      - 'crates/drbot-trie/src/**'
+      - 'crates/drbot-bimap/src/**'
+      - 'crates/drbot-dag/src/**'
+      - 'crates/drbot-stack/src/**'
+      - 'crates/drbot-multimap/src/**'
+      - 'crates/drbot-avl/src/**'
+      - 'crates/drbot-bounded/src/**'
+      - 'crates/drbot-vec-ext/src/**'
+      - 'crates/drbot-result-ext/src/**'
+      - 'crates/drbot-array-util/src/**'
+      - 'crates/drbot-either/src/**'
+      - 'crates/drbot-triple/src/**'
+      - 'crates/drbot-clamp/src/**'
+      - 'crates/drbot-convert/src/**'
+      - 'crates/drbot-base64-util/src/**'
+      - 'crates/drbot-borrow-ext/src/**'
+      - 'crates/drbot-box-ext/src/**'
+      - 'crates/drbot-assertion/src/**'
+      - 'crates/drbot-assume/src/**'
+      - 'crates/drbot-any-ext/src/**'
+      - 'crates/drbot-cmp/src/**'
+      - 'crates/drbot-default-ext/src/**'
+      - 'crates/drbot-fn-util/src/**'
+      - 'crates/drbot-math/src/**'
+      - 'crates/drbot-ord-ext/src/**'
+      - 'crates/drbot-lazy/src/**'
+      - 'crates/drbot-guard/src/**'
+      - 'crates/drbot-slot/src/**'
+      - 'crates/drbot-unit/src/**'
+      - 'crates/drbot-builder/src/**'
+      - 'crates/drbot-arc/src/**'
+      - 'crates/drbot-cast/src/**'
+      - 'crates/drbot-atomic-ext/src/**'
+      - 'crates/drbot-buffer/src/**'
+      - 'crates/drbot-checked/src/**'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kani-verification:
+    name: Kani Proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+
+      - name: Install Kani
+        uses: model-checking/kani-github-action@v1.1
+
+      - name: Cache Kani
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/kani*
+            ~/.cargo/bin/cargo-kani
+          key: kani-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Verify drbot-kani (standalone proofs)
+        run: cargo kani --package drbot-kani
+        continue-on-error: false
+
+      - name: Verify drbot-core
+        run: cargo kani --package drbot-core
+        continue-on-error: false
+
+      - name: Verify drbot-memory
+        run: cargo kani --package drbot-memory
+        continue-on-error: false
+
+      - name: Verify drbot-state-machine
+        run: cargo kani --package drbot-state-machine
+        continue-on-error: false
+
+      - name: Verify drbot-circuit
+        run: cargo kani --package drbot-circuit
+        continue-on-error: false
+
+      - name: Verify drbot-rate-limit
+        run: cargo kani --package drbot-rate-limit
+        continue-on-error: false
+
+      - name: Verify drbot-router
+        run: cargo kani --package drbot-router
+        continue-on-error: false
+
+      - name: Verify drbot-consensus
+        run: cargo kani --package drbot-consensus
+        continue-on-error: false
+
+      - name: Verify drbot-leader
+        run: cargo kani --package drbot-leader
+        continue-on-error: false
+
+      - name: Verify drbot-saga
+        run: cargo kani --package drbot-saga
+        continue-on-error: false
+
+      - name: Verify drbot-event-sourcing
+        run: cargo kani --package drbot-event-sourcing
+        continue-on-error: false
+
+      - name: Verify drbot-lock
+        run: cargo kani --package drbot-lock
+        continue-on-error: false
+
+      - name: Verify drbot-retry-strategy
+        run: cargo kani --package drbot-retry-strategy
+        continue-on-error: false
+
+      - name: Verify drbot-bloom
+        run: cargo kani --package drbot-bloom
+        continue-on-error: false
+
+      - name: Verify drbot-ringbuf
+        run: cargo kani --package drbot-ringbuf
+        continue-on-error: false
+
+      - name: Verify drbot-throttle
+        run: cargo kani --package drbot-throttle
+        continue-on-error: false
+
+      - name: Verify drbot-lru
+        run: cargo kani --package drbot-lru
+        continue-on-error: false
+
+      - name: Verify drbot-heap
+        run: cargo kani --package drbot-heap
+        continue-on-error: false
+
+      - name: Verify drbot-checksum
+        run: cargo kani --package drbot-checksum
+        continue-on-error: false
+
+      - name: Verify drbot-bitset
+        run: cargo kani --package drbot-bitset
+        continue-on-error: false
+
+      - name: Verify drbot-histogram
+        run: cargo kani --package drbot-histogram
+        continue-on-error: false
+
+      - name: Verify drbot-percentile
+        run: cargo kani --package drbot-percentile
+        continue-on-error: false
+
+      - name: Verify drbot-backpressure
+        run: cargo kani --package drbot-backpressure
+        continue-on-error: false
+
+      - name: Verify drbot-id
+        run: cargo kani --package drbot-id
+        continue-on-error: false
+
+      - name: Verify drbot-idempotency
+        run: cargo kani --package drbot-idempotency
+        continue-on-error: false
+
+      - name: Verify drbot-deque
+        run: cargo kani --package drbot-deque
+        continue-on-error: false
+
+      - name: Verify drbot-pqueue
+        run: cargo kani --package drbot-pqueue
+        continue-on-error: false
+
+      - name: Verify drbot-semver
+        run: cargo kani --package drbot-semver
+        continue-on-error: false
+
+      - name: Verify drbot-interval
+        run: cargo kani --package drbot-interval
+        continue-on-error: false
+
+      - name: Verify drbot-trie
+        run: cargo kani --package drbot-trie
+        continue-on-error: false
+
+      - name: Verify drbot-bimap
+        run: cargo kani --package drbot-bimap
+        continue-on-error: false
+
+      - name: Verify drbot-dag
+        run: cargo kani --package drbot-dag
+        continue-on-error: false
+
+      - name: Verify drbot-stack
+        run: cargo kani --package drbot-stack
+        continue-on-error: false
+
+      - name: Verify drbot-multimap
+        run: cargo kani --package drbot-multimap
+        continue-on-error: false
+
+      - name: Verify drbot-avl
+        run: cargo kani --package drbot-avl
+        continue-on-error: false
+
+      - name: Verify drbot-bounded
+        run: cargo kani --package drbot-bounded
+        continue-on-error: false
+
+      - name: Verify drbot-vec-ext
+        run: cargo kani --package drbot-vec-ext
+        continue-on-error: false
+
+      - name: Verify drbot-result-ext
+        run: cargo kani --package drbot-result-ext
+        continue-on-error: false
+
+      - name: Verify drbot-array-util
+        run: cargo kani --package drbot-array-util
+        continue-on-error: false
+
+      - name: Verify drbot-either
+        run: cargo kani --package drbot-either
+        continue-on-error: false
+
+      - name: Verify drbot-triple
+        run: cargo kani --package drbot-triple
+        continue-on-error: false
+
+      - name: Verify drbot-clamp
+        run: cargo kani --package drbot-clamp
+        continue-on-error: false
+
+      - name: Verify drbot-convert
+        run: cargo kani --package drbot-convert
+        continue-on-error: false
+
+      - name: Verify drbot-base64-util
+        run: cargo kani --package drbot-base64-util
+        continue-on-error: false
+
+      - name: Verify drbot-borrow-ext
+        run: cargo kani --package drbot-borrow-ext
+        continue-on-error: false
+
+      - name: Verify drbot-box-ext
+        run: cargo kani --package drbot-box-ext
+        continue-on-error: false
+
+      - name: Verify drbot-assertion
+        run: cargo kani --package drbot-assertion
+        continue-on-error: false
+
+      - name: Verify drbot-assume
+        run: cargo kani --package drbot-assume
+        continue-on-error: false
+
+      - name: Verify drbot-any-ext
+        run: cargo kani --package drbot-any-ext
+        continue-on-error: false
+
+      - name: Verify drbot-cmp
+        run: cargo kani --package drbot-cmp
+        continue-on-error: false
+
+      - name: Verify drbot-default-ext
+        run: cargo kani --package drbot-default-ext
+        continue-on-error: false
+
+      - name: Verify drbot-fn-util
+        run: cargo kani --package drbot-fn-util
+        continue-on-error: false
+
+      - name: Verify drbot-math
+        run: cargo kani --package drbot-math
+        continue-on-error: false
+
+      - name: Verify drbot-ord-ext
+        run: cargo kani --package drbot-ord-ext
+        continue-on-error: false
+
+      - name: Verify drbot-lazy
+        run: cargo kani --package drbot-lazy
+        continue-on-error: false
+
+      - name: Verify drbot-guard
+        run: cargo kani --package drbot-guard
+        continue-on-error: false
+
+      - name: Verify drbot-slot
+        run: cargo kani --package drbot-slot
+        continue-on-error: false
+
+      - name: Verify drbot-unit
+        run: cargo kani --package drbot-unit
+        continue-on-error: false
+
+      - name: Verify drbot-builder
+        run: cargo kani --package drbot-builder
+        continue-on-error: false
+
+      - name: Verify drbot-arc
+        run: cargo kani --package drbot-arc
+        continue-on-error: false
+
+      - name: Verify drbot-cast
+        run: cargo kani --package drbot-cast
+        continue-on-error: false
+
+      - name: Verify drbot-atomic-ext
+        run: cargo kani --package drbot-atomic-ext
+        continue-on-error: false
+
+      - name: Verify drbot-buffer
+        run: cargo kani --package drbot-buffer
+        continue-on-error: false
+
+      - name: Verify drbot-checked
+        run: cargo kani --package drbot-checked
+        continue-on-error: false
+
+  # Quick sanity check that proofs compile (runs on every PR)
+  kani-check:
+    name: Kani Compile Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+
+      - name: Check Kani crates compile
+        run: |
+          cargo check --package drbot-kani
+          cargo check --package drbot-core
+          cargo check --package drbot-memory
+          cargo check --package drbot-state-machine
+          cargo check --package drbot-circuit
+          cargo check --package drbot-rate-limit
+          cargo check --package drbot-router
+          cargo check --package drbot-consensus
+          cargo check --package drbot-leader
+          cargo check --package drbot-saga
+          cargo check --package drbot-event-sourcing
+          cargo check --package drbot-lock
+          cargo check --package drbot-retry-strategy
+          cargo check --package drbot-bloom
+          cargo check --package drbot-ringbuf
+          cargo check --package drbot-throttle
+          cargo check --package drbot-lru
+          cargo check --package drbot-heap
+          cargo check --package drbot-checksum
+          cargo check --package drbot-bitset
+          cargo check --package drbot-histogram
+          cargo check --package drbot-percentile
+          cargo check --package drbot-backpressure
+          cargo check --package drbot-id
+          cargo check --package drbot-idempotency
+          cargo check --package drbot-deque
+          cargo check --package drbot-pqueue
+          cargo check --package drbot-semver
+          cargo check --package drbot-interval
+          cargo check --package drbot-trie
+          cargo check --package drbot-bimap
+          cargo check --package drbot-dag
+          cargo check --package drbot-stack
+          cargo check --package drbot-multimap
+          cargo check --package drbot-avl
+          cargo check --package drbot-bounded
+          cargo check --package drbot-vec-ext
+          cargo check --package drbot-result-ext
+          cargo check --package drbot-array-util
+          cargo check --package drbot-either
+          cargo check --package drbot-triple
+          cargo check --package drbot-clamp
+          cargo check --package drbot-convert
+          cargo check --package drbot-base64-util
+          cargo check --package drbot-borrow-ext
+          cargo check --package drbot-box-ext
+          cargo check --package drbot-assertion
+          cargo check --package drbot-assume
+          cargo check --package drbot-any-ext
+          cargo check --package drbot-cmp
+          cargo check --package drbot-default-ext
+          cargo check --package drbot-fn-util
+          cargo check --package drbot-math
+          cargo check --package drbot-ord-ext
+          cargo check --package drbot-lazy
+          cargo check --package drbot-guard
+          cargo check --package drbot-slot
+          cargo check --package drbot-unit
+          cargo check --package drbot-builder
+          cargo check --package drbot-arc
+          cargo check --package drbot-cast
+          cargo check --package drbot-atomic-ext
+          cargo check --package drbot-buffer
+          cargo check --package drbot-checked
+
+      - name: Run unit tests
+        run: |
+          cargo test --package drbot-kani
+          cargo test --package drbot-core
+          cargo test --package drbot-memory
+          cargo test --package drbot-state-machine
+          cargo test --package drbot-circuit
+          cargo test --package drbot-rate-limit
+          cargo test --package drbot-router
+          cargo test --package drbot-consensus
+          cargo test --package drbot-leader
+          cargo test --package drbot-saga
+          cargo test --package drbot-event-sourcing
+          cargo test --package drbot-lock
+          cargo test --package drbot-retry-strategy
+          cargo test --package drbot-bloom
+          cargo test --package drbot-ringbuf
+          cargo test --package drbot-throttle
+          cargo test --package drbot-lru
+          cargo test --package drbot-heap
+          cargo test --package drbot-checksum
+          cargo test --package drbot-bitset
+          cargo test --package drbot-histogram
+          cargo test --package drbot-percentile
+          cargo test --package drbot-backpressure
+          cargo test --package drbot-id
+          cargo test --package drbot-idempotency
+          cargo test --package drbot-deque
+          cargo test --package drbot-pqueue
+          cargo test --package drbot-semver
+          cargo test --package drbot-interval
+          cargo test --package drbot-trie
+          cargo test --package drbot-bimap
+          cargo test --package drbot-dag
+          cargo test --package drbot-stack
+          cargo test --package drbot-multimap
+          cargo test --package drbot-avl
+          cargo test --package drbot-bounded
+          cargo test --package drbot-vec-ext
+          cargo test --package drbot-result-ext
+          cargo test --package drbot-array-util
+          cargo test --package drbot-either
+          cargo test --package drbot-triple
+          cargo test --package drbot-clamp
+          cargo test --package drbot-convert
+          cargo test --package drbot-base64-util
+          cargo test --package drbot-borrow-ext
+          cargo test --package drbot-box-ext
+          cargo test --package drbot-assertion
+          cargo test --package drbot-assume
+          cargo test --package drbot-any-ext
+          cargo test --package drbot-cmp
+          cargo test --package drbot-default-ext
+          cargo test --package drbot-fn-util
+          cargo test --package drbot-math
+          cargo test --package drbot-ord-ext
+          cargo test --package drbot-lazy
+          cargo test --package drbot-guard
+          cargo test --package drbot-slot
+          cargo test --package drbot-unit
+          cargo test --package drbot-builder
+          cargo test --package drbot-arc
+          cargo test --package drbot-cast
+          cargo test --package drbot-atomic-ext
+          cargo test --package drbot-buffer
+          cargo test --package drbot-checked

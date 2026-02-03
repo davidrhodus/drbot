@@ -1,0 +1,17 @@
+[package]
+name = "drbot-safety"
+version.workspace = true
+edition.workspace = true
+description = "AI safety layer with guardrails and content filtering for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+regex.workspace = true
+chrono.workspace = true

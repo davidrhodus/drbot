@@ -1,0 +1,8 @@
+[package]
+name = "drbot-btree"
+version.workspace = true
+edition.workspace = true
+description = "Binary tree for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-circuit-breaker"
+version.workspace = true
+edition.workspace = true
+description = "Circuit breaker pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

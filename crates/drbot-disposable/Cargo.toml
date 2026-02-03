@@ -1,0 +1,9 @@
+[package]
+name = "drbot-disposable"
+version.workspace = true
+edition.workspace = true
+description = "Disposable pattern utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

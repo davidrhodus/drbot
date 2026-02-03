@@ -1,0 +1,8 @@
+[package]
+name = "drbot-str-split"
+version.workspace = true
+edition.workspace = true
+description = "String splitting utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,2341 @@
+//! drbot - A personal AI assistant
+//!
+//! This is the main entry point for the drbot binary.
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use drbot_anthropic::AnthropicProvider;
+use drbot_context::{ContextConfig, ContextManager};
+use drbot_core::message::Message;
+use drbot_core::session::Session;
+use drbot_core::Config;
+use drbot_gateway::Gateway;
+use drbot_personas::{Persona, PersonaRegistry, PersonaStyle, PersonaTrait};
+use drbot_providers::{ChatOptions, Provider, StreamEvent};
+use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
+use drbot_tui::AppConfig;
+use futures::StreamExt;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
+
+#[derive(Parser)]
+#[command(name = "drbot")]
+#[command(author, version, about = "A personal AI assistant", long_about = None)]
+struct Cli {
+    /// Configuration file path
+    #[arg(short, long, global = true)]
+    config: Option<String>,
+
+    /// Enable verbose logging
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the gateway server
+    Gateway {
+        /// Host to bind to
+        #[arg(short = 'H', long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to listen on
+        #[arg(short, long, default_value = "18789")]
+        port: u16,
+    },
+
+    /// Interactive chat with AI
+    Chat {
+        /// Provider to use (anthropic, openai, ollama, auto)
+        #[arg(short, long)]
+        provider: Option<String>,
+
+        /// Model to use (e.g., claude-sonnet-4-20250514, gpt-4o)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// System prompt
+        #[arg(short, long)]
+        system: Option<String>,
+
+        /// Enable Codex-like tool use (bash, read/write files, search)
+        #[arg(long, alias = "tools")]
+        agent: bool,
+
+        /// Auto-approve tool use (use with --agent)
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Root directory for tool access (defaults to current directory)
+        #[arg(long)]
+        root: Option<String>,
+
+        /// Maximum tool/LLM back-and-forth rounds per user message
+        #[arg(long, default_value_t = 10)]
+        max_tool_rounds: usize,
+
+        /// Single message (non-interactive mode)
+        #[arg(short = 'M', long)]
+        message: Option<String>,
+
+        /// Disable streaming
+        #[arg(long)]
+        no_stream: bool,
+
+        /// Resume a specific session by ID
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Start a new session (don't resume last)
+        #[arg(long, short = 'n')]
+        new_session: bool,
+
+        /// List recent sessions
+        #[arg(long)]
+        list_sessions: bool,
+
+        /// Session title for new sessions
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Use a persona (e.g., concise, professional, creative)
+        #[arg(long)]
+        persona: Option<String>,
+
+        /// List available personas
+        #[arg(long)]
+        list_personas: bool,
+
+        /// Context window size in tokens (default: 100000)
+        #[arg(long)]
+        context_size: Option<usize>,
+    },
+
+    /// Terminal UI chat interface
+    Tui {
+        /// Provider to use (anthropic, openai, ollama)
+        #[arg(short, long)]
+        provider: Option<String>,
+
+        /// Model to use
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// System prompt
+        #[arg(short, long)]
+        system: Option<String>,
+    },
+
+    /// Manage channels
+    Channels {
+        #[command(subcommand)]
+        action: ChannelsAction,
+    },
+
+    /// Interactive setup wizard
+    Wizard,
+
+    /// Show configuration
+    Config,
+
+    /// Run health checks
+    Doctor,
+}
+
+/// Channels subcommands.
+#[derive(Subcommand)]
+enum ChannelsAction {
+    /// List configured channels
+    List,
+
+    /// Show channel status
+    Status {
+        /// Channel name
+        name: Option<String>,
+    },
+
+    /// Enable a channel
+    Enable {
+        /// Channel name
+        name: String,
+    },
+
+    /// Disable a channel
+    Disable {
+        /// Channel name
+        name: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Initialize logging
+    let log_level = if cli.verbose { "debug" } else { "info" };
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("drbot={},drbot_gateway={}", log_level, log_level).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Load configuration
+    let mut config = if let Some(path) = &cli.config {
+        Config::from_file(path)?
+    } else {
+        Config::load().unwrap_or_default()
+    };
+
+    match cli.command {
+        Some(Commands::Gateway { host, port }) => {
+            config.gateway.host = host;
+            config.gateway.port = port;
+            run_gateway(config).await
+        }
+        Some(Commands::Chat {
+            provider,
+            model,
+            system,
+            agent,
+            yes,
+            root,
+            max_tool_rounds,
+            message,
+            no_stream,
+            session,
+            new_session,
+            list_sessions,
+            title,
+            persona,
+            list_personas,
+            context_size,
+        }) => {
+            run_chat(
+                &config,
+                provider,
+                model,
+                system,
+                agent,
+                yes,
+                root,
+                max_tool_rounds,
+                message,
+                !no_stream,
+                session,
+                new_session,
+                list_sessions,
+                title,
+                persona,
+                list_personas,
+                context_size,
+            )
+            .await
+        }
+        Some(Commands::Tui {
+            provider,
+            model,
+            system,
+        }) => run_tui(&config, provider, model, system).await,
+        Some(Commands::Channels { action }) => {
+            run_channels(&config, action, cli.config.as_deref()).await
+        }
+        Some(Commands::Wizard) => run_wizard().await,
+        Some(Commands::Config) => {
+            show_config(&config);
+            Ok(())
+        }
+        Some(Commands::Doctor) => run_doctor(&config).await,
+        None => {
+            // Default: start gateway
+            run_gateway(config).await
+        }
+    }
+}
+
+async fn run_tui(
+    config: &Config,
+    provider_name: Option<String>,
+    model: Option<String>,
+    system: Option<String>,
+) -> Result<()> {
+    use drbot_tui::ProviderType;
+
+    // Determine provider type
+    let provider_name = provider_name
+        .or_else(|| config.providers.default_provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
+
+    let provider_type = ProviderType::from_str(&provider_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", provider_name))?;
+
+    // Get provider-specific config
+    let (api_key, base_url, default_model) = match provider_type {
+        ProviderType::Anthropic => {
+            let cfg = config.providers.anthropic.as_ref();
+            (
+                cfg.map(|c| c.api_key.clone()),
+                cfg.and_then(|c| c.base_url.clone()),
+                cfg.and_then(|c| c.default_model.clone()),
+            )
+        }
+        ProviderType::OpenAI => {
+            let cfg = config.providers.openai.as_ref();
+            (
+                cfg.map(|c| c.api_key.clone()),
+                cfg.and_then(|c| c.base_url.clone()),
+                cfg.and_then(|c| c.default_model.clone()),
+            )
+        }
+        ProviderType::Ollama => {
+            let cfg = config.providers.ollama.as_ref();
+            (
+                None, // Ollama doesn't need API key
+                cfg.map(|c| c.url.clone()),
+                cfg.and_then(|c| c.default_model.clone()),
+            )
+        }
+    };
+
+    let tui_config = AppConfig {
+        provider_type,
+        api_key,
+        base_url,
+        model: model.or(default_model),
+        system_prompt: system,
+        max_history: 100,
+    };
+
+    drbot_tui::run(tui_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+async fn run_gateway(config: Config) -> Result<()> {
+    info!("drbot v{} starting...", env!("CARGO_PKG_VERSION"));
+
+    let gateway = Gateway::new(config);
+
+    // Set up graceful shutdown
+    let shutdown = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C handler");
+        info!("Received shutdown signal");
+    };
+
+    gateway
+        .run_with_shutdown(shutdown)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    Ok(())
+}
+
+/// Create a provider from config.
+fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provider>> {
+    use drbot_ollama::OllamaProvider;
+    use drbot_openai::OpenAIProvider;
+
+    match provider_name {
+        "auto" => {
+            // Auto-select: prefer Anthropic > OpenAI > Ollama based on availability
+            if let Some(anthropic_config) = &config.providers.anthropic {
+                let mut p = AnthropicProvider::new(&anthropic_config.api_key);
+                if let Some(base_url) = &anthropic_config.base_url {
+                    p = p.with_base_url(base_url);
+                }
+                if let Some(default_model) = &anthropic_config.default_model {
+                    p = p.with_default_model(default_model);
+                }
+                if let Some(max_tokens) = anthropic_config.max_tokens {
+                    p = p.with_default_max_tokens(max_tokens);
+                }
+                info!("Auto-selected provider: anthropic");
+                return Ok(Arc::new(p));
+            }
+            if let Some(openai_config) = &config.providers.openai {
+                let mut p = OpenAIProvider::new(&openai_config.api_key);
+                if let Some(base_url) = &openai_config.base_url {
+                    p = p.with_base_url(base_url);
+                }
+                if let Some(default_model) = &openai_config.default_model {
+                    p = p.with_default_model(default_model);
+                }
+                info!("Auto-selected provider: openai");
+                return Ok(Arc::new(p));
+            }
+            if let Some(ollama_config) = &config.providers.ollama {
+                let mut p = OllamaProvider::new().with_base_url(&ollama_config.url);
+                if let Some(default_model) = &ollama_config.default_model {
+                    p = p.with_default_model(default_model);
+                }
+                info!("Auto-selected provider: ollama");
+                return Ok(Arc::new(p));
+            }
+            Err(anyhow::anyhow!(
+                "No providers configured. Run 'drbot wizard' to configure."
+            ))
+        }
+        "anthropic" | "claude" => {
+            let anthropic_config = config.providers.anthropic.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Anthropic provider not configured. Set ANTHROPIC_API_KEY or run 'drbot wizard'."
+                )
+            })?;
+            let mut p = AnthropicProvider::new(&anthropic_config.api_key);
+            if let Some(base_url) = &anthropic_config.base_url {
+                p = p.with_base_url(base_url);
+            }
+            if let Some(default_model) = &anthropic_config.default_model {
+                p = p.with_default_model(default_model);
+            }
+            if let Some(max_tokens) = anthropic_config.max_tokens {
+                p = p.with_default_max_tokens(max_tokens);
+            }
+            Ok(Arc::new(p))
+        }
+        "openai" | "gpt" => {
+            let openai_config = config.providers.openai.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI provider not configured. Set OPENAI_API_KEY or run 'drbot wizard'."
+                )
+            })?;
+            let mut p = OpenAIProvider::new(&openai_config.api_key);
+            if let Some(base_url) = &openai_config.base_url {
+                p = p.with_base_url(base_url);
+            }
+            if let Some(default_model) = &openai_config.default_model {
+                p = p.with_default_model(default_model);
+            }
+            Ok(Arc::new(p))
+        }
+        "ollama" | "local" => {
+            let ollama_config = config.providers.ollama.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Ollama provider not configured. Run 'drbot wizard' to configure.")
+            })?;
+            let mut p = OllamaProvider::new().with_base_url(&ollama_config.url);
+            if let Some(default_model) = &ollama_config.default_model {
+                p = p.with_default_model(default_model);
+            }
+            Ok(Arc::new(p))
+        }
+        _ => Err(anyhow::anyhow!(
+            "Unknown provider: {}. Supported: anthropic, openai, ollama, auto",
+            provider_name
+        )),
+    }
+}
+
+/// Get the session store.
+fn get_session_store(config: &Config) -> Result<SqliteSessionStore> {
+    let db_path = &config.storage.database_path;
+    SqliteSessionStore::new(db_path).map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Initialize the persona registry with built-in personas.
+fn init_persona_registry() -> PersonaRegistry {
+    let registry = PersonaRegistry::new();
+
+    // Add built-in personas
+    let concise = Persona::new("concise", "Concise Assistant")
+        .with_description("Brief, to-the-point responses")
+        .with_style(PersonaStyle::Concise)
+        .with_trait(PersonaTrait::Accurate);
+    let _ = registry.register(concise);
+
+    let professional = Persona::new("professional", "Professional Assistant")
+        .with_description("Formal, business-appropriate responses")
+        .with_style(PersonaStyle::Professional)
+        .with_trait(PersonaTrait::Accurate)
+        .with_trait(PersonaTrait::Helpful);
+    let _ = registry.register(professional);
+
+    let creative = Persona::new("creative", "Creative Assistant")
+        .with_description("Imaginative and expressive responses")
+        .with_style(PersonaStyle::Creative)
+        .with_trait(PersonaTrait::Creative);
+    let _ = registry.register(creative);
+
+    let teacher = Persona::new("teacher", "Teaching Assistant")
+        .with_description("Educational, explains concepts clearly")
+        .with_style(PersonaStyle::Educational)
+        .with_trait(PersonaTrait::Patient)
+        .with_trait(PersonaTrait::Helpful);
+    let _ = registry.register(teacher);
+
+    let technical = Persona::new("technical", "Technical Expert")
+        .with_description("Precise technical language and detailed answers")
+        .with_style(PersonaStyle::Technical)
+        .with_trait(PersonaTrait::Accurate);
+    let _ = registry.register(technical);
+
+    registry
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallSpec {
+    tool: String,
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct ToolModeConfig {
+    enabled: bool,
+    auto_approve: bool,
+    root: PathBuf,
+    max_rounds: usize,
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home.trim_end_matches('/'), rest);
+        }
+    }
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    }
+    path.to_string()
+}
+
+fn canonicalize_root(root: &Path) -> Result<PathBuf> {
+    root.canonicalize()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve root '{}': {}", root.display(), e))
+}
+
+fn resolve_path_under_root(root: &Path, path: &str, must_exist: bool) -> Result<PathBuf> {
+    let expanded = expand_tilde(path);
+    let input = Path::new(expanded.as_str());
+
+    if input.is_absolute() {
+        let canon = if must_exist {
+            input.canonicalize()
+        } else {
+            // For writes, canonicalize the parent directory.
+            let parent = input
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", input.display()))?;
+            let parent_canon = parent.canonicalize().map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to resolve parent directory '{}': {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+            let name = input
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", input.display()))?;
+            Ok(parent_canon.join(name))
+        }?;
+
+        if !canon.starts_with(root) {
+            return Err(anyhow::anyhow!(
+                "Path '{}' is outside tool root '{}'",
+                canon.display(),
+                root.display()
+            ));
+        }
+        return Ok(canon);
+    }
+
+    let joined = root.join(input);
+    if must_exist {
+        let canon = joined
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("Failed to resolve path '{}': {}", joined.display(), e))?;
+        if !canon.starts_with(root) {
+            return Err(anyhow::anyhow!(
+                "Path '{}' is outside tool root '{}'",
+                canon.display(),
+                root.display()
+            ));
+        }
+        return Ok(canon);
+    }
+
+    // For writes, canonicalize parent directory (must exist).
+    let parent = joined
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", joined.display()))?;
+    let parent_canon = parent.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to resolve parent directory '{}': {}",
+            parent.display(),
+            e
+        )
+    })?;
+    if !parent_canon.starts_with(root) {
+        return Err(anyhow::anyhow!(
+            "Path '{}' is outside tool root '{}'",
+            parent_canon.display(),
+            root.display()
+        ));
+    }
+    let name = joined
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", joined.display()))?;
+    Ok(parent_canon.join(name))
+}
+
+fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
+    let mut s = base.unwrap_or_else(|| "You are drbot, a helpful AI assistant.".to_string());
+    s.push_str("\n\n");
+    s.push_str("You are operating in a terminal with access to local tools.\n");
+    s.push_str("When you need to run a tool, respond ONLY with a fenced code block with language drbot_tool containing JSON.\n");
+    s.push_str("The JSON must be either a single object or an array of objects in this form:\n");
+    s.push_str("{\"tool\":\"bash\",\"args\":{\"command\":\"git status\"}}\n");
+    s.push_str("\nAvailable tools:\n");
+    s.push_str("- bash: Run a shell command in the tool root.\n");
+    s.push_str("  args: { \"command\": string }\n");
+    s.push_str("- read_file: Read a UTF-8 text file under the tool root.\n");
+    s.push_str("  args: { \"path\": string }\n");
+    s.push_str("- write_file: Write/replace a UTF-8 text file under the tool root.\n");
+    s.push_str("  args: { \"path\": string, \"content\": string }\n");
+    s.push_str("- list_dir: List a directory under the tool root.\n");
+    s.push_str("  args: { \"path\": string }\n");
+    s.push_str("- search: Search for a pattern under a path (uses ripgrep when available).\n");
+    s.push_str("  args: { \"pattern\": string, \"path\": string }\n");
+    s.push_str("\nRules:\n");
+    s.push_str("- Use relative paths unless absolutely necessary.\n");
+    s.push_str("- Prefer safe, read-only commands (git status/diff, rg, cargo test, etc.).\n");
+    s.push_str("- After a tool runs, you will receive a message starting with [Tool Result] or [Tool Denied]. Use it to continue.\n");
+    s.push_str(&format!("\nTool root: {}\n", tool_root.display()));
+    s
+}
+
+fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
+    let mut calls = Vec::new();
+    let mut in_block = false;
+    let mut block = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_block {
+            if trimmed.starts_with("```drbot_tool") {
+                in_block = true;
+                block.clear();
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("```") {
+            // End block -> parse
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&block) {
+                match value {
+                    serde_json::Value::Array(items) => {
+                        for item in items {
+                            if let Some(call) = parse_tool_call_value(&item) {
+                                calls.push(call);
+                            }
+                        }
+                    }
+                    other => {
+                        if let Some(call) = parse_tool_call_value(&other) {
+                            calls.push(call);
+                        }
+                    }
+                }
+            }
+            in_block = false;
+            block.clear();
+            continue;
+        }
+
+        block.push_str(line);
+        block.push('\n');
+    }
+
+    calls
+}
+
+fn parse_tool_call_value(value: &serde_json::Value) -> Option<ToolCallSpec> {
+    let tool = value.get("tool")?.as_str()?.to_string();
+    let args = value
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some(ToolCallSpec { tool, args })
+}
+
+fn prompt_approve(prompt: &str) -> Result<bool> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let ans = input.trim().to_lowercase();
+    Ok(ans == "y" || ans == "yes")
+}
+
+fn bash_command_is_safe_for_auto_approve(command: &str) -> bool {
+    const SAFE_PREFIXES: &[&str] = &[
+        "git", "cargo", "rg", "ls", "cat", "sed", "grep", "find", "head", "tail", "wc", "sort",
+        "uniq", "pwd", "echo",
+    ];
+
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+
+    // Extremely conservative: block clearly destructive patterns.
+    let lowered = cmd.to_lowercase();
+    let forbidden = [
+        "sudo", " rm ", "rm -", " rm\t", "mkfs", "dd ", "shutdown", "reboot",
+    ];
+    if forbidden.iter().any(|f| lowered.contains(f))
+        || lowered.starts_with("rm ")
+        || lowered == "rm"
+    {
+        return false;
+    }
+
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    SAFE_PREFIXES.contains(&first)
+}
+
+fn truncate_for_context(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars).collect();
+    format!("{}...\n[truncated]", truncated)
+}
+
+async fn run_bash_tool(root: &Path, command: &str) -> Result<(String, bool)> {
+    use tokio::process::Command;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        Command::new("bash")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(root)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("bash tool timed out"))?
+    .map_err(|e| anyhow::anyhow!("Failed to run bash tool: {}", e))?;
+
+    let code = output.status.code().unwrap_or(-1);
+    let is_error = code != 0;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let mut out = String::new();
+    out.push_str(&format!("exit_code: {}\n", code));
+    if !stdout.trim().is_empty() {
+        out.push_str("stdout:\n");
+        out.push_str(&stdout);
+        if !stdout.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !stderr.trim().is_empty() {
+        out.push_str("stderr:\n");
+        out.push_str(&stderr);
+        if !stderr.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    Ok((truncate_for_context(out.trim_end(), 40_000), is_error))
+}
+
+async fn run_read_file_tool(root: &Path, path: &str) -> Result<String> {
+    let file = resolve_path_under_root(root, path, true)?;
+    let bytes = tokio::fs::read(&file)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", file.display(), e))?;
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    Ok(truncate_for_context(&text, 120_000))
+}
+
+async fn run_write_file_tool(root: &Path, path: &str, content: &str) -> Result<String> {
+    let file = resolve_path_under_root(root, path, false)?;
+    tokio::fs::write(&file, content)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", file.display(), e))?;
+    Ok(format!(
+        "Wrote {} bytes to {}",
+        content.len(),
+        file.display()
+    ))
+}
+
+async fn run_list_dir_tool(root: &Path, path: &str) -> Result<String> {
+    let dir = resolve_path_under_root(root, path, true)?;
+    let mut entries = tokio::fs::read_dir(&dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read dir '{}': {}", dir.display(), e))?;
+    let mut items = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read dir entry: {}", e))?
+    {
+        let meta = entry.metadata().await.ok();
+        let suffix = if meta.map(|m| m.is_dir()).unwrap_or(false) {
+            "/"
+        } else {
+            ""
+        };
+        items.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
+    }
+    items.sort();
+    Ok(items.join("\n"))
+}
+
+async fn run_search_tool(root: &Path, pattern: &str, path: &str) -> Result<(String, bool)> {
+    use tokio::process::Command;
+
+    let target = resolve_path_under_root(root, path, true)?;
+
+    // Prefer ripgrep; fall back to grep.
+    let rg = Command::new("bash")
+        .arg("-lc")
+        .arg("command -v rg >/dev/null 2>&1")
+        .current_dir(root)
+        .output()
+        .await;
+
+    let (cmd, args): (&str, Vec<String>) = match rg {
+        Ok(out) if out.status.success() => (
+            "rg",
+            vec![
+                "-n".to_string(),
+                "--hidden".to_string(),
+                "--no-heading".to_string(),
+                pattern.to_string(),
+                target.to_string_lossy().to_string(),
+            ],
+        ),
+        _ => (
+            "grep",
+            vec![
+                "-R".to_string(),
+                "-n".to_string(),
+                pattern.to_string(),
+                target.to_string_lossy().to_string(),
+            ],
+        ),
+    };
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        Command::new(cmd).args(&args).current_dir(root).output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("search tool timed out"))?
+    .map_err(|e| anyhow::anyhow!("Failed to run search tool: {}", e))?;
+
+    let code = output.status.code().unwrap_or(-1);
+    let is_error = code != 0 && code != 1; // grep/rg use 1 for "no matches"
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let mut out = String::new();
+    out.push_str(&format!("exit_code: {}\n", code));
+    if !stdout.trim().is_empty() {
+        out.push_str("stdout:\n");
+        out.push_str(&stdout);
+        if !stdout.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !stderr.trim().is_empty() {
+        out.push_str("stderr:\n");
+        out.push_str(&stderr);
+        if !stderr.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    Ok((truncate_for_context(out.trim_end(), 40_000), is_error))
+}
+
+async fn execute_tool_call(
+    tool_cfg: &ToolModeConfig,
+    call: &ToolCallSpec,
+) -> Result<(String, bool)> {
+    match call.tool.as_str() {
+        "bash" => {
+            let command = call
+                .args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("bash tool requires args.command"))?;
+            let (output, is_error) = run_bash_tool(&tool_cfg.root, command).await?;
+            Ok((output, is_error))
+        }
+        "read_file" => {
+            let path = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("read_file tool requires args.path"))?;
+            let output = run_read_file_tool(&tool_cfg.root, path).await?;
+            Ok((output, false))
+        }
+        "write_file" => {
+            let path = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("write_file tool requires args.path"))?;
+            let content = call
+                .args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("write_file tool requires args.content"))?;
+            let output = run_write_file_tool(&tool_cfg.root, path, content).await?;
+            Ok((output, false))
+        }
+        "list_dir" => {
+            let path = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let output = run_list_dir_tool(&tool_cfg.root, path).await?;
+            Ok((output, false))
+        }
+        "search" => {
+            let pattern = call
+                .args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("search tool requires args.pattern"))?;
+            let path = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let (output, is_error) = run_search_tool(&tool_cfg.root, pattern, path).await?;
+            Ok((output, is_error))
+        }
+        other => Err(anyhow::anyhow!("Unknown tool: {}", other)),
+    }
+}
+
+async fn run_chat(
+    config: &Config,
+    provider_name: Option<String>,
+    model: Option<String>,
+    system: Option<String>,
+    agent: bool,
+    yes: bool,
+    root: Option<String>,
+    max_tool_rounds: usize,
+    single_message: Option<String>,
+    stream: bool,
+    session_id: Option<String>,
+    new_session: bool,
+    list_sessions: bool,
+    title: Option<String>,
+    persona_name: Option<String>,
+    list_personas: bool,
+    context_size: Option<usize>,
+) -> Result<()> {
+    // Initialize persona registry
+    let persona_registry = init_persona_registry();
+
+    // Handle --list-personas
+    if list_personas {
+        println!("Available Personas");
+        println!("==================");
+        println!();
+        for persona in persona_registry.list() {
+            println!("  {:12} - {}", persona.id, persona.description);
+        }
+        println!();
+        println!("Use with: drbot chat --persona <name>");
+        return Ok(());
+    }
+
+    // Initialize session store
+    let store = get_session_store(config)?;
+
+    // Handle --list-sessions
+    if list_sessions {
+        let sessions = store
+            .list(ListOptions {
+                limit: Some(20),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        if sessions.is_empty() {
+            println!("No sessions found.");
+        } else {
+            println!("Recent Sessions");
+            println!("===============");
+            println!();
+            for session in sessions {
+                let title = session.title.as_deref().unwrap_or("Untitled");
+                let msg_count = session.metadata.message_count;
+                let updated = session.updated_at.format("%Y-%m-%d %H:%M");
+                println!(
+                    "  {} - {} ({} messages, {})",
+                    &session.id.to_string()[..8],
+                    title,
+                    msg_count,
+                    updated
+                );
+            }
+            println!();
+            println!("Resume with: drbot chat --session <id>");
+        }
+        return Ok(());
+    }
+
+    // Determine which provider to use
+    let provider_name = provider_name
+        .or_else(|| config.providers.default_provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
+
+    // Create the provider
+    let provider = create_provider(config, &provider_name)?;
+
+    // Get or create session
+    let user_id = Uuid::nil(); // CLI user - could be configurable
+    let mut session = if let Some(sid) = session_id {
+        // Resume specific session
+        let uuid = if sid.len() >= 8 {
+            // Try to find by prefix
+            let sessions = store
+                .list(ListOptions::default())
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            sessions
+                .into_iter()
+                .find(|s| s.id.to_string().starts_with(&sid))
+                .map(|s| s.id)
+        } else {
+            None
+        };
+
+        let uuid = uuid
+            .or_else(|| Uuid::parse_str(&sid).ok())
+            .ok_or_else(|| anyhow::anyhow!("Invalid session ID: {}", sid))?;
+
+        store
+            .get(uuid)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", sid))?
+    } else if new_session {
+        // Force new session
+        let mut session = Session::new(user_id, "cli", "terminal");
+        session.title = title.or_else(|| Some("CLI Chat".to_string()));
+        session.model = model.clone();
+        session.system_prompt = system.clone();
+        store
+            .create(&session)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        session
+    } else {
+        // Try to resume last CLI session or create new
+        let sessions = store
+            .list(ListOptions {
+                channel_type: Some("cli".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        if let Some(mut last_session) = sessions.into_iter().next() {
+            // Load messages
+            last_session = store
+                .get(last_session.id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+                .unwrap_or(last_session);
+            last_session
+        } else {
+            let mut session = Session::new(user_id, "cli", "terminal");
+            session.title = title.or_else(|| Some("CLI Chat".to_string()));
+            session.model = model.clone();
+            session.system_prompt = system.clone();
+            store
+                .create(&session)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            session
+        }
+    };
+
+    let tool_root = if agent {
+        let root_path = root
+            .map(|p| PathBuf::from(expand_tilde(&p)))
+            .unwrap_or(std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?);
+        canonicalize_root(&root_path)?
+    } else {
+        canonicalize_root(&std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?)?
+    };
+
+    let mut tool_cfg = ToolModeConfig {
+        enabled: agent,
+        auto_approve: yes,
+        root: tool_root,
+        max_rounds: max_tool_rounds.max(1),
+    };
+
+    // Apply persona if specified
+    let active_persona = persona_name
+        .as_ref()
+        .and_then(|name| persona_registry.get(name));
+    let base_system = if let Some(persona) = &active_persona {
+        // Persona system prompt takes precedence, but can be combined with user system prompt
+        let persona_prompt = persona.build_system_prompt();
+        if let Some(user_system) = system.or_else(|| session.system_prompt.clone()) {
+            Some(format!("{}\n\n{}", persona_prompt, user_system))
+        } else {
+            Some(persona_prompt)
+        }
+    } else {
+        system.or_else(|| session.system_prompt.clone())
+    };
+
+    let system_prompt = if tool_cfg.enabled {
+        Some(build_agent_system_prompt(
+            base_system.clone(),
+            &tool_cfg.root,
+        ))
+    } else {
+        base_system.clone()
+    };
+
+    // Build chat options (system prompt may change if tool mode toggles)
+    let mut options = ChatOptions {
+        model: model.clone(),
+        max_tokens: Some(4096),
+        temperature: if tool_cfg.enabled { Some(0.2) } else { None },
+        top_p: None,
+        stop_sequences: None,
+        system_prompt: system_prompt.clone(),
+    };
+
+    // Initialize context manager
+    let context_config = ContextConfig {
+        max_tokens: context_size.unwrap_or(100000),
+        reserved_for_response: 4096,
+        compression_threshold: 0.8,
+        min_messages: 5,
+        auto_summarize: true,
+    };
+    let mut context_manager = ContextManager::new(context_config);
+
+    // Add system prompt to context if present
+    if let Some(sys) = &system_prompt {
+        let _ = context_manager.add_message(&Message::system(sys));
+    }
+
+    // Add existing session messages to context
+    for msg in &session.messages {
+        let _ = context_manager.add_message(msg);
+    }
+
+    // Single message mode
+    if let Some(msg) = single_message {
+        if tool_cfg.enabled && !tool_cfg.auto_approve {
+            return Err(anyhow::anyhow!(
+                "Tool mode requires approval. Use -y/--yes for non-interactive mode."
+            ));
+        }
+
+        // Add user message to context and session
+        let user_msg = Message::user(&msg);
+        let _ = context_manager.add_message(&user_msg);
+        session.add_message(user_msg);
+
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            if rounds > tool_cfg.max_rounds {
+                return Err(anyhow::anyhow!(
+                    "Max tool rounds exceeded ({}).",
+                    tool_cfg.max_rounds
+                ));
+            }
+
+            let messages_to_send = context_manager.build_messages();
+            let response =
+                send_chat(provider.as_ref(), &messages_to_send, &options, stream).await?;
+
+            if !stream {
+                println!("{}", response);
+            }
+
+            // Add assistant response to context and session
+            let assistant_msg = Message::assistant(&response);
+            let _ = context_manager.add_message(&assistant_msg);
+            session.add_message(assistant_msg);
+
+            if !tool_cfg.enabled {
+                break;
+            }
+
+            let calls = extract_tool_calls(&response);
+            if calls.is_empty() {
+                break;
+            }
+
+            for call in calls {
+                if call.tool == "bash" {
+                    let command = call
+                        .args
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !bash_command_is_safe_for_auto_approve(command) {
+                        let denied = Message::user(format!(
+                            "[Tool Denied] tool=bash reason=unsafe_for_auto_approve\ncommand: {}",
+                            command
+                        ));
+                        let _ = context_manager.add_message(&denied);
+                        session.add_message(denied);
+                        continue;
+                    }
+                }
+
+                let (output, is_error) = match execute_tool_call(&tool_cfg, &call).await {
+                    Ok((out, err)) => (out, err),
+                    Err(e) => (format!("Error: {}", e), true),
+                };
+
+                let tool_result = Message::user(format!(
+                    "[Tool Result] tool={}{}\n{}",
+                    call.tool,
+                    if is_error { " (error)" } else { "" },
+                    output
+                ));
+                let _ = context_manager.add_message(&tool_result);
+                session.add_message(tool_result);
+            }
+        }
+
+        session.update_timestamp();
+        let _ = store.update(&session).await;
+        return Ok(());
+    }
+
+    // Interactive mode
+    let session_info = format!("[Session: {}]", &session.id.to_string()[..8]);
+    let persona_info = active_persona
+        .as_ref()
+        .map(|p| format!(" [Persona: {}]", p.name))
+        .unwrap_or_default();
+    println!(
+        "drbot v{} - Interactive Chat ({}){}{}",
+        env!("CARGO_PKG_VERSION"),
+        provider.name(),
+        session_info,
+        persona_info
+    );
+    println!("Commands: /quit, /clear, /save, /info, /sessions, /new, /context, /tools, /approve, /agent");
+    if tool_cfg.enabled {
+        println!(
+            "Tool mode: ON (auto-approve: {})  Root: {}",
+            if tool_cfg.auto_approve { "ON" } else { "OFF" },
+            tool_cfg.root.display()
+        );
+    }
+
+    if !session.messages.is_empty() {
+        println!("Resuming session with {} messages.", session.messages.len());
+    }
+    println!();
+
+    loop {
+        // Prompt
+        print!("You: ");
+        io::stdout().flush()?;
+
+        // Read input
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            // EOF - save and exit
+            session.update_timestamp();
+            let _ = store.update(&session).await;
+            println!("\nSession saved.");
+            break;
+        }
+
+        let input = input.trim();
+
+        // Check for commands
+        if input.is_empty() {
+            continue;
+        }
+
+        if input == "/quit" || input == "quit" || input == "exit" {
+            session.update_timestamp();
+            store
+                .update(&session)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("Session saved. Goodbye!");
+            break;
+        }
+
+        if input == "/clear" {
+            session.clear_messages();
+            context_manager.clear();
+            if let Some(sys) = &options.system_prompt {
+                let _ = context_manager.add_message(&Message::system(sys));
+            }
+            store
+                .update(&session)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("Conversation cleared.");
+            println!();
+            continue;
+        }
+
+        if input == "/save" {
+            session.update_timestamp();
+            store
+                .update(&session)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("Session saved.");
+            println!();
+            continue;
+        }
+
+        if input == "/info" {
+            let state = context_manager.state();
+            println!();
+            println!("Session ID: {}", session.id);
+            println!("Title: {}", session.title.as_deref().unwrap_or("Untitled"));
+            println!("Messages: {}", session.messages.len());
+            println!(
+                "Context: {} tokens used, {} available",
+                state.total_tokens, state.available_tokens
+            );
+            if state.needs_compression {
+                println!("  (compression recommended)");
+            }
+            println!("Created: {}", session.created_at.format("%Y-%m-%d %H:%M"));
+            println!("Updated: {}", session.updated_at.format("%Y-%m-%d %H:%M"));
+            println!();
+            continue;
+        }
+
+        if input == "/context" {
+            let state = context_manager.state();
+            println!();
+            println!("Context Status");
+            println!("--------------");
+            println!("Total tokens: {}", state.total_tokens);
+            println!("Available: {}", state.available_tokens);
+            println!("Messages: {}", state.message_count);
+            println!("Needs compression: {}", state.needs_compression);
+            println!();
+            continue;
+        }
+
+        if input.starts_with("/tools") {
+            println!();
+            println!("Tools");
+            println!("-----");
+            println!("bash       - run a shell command (rooted)");
+            println!("read_file  - read a file under root");
+            println!("write_file - write a file under root");
+            println!("list_dir   - list a directory under root");
+            println!("search     - search for a pattern under root");
+            println!();
+            println!("Tool mode: {}", if tool_cfg.enabled { "ON" } else { "OFF" });
+            println!(
+                "Auto-approve: {}",
+                if tool_cfg.auto_approve { "ON" } else { "OFF" }
+            );
+            println!("Root: {}", tool_cfg.root.display());
+            println!("Max tool rounds: {}", tool_cfg.max_rounds);
+            println!();
+            continue;
+        }
+
+        if input.starts_with("/approve") {
+            let arg = input.split_whitespace().nth(1).unwrap_or("");
+            match arg {
+                "on" | "yes" | "true" => {
+                    tool_cfg.auto_approve = true;
+                    println!("\nAuto-approve: ON\n");
+                }
+                "off" | "no" | "false" => {
+                    tool_cfg.auto_approve = false;
+                    println!("\nAuto-approve: OFF\n");
+                }
+                _ => {
+                    println!(
+                        "\nAuto-approve: {} (use: /approve on|off)\n",
+                        if tool_cfg.auto_approve { "ON" } else { "OFF" }
+                    );
+                }
+            }
+            continue;
+        }
+
+        if input.starts_with("/agent") {
+            let arg = input.split_whitespace().nth(1).unwrap_or("");
+            match arg {
+                "on" | "yes" | "true" => {
+                    tool_cfg.enabled = true;
+                    options.system_prompt = Some(build_agent_system_prompt(
+                        base_system.clone(),
+                        &tool_cfg.root,
+                    ));
+                    options.temperature = Some(0.2);
+                    println!("\nTool mode: ON\n");
+                }
+                "off" | "no" | "false" => {
+                    tool_cfg.enabled = false;
+                    options.system_prompt = base_system.clone();
+                    options.temperature = None;
+                    println!("\nTool mode: OFF\n");
+                }
+                _ => {
+                    println!(
+                        "\nTool mode: {} (use: /agent on|off)\n",
+                        if tool_cfg.enabled { "ON" } else { "OFF" }
+                    );
+                }
+            }
+            continue;
+        }
+
+        if input == "/sessions" {
+            let sessions = store
+                .list(ListOptions {
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!();
+            for s in sessions {
+                let marker = if s.id == session.id { " *" } else { "" };
+                let title = s.title.as_deref().unwrap_or("Untitled");
+                println!(
+                    "  {} - {} ({} msgs){}",
+                    &s.id.to_string()[..8],
+                    title,
+                    s.metadata.message_count,
+                    marker
+                );
+            }
+            println!();
+            continue;
+        }
+
+        if input == "/new" {
+            // Save current session
+            session.update_timestamp();
+            store
+                .update(&session)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            // Create new session
+            session = Session::new(user_id, "cli", "terminal");
+            session.title = Some("CLI Chat".to_string());
+            session.model = model.clone();
+            session.system_prompt = base_system.clone();
+            store
+                .create(&session)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            // Reset context manager
+            context_manager.clear();
+            if let Some(sys) = &options.system_prompt {
+                let _ = context_manager.add_message(&Message::system(sys));
+            }
+
+            println!("New session started: {}", &session.id.to_string()[..8]);
+            println!();
+            continue;
+        }
+
+        // Add user message to context and session
+        let user_msg = Message::user(input);
+        let _ = context_manager.add_message(&user_msg);
+        session.add_message(user_msg.clone());
+
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            if rounds > tool_cfg.max_rounds {
+                eprintln!(
+                    "\nError: Max tool rounds exceeded ({}).",
+                    tool_cfg.max_rounds
+                );
+                break;
+            }
+
+            // Build messages from context manager (handles compression if needed)
+            let messages_to_send = context_manager.build_messages();
+
+            // Send and get response
+            print!("\nAssistant: ");
+            io::stdout().flush()?;
+
+            let response =
+                match send_chat(provider.as_ref(), &messages_to_send, &options, stream).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("\nError: {}", e);
+                        // Remove the failed user message from session
+                        session.messages.pop();
+                        break;
+                    }
+                };
+
+            if !stream {
+                println!("{}", response);
+            }
+            println!();
+
+            // Add assistant response to context and session
+            let assistant_msg = Message::assistant(&response);
+            let _ = context_manager.add_message(&assistant_msg);
+            session.add_message(assistant_msg);
+
+            if !tool_cfg.enabled {
+                // Auto-save after each exchange
+                session.update_timestamp();
+                let _ = store.update(&session).await;
+                break;
+            }
+
+            let calls = extract_tool_calls(&response);
+            if calls.is_empty() {
+                // Auto-save after each exchange
+                session.update_timestamp();
+                let _ = store.update(&session).await;
+                break;
+            }
+
+            for call in calls {
+                let mut approved = false;
+
+                if tool_cfg.auto_approve {
+                    approved = if call.tool == "bash" {
+                        let command = call
+                            .args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        bash_command_is_safe_for_auto_approve(command)
+                    } else {
+                        true
+                    };
+                }
+
+                if !approved {
+                    match call.tool.as_str() {
+                        "bash" => {
+                            let command = call
+                                .args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            println!("[Tool] bash\n  command: {}", command);
+                        }
+                        "read_file" => {
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            println!("[Tool] read_file\n  path: {}", path);
+                        }
+                        "write_file" => {
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            let bytes = call
+                                .args
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            println!("[Tool] write_file\n  path: {}\n  bytes: {}", path, bytes);
+                        }
+                        "list_dir" => {
+                            let path = call
+                                .args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(".");
+                            println!("[Tool] list_dir\n  path: {}", path);
+                        }
+                        "search" => {
+                            let pattern = call
+                                .args
+                                .get("pattern")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let path = call
+                                .args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(".");
+                            println!("[Tool] search\n  pattern: {}\n  path: {}", pattern, path);
+                        }
+                        _ => {
+                            println!("[Tool] {}", call.tool);
+                        }
+                    }
+
+                    approved = prompt_approve("Approve? [y/N] ")? && tool_cfg.enabled;
+                }
+
+                if !approved {
+                    let denied = Message::user(format!(
+                        "[Tool Denied] tool={} reason=user_denied",
+                        call.tool
+                    ));
+                    let _ = context_manager.add_message(&denied);
+                    session.add_message(denied);
+                    continue;
+                }
+
+                let (output, is_error) = match execute_tool_call(&tool_cfg, &call).await {
+                    Ok((out, err)) => (out, err),
+                    Err(e) => (format!("Error: {}", e), true),
+                };
+
+                println!(
+                    "[Tool Result] {}{}\n",
+                    call.tool,
+                    if is_error { " (error)" } else { "" }
+                );
+                println!("{}", output);
+                println!();
+
+                let tool_result = Message::user(format!(
+                    "[Tool Result] tool={}{}\n{}",
+                    call.tool,
+                    if is_error { " (error)" } else { "" },
+                    output
+                ));
+                let _ = context_manager.add_message(&tool_result);
+                session.add_message(tool_result);
+            }
+
+            // Auto-save after tool runs
+            session.update_timestamp();
+            let _ = store.update(&session).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_chat(
+    provider: &dyn Provider,
+    messages: &[Message],
+    options: &ChatOptions,
+    stream: bool,
+) -> Result<String> {
+    if stream {
+        let mut full_content = String::new();
+        let mut stream_result = provider
+            .stream(messages, options.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        while let Some(event) = stream_result.next().await {
+            match event {
+                StreamEvent::Delta { content } => {
+                    print!("{}", content);
+                    io::stdout().flush()?;
+                    full_content.push_str(&content);
+                }
+                StreamEvent::Error { message } => {
+                    return Err(anyhow::anyhow!("{}", message));
+                }
+                _ => {}
+            }
+        }
+        Ok(full_content)
+    } else {
+        let response = provider
+            .chat(messages, options.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(response.content)
+    }
+}
+
+fn show_config(config: &Config) {
+    println!("drbot Configuration");
+    println!("===================");
+    println!();
+    println!("Gateway:");
+    println!("  Host: {}", config.gateway.host);
+    println!("  Port: {}", config.gateway.port);
+    println!(
+        "  Auth: {}",
+        if config.gateway.auth_token.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!();
+    println!("Providers:");
+    println!(
+        "  Default: {}",
+        config
+            .providers
+            .default_provider
+            .as_deref()
+            .unwrap_or("none")
+    );
+    if config.providers.anthropic.is_some() {
+        println!("  Anthropic: configured");
+    }
+    if config.providers.openai.is_some() {
+        println!("  OpenAI: configured");
+    }
+    if config.providers.ollama.is_some() {
+        println!("  Ollama: configured");
+    }
+    println!();
+    println!("Storage:");
+    println!("  Database: {}", config.storage.database_path.display());
+    println!("  Media: {}", config.storage.media_path.display());
+}
+
+#[cfg(test)]
+mod tool_mode_tests {
+    use super::*;
+
+    #[test]
+    fn extract_single_tool_call() {
+        let text = r#"
+hello
+```drbot_tool
+{"tool":"bash","args":{"command":"git status"}}
+```
+"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "bash");
+        assert_eq!(
+            calls[0].args.get("command").and_then(|v| v.as_str()),
+            Some("git status")
+        );
+    }
+
+    #[test]
+    fn extract_multiple_tool_calls_array() {
+        let text = r#"
+```drbot_tool
+[
+  {"tool":"read_file","args":{"path":"src/main.rs"}},
+  {"tool":"search","args":{"pattern":"run_chat","path":"src"}}
+]
+```
+"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[1].tool, "search");
+    }
+
+    #[test]
+    fn safe_bash_auto_approve() {
+        assert!(bash_command_is_safe_for_auto_approve("git status"));
+        assert!(bash_command_is_safe_for_auto_approve("cargo test -q"));
+        assert!(!bash_command_is_safe_for_auto_approve("rm -rf /"));
+        assert!(!bash_command_is_safe_for_auto_approve("sudo ls"));
+        assert!(!bash_command_is_safe_for_auto_approve("./script.sh"));
+    }
+}
+
+async fn run_doctor(config: &Config) -> Result<()> {
+    println!("drbot Health Check");
+    println!("==================");
+    println!();
+
+    // Check config directory
+    print!("Config directory... ");
+    if let Some(dir) = Config::config_dir() {
+        if dir.exists() {
+            println!("OK ({})", dir.display());
+        } else {
+            println!("MISSING ({})", dir.display());
+        }
+    } else {
+        println!("UNKNOWN");
+    }
+
+    // Check data directory
+    print!("Data directory... ");
+    if let Some(dir) = Config::data_dir() {
+        if dir.exists() {
+            println!("OK ({})", dir.display());
+        } else {
+            println!("MISSING ({})", dir.display());
+        }
+    } else {
+        println!("UNKNOWN");
+    }
+
+    // Check providers
+    println!();
+    println!("Providers:");
+
+    print!("  Anthropic... ");
+    if config.providers.anthropic.is_some() {
+        println!("configured");
+    } else {
+        println!("not configured");
+    }
+
+    print!("  OpenAI... ");
+    if config.providers.openai.is_some() {
+        println!("configured");
+    } else {
+        println!("not configured");
+    }
+
+    print!("  Ollama... ");
+    if let Some(ollama) = &config.providers.ollama {
+        // Actually check if Ollama is running
+        match check_ollama_health(&ollama.url).await {
+            Ok(true) => println!("running ({})", ollama.url),
+            Ok(false) => println!("configured but not responding ({})", ollama.url),
+            Err(e) => println!("error checking ({}): {}", ollama.url, e),
+        }
+    } else {
+        println!("not configured");
+    }
+
+    println!();
+    println!("All checks complete!");
+
+    Ok(())
+}
+
+/// Check if Ollama is running by hitting its health endpoint.
+async fn check_ollama_health(url: &str) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    // Ollama's API endpoint - try to list models
+    let api_url = format!("{}/api/tags", url.trim_end_matches('/'));
+
+    match client.get(&api_url).send().await {
+        Ok(response) => Ok(response.status().is_success()),
+        Err(e) if e.is_timeout() => Ok(false),
+        Err(e) if e.is_connect() => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("{}", e)),
+    }
+}
+
+/// Interactive setup wizard.
+async fn run_wizard() -> Result<()> {
+    use drbot_core::config::{AnthropicConfig, OllamaConfig, OpenAIConfig};
+
+    println!();
+    println!("╔═══════════════════════════════════════╗");
+    println!("║     drbot Setup Wizard                ║");
+    println!("╚═══════════════════════════════════════╝");
+    println!();
+    println!("This wizard will help you configure drbot.");
+    println!();
+
+    let mut config = Config::default();
+
+    // --- Provider Configuration ---
+    println!("┌─ Provider Configuration ─────────────────┐");
+    println!();
+
+    // Anthropic
+    print!("Configure Anthropic Claude? [Y/n]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let configure_anthropic =
+        input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
+
+    if configure_anthropic {
+        // Check environment variable first
+        let env_key = std::env::var("ANTHROPIC_API_KEY").ok();
+
+        let api_key = if let Some(key) = env_key {
+            println!("  Found ANTHROPIC_API_KEY in environment.");
+            print!("  Use environment variable? [Y/n]: ");
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            if input.trim().is_empty() || input.trim().to_lowercase().starts_with('y') {
+                key
+            } else {
+                print!("  Enter Anthropic API key: ");
+                io::stdout().flush()?;
+                input.clear();
+                io::stdin().read_line(&mut input)?;
+                input.trim().to_string()
+            }
+        } else {
+            print!("  Enter Anthropic API key: ");
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        };
+
+        if !api_key.is_empty() {
+            print!("  Default model [claude-sonnet-4-20250514]: ");
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            let model = if input.trim().is_empty() {
+                "claude-sonnet-4-20250514".to_string()
+            } else {
+                input.trim().to_string()
+            };
+
+            config.providers.anthropic = Some(AnthropicConfig {
+                api_key,
+                default_model: Some(model),
+                base_url: None,
+                max_tokens: None,
+            });
+            println!("  Anthropic configured.");
+        }
+    }
+    println!();
+
+    // OpenAI
+    print!("Configure OpenAI? [Y/n]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    let configure_openai = input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
+
+    if configure_openai {
+        let env_key = std::env::var("OPENAI_API_KEY").ok();
+
+        let api_key = if let Some(key) = env_key {
+            println!("  Found OPENAI_API_KEY in environment.");
+            print!("  Use environment variable? [Y/n]: ");
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            if input.trim().is_empty() || input.trim().to_lowercase().starts_with('y') {
+                key
+            } else {
+                print!("  Enter OpenAI API key: ");
+                io::stdout().flush()?;
+                input.clear();
+                io::stdin().read_line(&mut input)?;
+                input.trim().to_string()
+            }
+        } else {
+            print!("  Enter OpenAI API key: ");
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        };
+
+        if !api_key.is_empty() {
+            print!("  Default model [gpt-4o]: ");
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            let model = if input.trim().is_empty() {
+                "gpt-4o".to_string()
+            } else {
+                input.trim().to_string()
+            };
+
+            config.providers.openai = Some(OpenAIConfig {
+                api_key,
+                default_model: Some(model),
+                base_url: None,
+                organization: None,
+            });
+            println!("  OpenAI configured.");
+        }
+    }
+    println!();
+
+    // Ollama
+    print!("Configure Ollama (local models)? [y/N]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    let configure_ollama = input.trim().to_lowercase().starts_with('y');
+
+    if configure_ollama {
+        print!("  Ollama URL [http://localhost:11434]: ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let url = if input.trim().is_empty() {
+            "http://localhost:11434".to_string()
+        } else {
+            input.trim().to_string()
+        };
+
+        print!("  Default model [llama3.2]: ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let model = if input.trim().is_empty() {
+            "llama3.2".to_string()
+        } else {
+            input.trim().to_string()
+        };
+
+        config.providers.ollama = Some(OllamaConfig {
+            url,
+            default_model: Some(model),
+        });
+        println!("  Ollama configured.");
+    }
+    println!();
+
+    // Default provider
+    let mut providers_available = Vec::new();
+    if config.providers.anthropic.is_some() {
+        providers_available.push("anthropic");
+    }
+    if config.providers.openai.is_some() {
+        providers_available.push("openai");
+    }
+    if config.providers.ollama.is_some() {
+        providers_available.push("ollama");
+    }
+
+    if !providers_available.is_empty() {
+        let default = providers_available[0];
+        print!("Default provider [{}]: ", default);
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let chosen = if input.trim().is_empty() {
+            default.to_string()
+        } else {
+            input.trim().to_string()
+        };
+        config.providers.default_provider = Some(chosen);
+    }
+
+    println!();
+    println!("└───────────────────────────────────────────┘");
+    println!();
+
+    // --- Gateway Configuration ---
+    println!("┌─ Gateway Configuration ───────────────────┐");
+    println!();
+
+    print!("Gateway host [127.0.0.1]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if !input.trim().is_empty() {
+        config.gateway.host = input.trim().to_string();
+    }
+
+    print!("Gateway port [18789]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if !input.trim().is_empty() {
+        if let Ok(port) = input.trim().parse() {
+            config.gateway.port = port;
+        }
+    }
+
+    print!("Require authentication token? [y/N]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase().starts_with('y') {
+        print!("  Enter auth token: ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().is_empty() {
+            config.gateway.auth_token = Some(input.trim().to_string());
+        }
+    }
+
+    println!();
+    println!("└───────────────────────────────────────────┘");
+    println!();
+
+    // --- Save Configuration ---
+    let config_path = Config::config_dir()
+        .map(|d| d.join("config.toml"))
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
+
+    println!("Configuration will be saved to:");
+    println!("  {}", config_path.display());
+    println!();
+
+    print!("Save configuration? [Y/n]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+
+    if input.trim().is_empty() || input.trim().to_lowercase().starts_with('y') {
+        // Ensure config directory exists
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Serialize and save
+        let toml_str = toml::to_string_pretty(&config)?;
+        std::fs::write(&config_path, toml_str)?;
+
+        println!();
+        println!("Configuration saved!");
+        println!();
+        println!("You can now run:");
+        println!("  drbot chat     - Start interactive chat");
+        println!("  drbot tui      - Launch terminal UI");
+        println!("  drbot gateway  - Start the gateway server");
+        println!("  drbot doctor   - Verify configuration");
+    } else {
+        println!("Configuration not saved.");
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Manage channels.
+async fn run_channels(
+    config: &Config,
+    action: ChannelsAction,
+    config_path: Option<&str>,
+) -> Result<()> {
+    fn resolve_config_path(cli_config_path: Option<&str>) -> Result<std::path::PathBuf> {
+        if let Some(path) = cli_config_path {
+            return Ok(std::path::PathBuf::from(path));
+        }
+        Config::config_dir()
+            .map(|d| d.join("config.toml"))
+            .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))
+    }
+
+    fn save_config(path: &std::path::Path, config: &Config) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml_str = toml::to_string_pretty(config)?;
+        std::fs::write(path, toml_str)?;
+        Ok(())
+    }
+
+    fn normalize_channel_name(name: &str) -> Option<&'static str> {
+        match name {
+            "whatsapp" => Some("whatsapp"),
+            "telegram" => Some("telegram"),
+            "discord" => Some("discord"),
+            "slack" => Some("slack"),
+            "signal" => Some("signal"),
+            "imessage" => Some("imessage"),
+            "matrix" => Some("matrix"),
+            "webchat" => Some("webchat"),
+            _ => None,
+        }
+    }
+
+    match action {
+        ChannelsAction::List => {
+            println!("Configured Channels");
+            println!("===================");
+            println!();
+
+            // List all possible channels with their status
+            let channels = [
+                ("whatsapp", config.channels.whatsapp.is_some()),
+                ("telegram", config.channels.telegram.is_some()),
+                ("discord", config.channels.discord.is_some()),
+                ("slack", config.channels.slack.is_some()),
+                ("signal", config.channels.signal.is_some()),
+                ("imessage", config.channels.imessage.is_some()),
+                ("matrix", config.channels.matrix.is_some()),
+                ("webchat", config.channels.webchat.is_some()),
+            ];
+
+            for (name, configured) in channels {
+                let enabled = config.channels.enabled.iter().any(|c| c == name);
+                let status = match (configured, enabled) {
+                    (true, true) => "configured, enabled",
+                    (true, false) => "configured, disabled",
+                    (false, true) => "not configured (but enabled)",
+                    (false, false) => "not configured",
+                };
+                println!("  {:<12} {}", name, status);
+            }
+            println!();
+        }
+        ChannelsAction::Status { name } => {
+            if let Some(channel_name) = name {
+                let channel_name = normalize_channel_name(&channel_name)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown channel: {}", channel_name))?;
+                let enabled = config.channels.enabled.iter().any(|c| c == channel_name);
+
+                // Show status for specific channel
+                let status = match channel_name {
+                    "whatsapp" => {
+                        if let Some(wa) = &config.channels.whatsapp {
+                            format!(
+                                "WhatsApp: configured, {} (session: {}, bridge: {})",
+                                if enabled { "enabled" } else { "disabled" },
+                                wa.session_path.display(),
+                                wa.bridge_url
+                            )
+                        } else {
+                            format!(
+                                "WhatsApp: not configured{}",
+                                if enabled { " (enabled)" } else { "" }
+                            )
+                        }
+                    }
+                    "telegram" => {
+                        if let Some(_tg) = &config.channels.telegram {
+                            format!(
+                                "Telegram: configured, {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            )
+                        } else {
+                            format!(
+                                "Telegram: not configured{}",
+                                if enabled { " (enabled)" } else { "" }
+                            )
+                        }
+                    }
+                    "discord" => {
+                        if let Some(_dc) = &config.channels.discord {
+                            format!(
+                                "Discord: configured, {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            )
+                        } else {
+                            format!(
+                                "Discord: not configured{}",
+                                if enabled { " (enabled)" } else { "" }
+                            )
+                        }
+                    }
+                    "slack" => {
+                        if let Some(_sl) = &config.channels.slack {
+                            format!(
+                                "Slack: configured, {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            )
+                        } else {
+                            format!(
+                                "Slack: not configured{}",
+                                if enabled { " (enabled)" } else { "" }
+                            )
+                        }
+                    }
+                    "webchat" => {
+                        if let Some(wc) = &config.channels.webchat {
+                            format!(
+                                "WebChat: configured, {} (host: {}, port: {})",
+                                if enabled { "enabled" } else { "disabled" },
+                                wc.host,
+                                wc.port
+                            )
+                        } else {
+                            format!(
+                                "WebChat: not configured{}",
+                                if enabled { " (enabled)" } else { "" }
+                            )
+                        }
+                    }
+                    "matrix" => {
+                        if let Some(mx) = &config.channels.matrix {
+                            format!(
+                                "Matrix: configured, {} (homeserver: {}, user: {}, allowed_rooms: {})",
+                                if enabled { "enabled" } else { "disabled" },
+                                mx.homeserver_url,
+                                mx.user_id,
+                                mx.allowed_rooms.len()
+                            )
+                        } else {
+                            format!(
+                                "Matrix: not configured{}",
+                                if enabled { " (enabled)" } else { "" }
+                            )
+                        }
+                    }
+                    _ => format!("Unknown channel: {}", channel_name),
+                };
+                println!("{}", status);
+            } else {
+                // Show status for all channels
+                println!("Channel Status");
+                println!("==============");
+                println!("Run 'drbot channels list' for config/enablement state.");
+                println!("Connectivity checks are channel-specific and may require credentials.");
+            }
+        }
+        ChannelsAction::Enable { name } => {
+            let name = normalize_channel_name(&name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown channel: {}", name))?;
+
+            let path = resolve_config_path(config_path)?;
+            let mut cfg = if path.exists() {
+                Config::from_file(&path)?
+            } else {
+                config.clone()
+            };
+
+            if !cfg.channels.enabled.iter().any(|c| c == name) {
+                cfg.channels.enabled.push(name.to_string());
+            }
+
+            save_config(&path, &cfg)?;
+
+            println!("Enabled '{}'.", name);
+            println!("Config: {}", path.display());
+            println!("Note: you still need the channel's config section (tokens/URLs) to actually connect.");
+        }
+        ChannelsAction::Disable { name } => {
+            let name = normalize_channel_name(&name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown channel: {}", name))?;
+
+            let path = resolve_config_path(config_path)?;
+            let mut cfg = if path.exists() {
+                Config::from_file(&path)?
+            } else {
+                config.clone()
+            };
+
+            cfg.channels.enabled.retain(|c| c != name);
+            save_config(&path, &cfg)?;
+
+            println!("Disabled '{}'.", name);
+            println!("Config: {}", path.display());
+        }
+    }
+
+    Ok(())
+}

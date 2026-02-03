@@ -1,0 +1,8 @@
+[package]
+name = "drbot-wildcard"
+version.workspace = true
+edition.workspace = true
+description = "Wildcard pattern matching for drbot"
+
+[dependencies]
+thiserror.workspace = true

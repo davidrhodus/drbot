@@ -1,0 +1,8 @@
+[package]
+name = "drbot-finalize"
+version.workspace = true
+edition.workspace = true
+description = "Finalization utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

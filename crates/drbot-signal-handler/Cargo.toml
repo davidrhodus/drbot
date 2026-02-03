@@ -1,0 +1,11 @@
+[package]
+name = "drbot-signal-handler"
+version.workspace = true
+edition.workspace = true
+description = "Signal handling for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

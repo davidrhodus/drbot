@@ -1,0 +1,11 @@
+[package]
+name = "drbot-arc"
+version.workspace = true
+edition.workspace = true
+description = "Arc utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

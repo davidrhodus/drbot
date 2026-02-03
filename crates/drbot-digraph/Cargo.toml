@@ -1,0 +1,8 @@
+[package]
+name = "drbot-digraph"
+version.workspace = true
+edition.workspace = true
+description = "Directed graph for drbot"
+
+[dependencies]
+thiserror.workspace = true

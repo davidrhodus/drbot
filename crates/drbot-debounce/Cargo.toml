@@ -1,0 +1,9 @@
+[package]
+name = "drbot-debounce"
+version.workspace = true
+edition.workspace = true
+description = "Debouncing and throttling utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

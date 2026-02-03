@@ -1,0 +1,8 @@
+[package]
+name = "drbot-size"
+version.workspace = true
+edition.workspace = true
+description = "Size utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-refcell"
+version.workspace = true
+edition.workspace = true
+description = "RefCell-like wrapper utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

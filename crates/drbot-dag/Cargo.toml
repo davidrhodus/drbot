@@ -1,0 +1,11 @@
+[package]
+name = "drbot-dag"
+version.workspace = true
+edition.workspace = true
+description = "Directed acyclic graph for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

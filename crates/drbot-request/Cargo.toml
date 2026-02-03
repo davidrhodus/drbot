@@ -1,0 +1,8 @@
+[package]
+name = "drbot-request"
+version.workspace = true
+edition.workspace = true
+description = "Request builder utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

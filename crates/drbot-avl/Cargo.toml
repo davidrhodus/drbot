@@ -1,0 +1,11 @@
+[package]
+name = "drbot-avl"
+version.workspace = true
+edition.workspace = true
+description = "AVL self-balancing tree for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-flyweight"
+version.workspace = true
+edition.workspace = true
+description = "Flyweight pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

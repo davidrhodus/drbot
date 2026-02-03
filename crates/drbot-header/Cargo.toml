@@ -1,0 +1,8 @@
+[package]
+name = "drbot-header"
+version.workspace = true
+edition.workspace = true
+description = "HTTP header utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

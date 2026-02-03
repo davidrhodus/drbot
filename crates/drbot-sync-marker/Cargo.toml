@@ -1,0 +1,8 @@
+[package]
+name = "drbot-sync-marker"
+version.workspace = true
+edition.workspace = true
+description = "Sync trait utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

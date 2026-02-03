@@ -1,0 +1,8 @@
+[package]
+name = "drbot-pipe"
+version.workspace = true
+edition.workspace = true
+description = "Pipe and pipeline utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

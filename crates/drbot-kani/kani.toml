@@ -1,0 +1,16 @@
+# Kani configuration for drbot formal verification
+#
+# Run all proofs: cargo kani --package drbot-kani
+# Run specific proof: cargo kani --package drbot-kani --harness proof_cosine_bounds
+
+[kani]
+# Default solver timeout (seconds)
+solver-timeout = 300
+
+# Enable extra checks
+overflow-checks = true
+undefined-checks = true
+
+[kani.flags]
+# Enable all standard checks
+# Note: Add specific flags as needed for your verification goals

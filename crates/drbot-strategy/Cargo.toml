@@ -1,0 +1,8 @@
+[package]
+name = "drbot-strategy"
+version.workspace = true
+edition.workspace = true
+description = "Strategy pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

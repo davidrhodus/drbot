@@ -1,0 +1,16 @@
+[package]
+name = "drbot-crosslingual"
+version.workspace = true
+edition.workspace = true
+description = "Cross-lingual intelligence for drbot - seamless language switching"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

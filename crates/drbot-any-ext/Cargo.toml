@@ -1,0 +1,11 @@
+[package]
+name = "drbot-any-ext"
+version.workspace = true
+edition.workspace = true
+description = "Any type extensions for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

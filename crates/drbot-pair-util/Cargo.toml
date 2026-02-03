@@ -1,0 +1,8 @@
+[package]
+name = "drbot-pair-util"
+version.workspace = true
+edition.workspace = true
+description = "Pair utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "drbot-mcp"
+version.workspace = true
+edition.workspace = true
+description = "Model Context Protocol (MCP) implementation for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest.workspace = true

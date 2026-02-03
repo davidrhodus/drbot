@@ -1,0 +1,8 @@
+[package]
+name = "drbot-option"
+description = "Option utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true

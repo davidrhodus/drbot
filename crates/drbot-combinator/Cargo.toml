@@ -1,0 +1,8 @@
+[package]
+name = "drbot-combinator"
+version.workspace = true
+edition.workspace = true
+description = "Parser combinator utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

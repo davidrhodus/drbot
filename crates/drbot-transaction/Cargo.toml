@@ -1,0 +1,8 @@
+[package]
+name = "drbot-transaction"
+version.workspace = true
+edition.workspace = true
+description = "Transaction-like semantics for drbot"
+
+[dependencies]
+thiserror.workspace = true

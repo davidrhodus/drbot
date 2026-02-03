@@ -1,0 +1,10 @@
+[package]
+name = "drbot-url"
+version.workspace = true
+edition.workspace = true
+description = "URL parsing and manipulation for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

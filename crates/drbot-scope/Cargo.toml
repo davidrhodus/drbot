@@ -1,0 +1,8 @@
+[package]
+name = "drbot-scope"
+version.workspace = true
+edition.workspace = true
+description = "Scoped resources for drbot"
+
+[dependencies]
+thiserror.workspace = true

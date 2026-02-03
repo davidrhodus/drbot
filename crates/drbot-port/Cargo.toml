@@ -1,0 +1,10 @@
+[package]
+name = "drbot-port"
+version.workspace = true
+edition.workspace = true
+description = "Port handling for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

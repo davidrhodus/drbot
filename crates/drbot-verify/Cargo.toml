@@ -1,0 +1,18 @@
+[package]
+name = "drbot-verify"
+description = "Trust and verification for drbot - fact-checking, citations, confidence"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio-test = "0.4"

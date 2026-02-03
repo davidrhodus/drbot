@@ -1,0 +1,8 @@
+[package]
+name = "drbot-sync-primitives"
+version.workspace = true
+edition.workspace = true
+description = "Synchronization primitives for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-nonzero"
+version.workspace = true
+edition.workspace = true
+description = "Non-zero type utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-fuzzy"
+version.workspace = true
+edition.workspace = true
+description = "Fuzzy string matching for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "drbot-webchat"
+version.workspace = true
+edition.workspace = true
+description = "WebChat interface for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-channels.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+futures.workspace = true

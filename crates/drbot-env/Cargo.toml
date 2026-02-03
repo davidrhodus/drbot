@@ -1,0 +1,11 @@
+[package]
+name = "drbot-env"
+version.workspace = true
+edition.workspace = true
+description = "Environment variable utilities for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "drbot-federated"
+version.workspace = true
+edition.workspace = true
+description = "Federated learning for drbot - privacy-preserving improvement"
+
+[dependencies]
+drbot-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

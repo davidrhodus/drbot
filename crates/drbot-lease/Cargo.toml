@@ -1,0 +1,11 @@
+[package]
+name = "drbot-lease"
+version.workspace = true
+edition.workspace = true
+description = "Lease-based resource management for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+tokio.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "drbot-time"
+description = "Time utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true

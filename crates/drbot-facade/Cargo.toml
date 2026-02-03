@@ -1,0 +1,8 @@
+[package]
+name = "drbot-facade"
+version.workspace = true
+edition.workspace = true
+description = "Facade pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

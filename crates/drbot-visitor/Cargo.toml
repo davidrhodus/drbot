@@ -1,0 +1,8 @@
+[package]
+name = "drbot-visitor"
+version.workspace = true
+edition.workspace = true
+description = "Visitor pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

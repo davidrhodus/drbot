@@ -1,0 +1,11 @@
+[package]
+name = "drbot-bimap"
+version.workspace = true
+edition.workspace = true
+description = "Bidirectional map for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

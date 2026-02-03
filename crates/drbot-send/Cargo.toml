@@ -1,0 +1,8 @@
+[package]
+name = "drbot-send"
+version.workspace = true
+edition.workspace = true
+description = "Send trait utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

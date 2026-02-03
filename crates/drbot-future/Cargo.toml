@@ -1,0 +1,8 @@
+[package]
+name = "drbot-future"
+version.workspace = true
+edition.workspace = true
+description = "Future/Promise utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

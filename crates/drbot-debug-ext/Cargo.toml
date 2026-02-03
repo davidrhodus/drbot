@@ -1,0 +1,8 @@
+[package]
+name = "drbot-debug-ext"
+version.workspace = true
+edition.workspace = true
+description = "Debug trait extensions for drbot"
+
+[dependencies]
+thiserror.workspace = true

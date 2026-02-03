@@ -1,0 +1,8 @@
+[package]
+name = "drbot-cancellation"
+version.workspace = true
+edition.workspace = true
+description = "Cancellation tokens for drbot"
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,8 @@
+[package]
+name = "drbot-layout"
+version.workspace = true
+edition.workspace = true
+description = "Memory layout utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

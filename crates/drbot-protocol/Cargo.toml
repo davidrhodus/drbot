@@ -1,0 +1,16 @@
+[package]
+name = "drbot-protocol"
+version.workspace = true
+edition.workspace = true
+description = "WebSocket protocol definitions for drbot gateway"
+
+[dependencies]
+drbot-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

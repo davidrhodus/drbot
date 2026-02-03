@@ -1,0 +1,24 @@
+[package]
+name = "drbot-msteams"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Microsoft Teams channel integration for drbot"
+repository.workspace = true
+
+[dependencies]
+drbot-core.workspace = true
+drbot-channels.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

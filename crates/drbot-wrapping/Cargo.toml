@@ -1,0 +1,8 @@
+[package]
+name = "drbot-wrapping"
+version.workspace = true
+edition.workspace = true
+description = "Wrapping arithmetic utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

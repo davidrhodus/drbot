@@ -1,0 +1,10 @@
+[package]
+name = "drbot-ast"
+version.workspace = true
+edition.workspace = true
+description = "AST utilities and visitor pattern for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

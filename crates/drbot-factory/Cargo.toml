@@ -1,0 +1,8 @@
+[package]
+name = "drbot-factory"
+version.workspace = true
+edition.workspace = true
+description = "Factory pattern utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

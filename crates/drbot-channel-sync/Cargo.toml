@@ -1,0 +1,8 @@
+[package]
+name = "drbot-channel-sync"
+version.workspace = true
+edition.workspace = true
+description = "Synchronous channel utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

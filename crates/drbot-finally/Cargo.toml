@@ -1,0 +1,8 @@
+[package]
+name = "drbot-finally"
+version.workspace = true
+edition.workspace = true
+description = "Finally/cleanup handlers for drbot"
+
+[dependencies]
+thiserror.workspace = true

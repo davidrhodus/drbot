@@ -1,0 +1,8 @@
+[package]
+name = "drbot-meter"
+version.workspace = true
+edition.workspace = true
+description = "Metering and metrics utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

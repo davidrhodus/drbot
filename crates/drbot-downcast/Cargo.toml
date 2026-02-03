@@ -1,0 +1,8 @@
+[package]
+name = "drbot-downcast"
+version.workspace = true
+edition.workspace = true
+description = "Downcasting utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

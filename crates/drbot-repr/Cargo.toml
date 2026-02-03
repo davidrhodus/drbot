@@ -1,0 +1,8 @@
+[package]
+name = "drbot-repr"
+version.workspace = true
+edition.workspace = true
+description = "Representation utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

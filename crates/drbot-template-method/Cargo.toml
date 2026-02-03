@@ -1,0 +1,8 @@
+[package]
+name = "drbot-template-method"
+version.workspace = true
+edition.workspace = true
+description = "Template method pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

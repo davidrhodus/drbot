@@ -1,0 +1,10 @@
+[package]
+name = "drbot-cookie"
+version.workspace = true
+edition.workspace = true
+description = "Cookie parsing for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true

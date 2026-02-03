@@ -1,0 +1,9 @@
+[package]
+name = "drbot-slug"
+description = "Slug generation for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+regex.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "drbot-tui"
+version.workspace = true
+edition.workspace = true
+description = "Terminal UI for drbot"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-protocol.workspace = true
+drbot-providers.workspace = true
+drbot-anthropic.workspace = true
+drbot-openai.workspace = true
+drbot-ollama.workspace = true
+tokio.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

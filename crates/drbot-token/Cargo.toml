@@ -1,0 +1,12 @@
+[package]
+name = "drbot-token"
+description = "Token generation and validation for drbot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+ring.workspace = true

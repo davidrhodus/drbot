@@ -1,0 +1,9 @@
+[package]
+name = "drbot-truncate"
+version.workspace = true
+edition.workspace = true
+description = "Text truncation for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

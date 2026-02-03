@@ -1,0 +1,8 @@
+[package]
+name = "drbot-contract"
+version.workspace = true
+edition.workspace = true
+description = "Design by contract for drbot"
+
+[dependencies]
+thiserror.workspace = true

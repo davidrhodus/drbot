@@ -1,0 +1,10 @@
+[package]
+name = "drbot-cleanup"
+version.workspace = true
+edition.workspace = true
+description = "Cleanup utilities and finalizers for drbot"
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "drbot-serialization"
+description = "Serialization utilities for drbot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

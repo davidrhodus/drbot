@@ -1,0 +1,8 @@
+[package]
+name = "drbot-init"
+version.workspace = true
+edition.workspace = true
+description = "Initialization utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

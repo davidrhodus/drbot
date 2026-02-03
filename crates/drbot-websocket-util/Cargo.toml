@@ -1,0 +1,8 @@
+[package]
+name = "drbot-websocket-util"
+version.workspace = true
+edition.workspace = true
+description = "WebSocket utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

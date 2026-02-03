@@ -1,0 +1,8 @@
+[package]
+name = "drbot-resource-pool"
+version.workspace = true
+edition.workspace = true
+description = "Generic resource pooling for drbot"
+
+[dependencies]
+thiserror.workspace = true

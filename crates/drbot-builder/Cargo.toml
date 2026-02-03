@@ -1,0 +1,11 @@
+[package]
+name = "drbot-builder"
+version.workspace = true
+edition.workspace = true
+description = "Builder pattern utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

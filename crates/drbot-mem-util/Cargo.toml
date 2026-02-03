@@ -1,0 +1,8 @@
+[package]
+name = "drbot-mem-util"
+version.workspace = true
+edition.workspace = true
+description = "Memory utilities for drbot"
+
+[dependencies]
+thiserror.workspace = true

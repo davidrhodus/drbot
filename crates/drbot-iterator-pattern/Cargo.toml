@@ -1,0 +1,8 @@
+[package]
+name = "drbot-iterator-pattern"
+version.workspace = true
+edition.workspace = true
+description = "Iterator pattern for drbot"
+
+[dependencies]
+thiserror.workspace = true

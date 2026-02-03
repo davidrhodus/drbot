@@ -1,0 +1,11 @@
+[package]
+name = "drbot-base64-util"
+version.workspace = true
+edition.workspace = true
+description = "Base64 encoding/decoding for drbot"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

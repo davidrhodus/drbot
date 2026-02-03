@@ -1,0 +1,20 @@
+[package]
+name = "drbot-kani"
+version.workspace = true
+edition.workspace = true
+description = "Formal verification proofs using Kani for drbot"
+
+[dependencies]
+# Core crates for type definitions
+drbot-core = { path = "../drbot-core" }
+
+[dev-dependencies]
+# Kani is a dev dependency - proofs run via `cargo kani`
+
+[features]
+default = []
+# Enable this when running Kani verification
+kani = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }

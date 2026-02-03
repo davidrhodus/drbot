@@ -1,0 +1,17 @@
+[package]
+name = "drbot-benchmark"
+version.workspace = true
+edition.workspace = true
+description = "AI benchmarks for drbot - built-in performance measurement"
+
+[dependencies]
+drbot-core.workspace = true
+drbot-providers.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
