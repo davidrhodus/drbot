@@ -97,8 +97,12 @@ The wizard will guide you through:
 drbot chat [OPTIONS]
 
 Options:
+  -p, --provider <PROVIDER> Provider to use (anthropic, openai, ollama, auto)
   -m, --model <MODEL>      Model to use (e.g., claude-sonnet-4-20250514)
   -s, --system <PROMPT>    System prompt
+      --skill-url <URL>    Load an OpenClaw-style SKILL.md from a URL (and linked relative docs)
+      --agent              Enable tool use (bash, read/write files, search)
+      --root <PATH>        Root directory for tool access (defaults to current directory)
   -M, --message <MSG>      Single message (non-interactive)
       --no-stream          Disable streaming
 ```
@@ -212,6 +216,8 @@ for interoperability with OpenClaw clients (Control UI, nodes).
 - Heartbeats (`set-heartbeats`, `wake`) follow OpenClaw semantics (they run `HEARTBEAT.md`, not WS keepalives).
 - Outbound `send` / `poll` are approval-gated by default via `exec.approval.*`; set `DRBOT_OPENCLAW_SEND_WRITE=1`
   to bypass approvals.
+- OpenClaw agent runs include a restricted `bash` tool by default; set `DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST`
+  (comma-separated) or `DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL=1` to relax it.
 
 ## Providers
 

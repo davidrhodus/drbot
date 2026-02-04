@@ -16,9 +16,9 @@ use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
 use drbot_tui::AppConfig;
 use futures::StreamExt;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -64,6 +64,10 @@ enum Commands {
         /// System prompt
         #[arg(short, long)]
         system: Option<String>,
+
+        /// Load an OpenClaw-style SKILL.md from a URL (and linked relative docs)
+        #[arg(long)]
+        skill_url: Option<String>,
 
         /// Enable Codex-like tool use (bash, read/write files, search)
         #[arg(long, alias = "tools")]
@@ -206,6 +210,7 @@ async fn main() -> Result<()> {
             provider,
             model,
             system,
+            skill_url,
             agent,
             yes,
             root,
@@ -225,6 +230,7 @@ async fn main() -> Result<()> {
                 provider,
                 model,
                 system,
+                skill_url,
                 agent,
                 yes,
                 root,
@@ -615,6 +621,271 @@ fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
     s
 }
 
+fn strip_frontmatter(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.starts_with("---\n") {
+        return normalized;
+    }
+    let Some(end_index) = normalized[3..].find("\n---").map(|i| i + 3) else {
+        return normalized;
+    };
+    let start = (end_index + 4).min(normalized.len());
+    normalized[start..].to_string()
+}
+
+fn is_markdown_doc_path(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+fn extract_markdown_inline_link_targets(markdown: &str) -> Vec<String> {
+    let bytes = markdown.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b']' && bytes[i + 1] == b'(' {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b')' {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                break;
+            }
+            if let Some(target) = markdown.get(start..end) {
+                out.push(target.to_string());
+            }
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn normalize_relative_doc_path_from_target(target: &str) -> Option<PathBuf> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let token = trimmed.split_whitespace().next().unwrap_or("").trim();
+    if token.is_empty() || token.starts_with('#') {
+        return None;
+    }
+    let token = token.trim_start_matches('<').trim_end_matches('>');
+    if token.contains("://")
+        || token.starts_with("mailto:")
+        || token.starts_with("data:")
+        || token.starts_with("javascript:")
+    {
+        return None;
+    }
+    let path_part = token
+        .split(|c| c == '#' || c == '?')
+        .next()
+        .unwrap_or(token)
+        .trim();
+    if path_part.is_empty() || !is_markdown_doc_path(path_part) {
+        return None;
+    }
+
+    let mut raw = path_part;
+    while raw.starts_with("./") {
+        raw = &raw[2..];
+    }
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return None;
+    }
+
+    let mut out = PathBuf::new();
+    for comp in Path::new(raw).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => out.push(seg),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn resolve_skill_url_timeout_secs() -> u64 {
+    std::env::var("DRBOT_CHAT_SKILL_URL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .filter(|v| *v >= 1)
+        .unwrap_or(20)
+}
+
+fn resolve_skill_url_max_file_bytes() -> usize {
+    std::env::var("DRBOT_CHAT_SKILL_URL_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .or_else(|| {
+            std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_MAX_FILE_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .filter(|v| *v >= 1_024)
+        .unwrap_or(2 * 1024 * 1024)
+}
+
+fn resolve_skill_url_max_relative_docs() -> usize {
+    std::env::var("DRBOT_CHAT_SKILL_URL_MAX_RELATIVE_DOCS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .or_else(|| {
+            std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_MAX_RELATIVE_DOCS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        })
+        .filter(|v| *v >= 1)
+        .unwrap_or(32)
+}
+
+fn resolve_skill_url_max_total_bytes() -> usize {
+    std::env::var("DRBOT_CHAT_SKILL_URL_MAX_TOTAL_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1_024)
+        .unwrap_or(400_000)
+}
+
+async fn fetch_url_text(
+    client: &reqwest::Client,
+    url: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    let res = client.get(url).send().await?;
+    let status = res.status().as_u16();
+    if status < 200 || status >= 300 {
+        return Err(anyhow::anyhow!("http {} for {}", status, url));
+    }
+    if let Some(len) = res.content_length() {
+        if len as usize > max_bytes {
+            return Err(anyhow::anyhow!(
+                "remote content too large ({} bytes) for {}",
+                len,
+                url
+            ));
+        }
+    }
+    let bytes = res.bytes().await?;
+    if bytes.len() > max_bytes {
+        return Err(anyhow::anyhow!(
+            "remote content too large ({} bytes) for {}",
+            bytes.len(),
+            url
+        ));
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|e| anyhow::anyhow!("invalid utf8 from {}: {}", url, e))
+}
+
+async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
+    let base = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::anyhow!("invalid skill url: {} ({})", url, e))?;
+    if base.scheme() != "http" && base.scheme() != "https" {
+        return Err(anyhow::anyhow!(
+            "unsupported skill url scheme: {}",
+            base.scheme()
+        ));
+    }
+
+    let timeout_secs = resolve_skill_url_timeout_secs();
+    let max_file_bytes = resolve_skill_url_max_file_bytes();
+    let max_relative_docs = resolve_skill_url_max_relative_docs();
+    let max_total_bytes = resolve_skill_url_max_total_bytes();
+    let ua = format!("drbot/{} (+skill-url)", env!("CARGO_PKG_VERSION"));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .user_agent(ua)
+        .build()?;
+
+    let dir_url = base
+        .join(".")
+        .map_err(|e| anyhow::anyhow!("failed to resolve skill base url: {}", e))?;
+    let dir_prefix = dir_url.path().to_string();
+
+    let main_raw = fetch_url_text(&client, base.as_str(), max_file_bytes).await?;
+    let main_body = strip_frontmatter(&main_raw);
+    let main_body = main_body.trim();
+    if main_body.is_empty() {
+        return Err(anyhow::anyhow!("empty skill document: {}", url));
+    }
+    if main_body.len() > max_total_bytes {
+        return Err(anyhow::anyhow!(
+            "skill document too large ({} bytes > max {})",
+            main_body.len(),
+            max_total_bytes
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str(main_body);
+    let mut used_bytes = main_body.len();
+
+    let mut seen = std::collections::HashSet::<PathBuf>::new();
+    let mut docs_added = 0usize;
+    for target in extract_markdown_inline_link_targets(main_body) {
+        if docs_added >= max_relative_docs || used_bytes >= max_total_bytes {
+            break;
+        }
+        let token = target.trim().split_whitespace().next().unwrap_or("").trim();
+        let token = token.trim_start_matches('<').trim_end_matches('>');
+        let Some(rel_path) = normalize_relative_doc_path_from_target(token) else {
+            continue;
+        };
+        let leaf = rel_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if leaf.eq_ignore_ascii_case("SKILL.md") || leaf.eq_ignore_ascii_case("HEARTBEAT.md") {
+            continue;
+        }
+        if !seen.insert(rel_path) {
+            continue;
+        }
+
+        let resolved = match dir_url.join(token) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        if resolved.scheme() != base.scheme()
+            || resolved.host_str() != base.host_str()
+            || !resolved.path().starts_with(&dir_prefix)
+        {
+            continue;
+        }
+
+        let raw = match fetch_url_text(&client, resolved.as_str(), max_file_bytes).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, url = %resolved.as_str(), "failed to fetch relative skill doc");
+                continue;
+            }
+        };
+        let body = strip_frontmatter(&raw);
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if used_bytes.saturating_add(body.len()) > max_total_bytes {
+            break;
+        }
+        out.push_str("\n\n---\n\n");
+        out.push_str(body);
+        used_bytes = used_bytes.saturating_add(body.len());
+        docs_added = docs_added.saturating_add(1);
+    }
+
+    Ok(out)
+}
+
 fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
     let mut calls = Vec::new();
     let mut in_block = false;
@@ -934,6 +1205,7 @@ async fn run_chat(
     provider_name: Option<String>,
     model: Option<String>,
     system: Option<String>,
+    skill_url: Option<String>,
     agent: bool,
     yes: bool,
     root: Option<String>,
@@ -1109,6 +1381,16 @@ async fn run_chat(
         }
     } else {
         system.or_else(|| session.system_prompt.clone())
+    };
+
+    let base_system = if let Some(skill_url) = skill_url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let skill_pack = fetch_skill_pack_from_url(skill_url).await?;
+        Some(match base_system {
+            Some(existing) => format!("{}\n\n---\n\n{}", existing.trim(), skill_pack.trim()),
+            None => skill_pack,
+        })
+    } else {
+        base_system
     };
 
     let system_prompt = if tool_cfg.enabled {

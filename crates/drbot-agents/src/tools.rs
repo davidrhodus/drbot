@@ -54,8 +54,52 @@ pub struct BashTool {
 
 impl BashTool {
     pub fn new() -> Self {
-        Self {
-            allowed_prefixes: vec![
+        fn truthy(value: &str) -> bool {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        }
+
+        let allow_all = std::env::var("DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL")
+            .ok()
+            .as_deref()
+            .map(truthy)
+            .unwrap_or(false)
+            || std::env::var("DRBOT_AGENT_BASH_ALLOW_ALL")
+                .ok()
+                .as_deref()
+                .map(truthy)
+                .unwrap_or(false);
+
+        let allowlist_raw = std::env::var("DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("DRBOT_AGENT_BASH_ALLOWLIST")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            });
+
+        let allowlist = allowlist_raw
+            .as_deref()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let allow_all = allow_all
+            || allowlist.iter().any(|s| s == "*" || s.eq_ignore_ascii_case("all"));
+
+        let allowed_prefixes = if allow_all {
+            Vec::new()
+        } else if !allowlist.is_empty() {
+            allowlist
+        } else {
+            vec![
                 "ls".to_string(),
                 "cat".to_string(),
                 "echo".to_string(),
@@ -69,7 +113,10 @@ impl BashTool {
                 "wc".to_string(),
                 "sort".to_string(),
                 "uniq".to_string(),
-            ],
+            ]
+        };
+        Self {
+            allowed_prefixes,
             timeout_secs: 30,
         }
     }
