@@ -64,6 +64,14 @@ drbot gateway
 drbot gateway -H 0.0.0.0 -p 8080
 ```
 
+OpenClaw agent bash restrictions can be relaxed at startup:
+
+```bash
+drbot gateway --openclaw-agent-bash-allowlist "git,cargo,rg,npm,npx,pnpm,node"
+# or (dangerous)
+drbot gateway --openclaw-agent-bash-allow-all
+```
+
 ## CLI Commands
 
 ```

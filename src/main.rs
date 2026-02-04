@@ -49,6 +49,14 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "18789")]
         port: u16,
+
+        /// Allow all bash commands for OpenClaw agent runs (dangerous)
+        #[arg(long, default_value_t = false)]
+        openclaw_agent_bash_allow_all: bool,
+
+        /// Comma-separated allowlist of bash command prefixes for OpenClaw agent runs
+        #[arg(long)]
+        openclaw_agent_bash_allowlist: Option<String>,
     },
 
     /// Interactive chat with AI
@@ -201,9 +209,20 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Some(Commands::Gateway { host, port }) => {
+        Some(Commands::Gateway {
+            host,
+            port,
+            openclaw_agent_bash_allow_all,
+            openclaw_agent_bash_allowlist,
+        }) => {
             config.gateway.host = host;
             config.gateway.port = port;
+            if openclaw_agent_bash_allow_all {
+                std::env::set_var("DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL", "1");
+            }
+            if let Some(raw) = openclaw_agent_bash_allowlist.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                std::env::set_var("DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST", raw);
+            }
             run_gateway(config).await
         }
         Some(Commands::Chat {
