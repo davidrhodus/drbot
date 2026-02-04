@@ -70,6 +70,8 @@ pub struct WhatsAppChannel {
     pending_sends: Arc<RwLock<HashMap<String, oneshot::Sender<String>>>>,
     /// QR code callback.
     qr_callback: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    /// Connection status callback.
+    status_callback: Option<Box<dyn Fn(ConnectionStatus) + Send + Sync>>,
 }
 
 impl WhatsAppChannel {
@@ -86,6 +88,7 @@ impl WhatsAppChannel {
             request_tx: None,
             pending_sends: Arc::new(RwLock::new(HashMap::new())),
             qr_callback: None,
+            status_callback: None,
         }
     }
 
@@ -101,6 +104,15 @@ impl WhatsAppChannel {
         F: Fn(&str) + Send + Sync + 'static,
     {
         self.qr_callback = Some(Box::new(callback));
+        self
+    }
+
+    /// Set a status callback.
+    pub fn with_status_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ConnectionStatus) + Send + Sync + 'static,
+    {
+        self.status_callback = Some(Box::new(callback));
         self
     }
 
@@ -169,6 +181,7 @@ impl Channel for WhatsAppChannel {
         let tx = self.tx.clone();
         let pending_sends = self.pending_sends.clone();
         let qr_callback = self.qr_callback.take();
+        let status_callback = self.status_callback.take();
 
         // Writer task
         tokio::spawn(async move {
@@ -201,10 +214,8 @@ impl Channel for WhatsAppChannel {
                     BridgeEvent::Connection { status: new_status } => {
                         info!("WhatsApp connection status: {:?}", new_status);
                         *status.write().await = new_status;
-
-                        if new_status == ConnectionStatus::Close {
-                            connected.store(false, Ordering::SeqCst);
-                            break;
+                        if let Some(ref callback) = status_callback {
+                            callback(new_status);
                         }
                     }
                     BridgeEvent::Qr { qr } => {

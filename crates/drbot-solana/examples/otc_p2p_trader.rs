@@ -15,14 +15,16 @@
 //!     --direction buy --amount-sol 1
 
 use clap::Parser;
+use chrono::Utc;
 use drbot_a2a::{A2AConfig, A2AHub, Agent};
 use drbot_a2a_p2p::{start_p2p_bridge, P2PConfig};
 use drbot_solana::otc::{
-    build_escrow_params, otc_notification, parse_otc_envelope, EscrowManager, EscrowParty,
-    usdc_mint, OTCEnvelope, OTCMessage, OtcTraderClient, TradeDirection, OTC_CAPABILITY, make_sol_rfq,
+    build_escrow_params, sign_otc_notification, wait_for_settled_notification, EscrowManager,
+    spawn_otc_auto_cancel_watcher, OtcSettlementWatch, OtcSettlementWatchStore, EscrowParty,
+    make_sol_rfq, OTCMessage, OtcTraderClient, TradeDirection,
+    OTC_CAPABILITY,
 };
 use drbot_solana::wallet::FileKeypairManager;
-use drbot_solana::SolanaError;
 use serde_json::json;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -56,9 +58,19 @@ struct Args {
     #[arg(long, default_value = "./otc-trader.key")]
     identity: PathBuf,
 
+    /// If set, do not create a new RFQ; only watch/cancel existing state.
+    #[arg(long, default_value_t = false)]
+    watch_only: bool,
+
     /// Optional Solana keypair file (enables on-chain settlement when paired with --escrow-program-id).
     #[arg(long)]
     wallet: Option<PathBuf>,
+
+    /// Optional Solana keypair to pay transaction fees (fee sponsorship).
+    ///
+    /// When set, the trader's `--wallet` still signs as the funder/rent-payer, but this key pays fees.
+    #[arg(long)]
+    fee_payer_wallet: Option<PathBuf>,
 
     /// OTC escrow program id (enables on-chain settlement when paired with --wallet).
     #[arg(long)]
@@ -71,6 +83,14 @@ struct Args {
     /// Solana RPC URL (use "mock" for no-network demo mode).
     #[arg(long, default_value = "mock")]
     rpc_url: String,
+
+    /// Persist settlement watch state to disk (crash/restart safety).
+    #[arg(long, default_value = "./otc-trader-state.json")]
+    state_file: PathBuf,
+
+    /// Autosave flush interval (ms) for --state-file.
+    #[arg(long, default_value_t = 1000)]
+    state_flush_ms: u64,
 
     /// RFQ direction: buy or sell.
     #[arg(long, default_value = "buy")]
@@ -119,11 +139,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Arc::new(RpcClient::new(args.rpc_url.clone()))
     };
 
+    let watch_store = Arc::new(OtcSettlementWatchStore::new());
+    let _watch_persistence_task = watch_store
+        .enable_persistence(&args.state_file, Duration::from_millis(args.state_flush_ms))
+        .await?;
+
     if args.wallet.is_some() ^ args.escrow_program_id.is_some() {
         return Err("Provide both --wallet and --escrow-program-id to enable settlement".into());
     }
     if args.wallet.is_some() && args.rpc_url == "mock" {
         return Err("Settlement requires a real --rpc-url (not mock)".into());
+    }
+    if args.fee_payer_wallet.is_some() && args.wallet.is_none() {
+        return Err("--fee-payer-wallet requires --wallet/--escrow-program-id".into());
+    }
+
+    if args.watch_only {
+        let wallet = args
+            .wallet
+            .as_ref()
+            .ok_or("--watch-only requires --wallet/--escrow-program-id")?;
+        let program_id = args
+            .escrow_program_id
+            .ok_or("--watch-only requires --wallet/--escrow-program-id")?;
+        if args.rpc_url == "mock" {
+            return Err("--watch-only requires a real --rpc-url (not mock)".into());
+        }
+
+        let keypair_manager = FileKeypairManager::from_file(wallet)?;
+        let fee_payer = args
+            .fee_payer_wallet
+            .as_ref()
+            .map(|p| FileKeypairManager::from_file(p).map(|m| m.keypair().insecure_clone()))
+            .transpose()?;
+
+        let escrow_manager = Arc::new(EscrowManager::new(rpc.clone()).with_program_id(program_id));
+        let _watcher_task = spawn_otc_auto_cancel_watcher(
+            watch_store.clone(),
+            escrow_manager,
+            keypair_manager.keypair().insecure_clone(),
+            fee_payer,
+            None,
+        );
+
+        let watches = watch_store.list().await;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "watch_only": true,
+                "state_file": args.state_file.to_string_lossy(),
+                "watch_count": watches.len(),
+            }))?
+        );
+
+        println!("Press Ctrl-C to stop.");
+        tokio::signal::ctrl_c().await?;
+        return Ok(());
     }
 
     let hub = Arc::new(A2AHub::new(
@@ -174,6 +245,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         None
     };
+    let fee_payer_manager = if let Some(path) = &args.fee_payer_wallet {
+        Some(FileKeypairManager::from_file(path)?)
+    } else {
+        None
+    };
 
     let initiator_wallet = keypair_manager
         .as_ref()
@@ -211,6 +287,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     if let (Some(keypair_manager), Some(program_id)) = (keypair_manager, args.escrow_program_id) {
+        let fee_payer = fee_payer_manager
+            .as_ref()
+            .map(|m| m.keypair().insecure_clone());
+
+        let escrow_manager = Arc::new(EscrowManager::new(rpc.clone()).with_program_id(program_id));
+        let _watcher_task = spawn_otc_auto_cancel_watcher(
+            watch_store.clone(),
+            escrow_manager.clone(),
+            keypair_manager.keypair().insecure_clone(),
+            fee_payer_manager
+                .as_ref()
+                .map(|m| m.keypair().insecure_clone()),
+            None,
+        );
+
         // Pick best quote (lowest ask for buy; highest bid for sell).
         let best = quotes
             .iter()
@@ -220,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     price,
                     quantity,
                     settlement_amount,
-                    settlement_mint,
+                    settlement_asset,
                     ..
                 } => {
                     if *quantity == 0 {
@@ -228,7 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
 
                     // For SOL/USDC, trust the on-chain amount (settlement_amount) over the float.
-                    let effective_price = if *settlement_mint == usdc_mint() {
+                    let effective_price = if settlement_asset.eq_ignore_ascii_case("USDC") {
                         (*settlement_amount as f64) * 1000.0 / (*quantity as f64)
                     } else {
                         *price
@@ -257,17 +348,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             quote_id,
             accepting_wallet: initiator_wallet,
         };
-        let accept_env = OTCEnvelope::new(trader_agent_id.to_string(), accept)
-            .sign_with(keypair_manager.keypair())?;
-        hub.send(otc_notification(trader_agent_id, desk_agent_id, accept_env))
-            .await?;
+        hub.send(sign_otc_notification(
+            trader_agent_id,
+            desk_agent_id,
+            keypair_manager.keypair(),
+            accept,
+        )?)
+        .await?;
 
         // Create escrow and fund Party A.
         let params = build_escrow_params(&rfq, &quote_msg)?;
-        let escrow_manager = EscrowManager::new(rpc.clone()).with_program_id(program_id);
-
         let keypair = keypair_manager.keypair();
-        let (escrow_address, _) = escrow_manager.create_escrow(keypair, params.clone()).await?;
+        let (escrow_address, _) =
+            escrow_manager.derive_address(params.negotiation_id, params.party_a, params.party_b)?;
+
+        // Persist a watch entry before funding so we can safely resume after crashes.
+        watch_store
+            .upsert(OtcSettlementWatch::new(
+                params.negotiation_id,
+                params.party_a,
+                params.party_b,
+                escrow_address,
+                params.expiry_unix_ts,
+            ))
+            .await;
+        watch_store.flush().await?;
+
+        if escrow_manager.try_get_escrow(&escrow_address).await?.is_none() {
+            match fee_payer.as_ref() {
+                Some(fee_payer) => {
+                    let _ = escrow_manager
+                        .create_escrow_with_fee_payer(fee_payer, keypair, params.clone())
+                        .await?;
+                }
+                None => {
+                    let _ = escrow_manager.create_escrow(keypair, params.clone()).await?;
+                }
+            }
+        }
 
         let token_source = if params.a_owes.kind == drbot_otc_escrow_program::LegKind::SplToken {
             Some(EscrowManager::associated_token_address(
@@ -278,19 +396,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             None
         };
 
-        let sig = escrow_manager
-            .fund_party_a(keypair, escrow_address, token_source)
-            .await?;
-
-        let settled = match escrow_manager.get_escrow(&escrow_address).await {
-            Ok(_) => false,
-            Err(SolanaError::RpcError(msg)) => {
-                msg.contains("AccountNotFound")
-                    || msg.contains("could not find account")
-                    || msg.contains("could not find")
+        let sig = match fee_payer.as_ref() {
+            Some(fee_payer) => {
+                escrow_manager
+                    .fund_party_a_with_fee_payer(fee_payer, keypair, escrow_address, token_source)
+                    .await?
             }
-            Err(_) => false,
+            None => {
+                escrow_manager
+                    .fund_party_a(keypair, escrow_address, token_source)
+                    .await?
+            }
         };
+
+        let settled = escrow_manager
+            .await_escrow_closed(
+                &escrow_address,
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+            )
+            .await
+            .unwrap_or(false);
 
         let notify_msg = if settled {
             let (final_price, final_quantity) = match &quote_msg {
@@ -314,48 +440,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        let notify_env = OTCEnvelope::new(trader_agent_id.to_string(), notify_msg)
-            .sign_with(keypair_manager.keypair())?;
-        hub.send(otc_notification(trader_agent_id, desk_agent_id, notify_env))
-            .await?;
+        hub.send(sign_otc_notification(
+            trader_agent_id,
+            desk_agent_id,
+            keypair_manager.keypair(),
+            notify_msg,
+        )?)
+        .await?;
 
         if !settled {
-            // Wait for a Settled notification.
-            let mut rx = hub.subscribe();
-            let deadline = Instant::now() + Duration::from_millis(args.settle_timeout_ms);
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-
-                let msg = match tokio::time::timeout(remaining, rx.recv()).await {
-                    Ok(Ok(m)) => m,
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                    _ => break,
-                };
-
-                if msg.to != trader_agent_id {
-                    continue;
-                }
-
-                let Some(env) = parse_otc_envelope(&msg) else {
-                    continue;
-                };
-
-                if env.verify_signature().ok() != Some(true) {
-                    continue;
-                }
-
-                if matches!(env.message, OTCMessage::Settled { negotiation_id, .. } if negotiation_id == params.negotiation_id) {
+            // Fast path: wait for a signed A2A "Settled" notification.
+            let now_ts = Utc::now().timestamp();
+            let remaining_ms = ((params.expiry_unix_ts - now_ts).max(0) as u64) * 1000;
+            let a2a_wait_ms = std::cmp::min(args.settle_timeout_ms, remaining_ms);
+            if a2a_wait_ms > 0 {
+                if let Some((_from, env)) = wait_for_settled_notification(
+                    hub.clone(),
+                    trader_agent_id,
+                    params.negotiation_id,
+                    Duration::from_millis(a2a_wait_ms),
+                )
+                .await?
+                {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
                             "settled": env,
                         }))?
                     );
-                    break;
+                    watch_store.remove(params.negotiation_id).await;
+                    watch_store.flush().await?;
+                    bridge.shutdown().await;
+                    return Ok(());
                 }
+            }
+
+            // Wait for on-chain resolution. The background watcher will auto-cancel after expiry.
+            let poll_interval = Duration::from_millis(500);
+            loop {
+                if let Some(status) = escrow_manager
+                    .get_receipt_status(params.negotiation_id, params.party_a, params.party_b)
+                    .await?
+                {
+                    match status {
+                        drbot_otc_escrow_program::ReceiptStatus::Settled => {
+                            println!("{}", serde_json::to_string_pretty(&json!({ "status": "settled" }))?);
+                            watch_store.remove(params.negotiation_id).await;
+                            watch_store.flush().await?;
+                            break;
+                        }
+                        drbot_otc_escrow_program::ReceiptStatus::Cancelled => {
+                            println!("{}", serde_json::to_string_pretty(&json!({ "status": "cancelled" }))?);
+                            watch_store.remove(params.negotiation_id).await;
+                            watch_store.flush().await?;
+                            break;
+                        }
+                        drbot_otc_escrow_program::ReceiptStatus::Open => {}
+                    }
+                }
+
+                tokio::time::sleep(poll_interval).await;
             }
         }
     }

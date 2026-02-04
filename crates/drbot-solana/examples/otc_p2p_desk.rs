@@ -17,15 +17,10 @@
 use clap::Parser;
 use drbot_a2a::{A2AConfig, A2AHub, Agent};
 use drbot_a2a_p2p::{start_p2p_bridge, P2PConfig};
-use drbot_solana::otc::{
-    build_escrow_params, otc_notification, parse_otc_envelope, EscrowManager, EscrowParty,
-    OTCEnvelope, OTCMessage, OtcDeskAgent,
-};
+use drbot_solana::otc::{spawn_desk_settlement_service, OtcDeskAgent};
 use drbot_solana::wallet::FileKeypairManager;
-use drbot_solana::SolanaError;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signer::Signer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +38,12 @@ struct Args {
     /// Total spread in basis points (e.g. 80 = 0.80%).
     #[arg(long, default_value_t = 80)]
     spread_bps: u16,
+
+    /// Settlement USDC mint (defaults to mainnet USDC).
+    ///
+    /// Override this for devnet/testing where the mainnet mint does not exist.
+    #[arg(long, default_value = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")]
+    usdc_mint: Pubkey,
 
     /// Multiaddr to listen on (libp2p).
     #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
@@ -66,6 +67,18 @@ struct Args {
     #[arg(long)]
     wallet: Option<PathBuf>,
 
+    /// Optional Solana keypair to pay transaction fees (fee sponsorship).
+    ///
+    /// When set, the desk's `--wallet` still signs as the funder/rent-payer, but this key pays fees.
+    #[arg(long)]
+    fee_payer_wallet: Option<PathBuf>,
+
+    /// If set, the desk will create the escrow account if it's missing (desk pays rent/fees).
+    ///
+    /// For an open network, leaving this off is safer: require the initiator (Party A) to create.
+    #[arg(long, default_value_t = false)]
+    create_escrow: bool,
+
     /// OTC escrow program id (enables on-chain settlement when paired with --wallet).
     #[arg(long)]
     escrow_program_id: Option<Pubkey>,
@@ -77,6 +90,14 @@ struct Args {
     /// Solana RPC URL (use "mock" for no-network demo mode).
     #[arg(long, default_value = "mock")]
     rpc_url: String,
+
+    /// Persist negotiation state to disk (crash/restart safety).
+    #[arg(long, default_value = "./otc-desk-state.json")]
+    state_file: PathBuf,
+
+    /// Autosave flush interval (ms) for --state-file.
+    #[arg(long, default_value_t = 1000)]
+    state_flush_ms: u64,
 
     /// Announcement interval seconds.
     #[arg(long, default_value_t = 5)]
@@ -103,6 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.wallet.is_some() && args.rpc_url == "mock" {
         return Err("Settlement requires a real --rpc-url (not mock)".into());
     }
+    if args.fee_payer_wallet.is_some() && args.wallet.is_none() {
+        return Err("--fee-payer-wallet requires --wallet/--escrow-program-id".into());
+    }
 
     let hub = Arc::new(A2AHub::new(
         A2AConfig::default(),
@@ -114,165 +138,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let manager = FileKeypairManager::from_file(path)?;
         let signer = manager.keypair().insecure_clone();
         (
-            OtcDeskAgent::new_sol_usdc_spread_with_wallet(
+            OtcDeskAgent::new_sol_usdc_spread_with_wallet_and_mint(
                 rpc.clone(),
                 &args.name,
                 args.mid,
                 args.spread_bps,
                 manager.pubkey(),
+                args.usdc_mint,
             )
             .with_signing_keypair(signer),
             Some(manager),
         )
     } else {
         (
-            OtcDeskAgent::new_sol_usdc_spread(rpc.clone(), &args.name, args.mid, args.spread_bps),
+            OtcDeskAgent::new_sol_usdc_spread_with_mint(
+                rpc.clone(),
+                &args.name,
+                args.mid,
+                args.spread_bps,
+                args.usdc_mint,
+            ),
             None,
         )
     };
 
     let negotiation_manager = desk.negotiation_manager();
+    let _persistence_task = negotiation_manager
+        .enable_persistence(&args.state_file, Duration::from_millis(args.state_flush_ms))
+        .await?;
     let desk_agent_id = desk.agent.id;
     let _desk_task = desk.spawn(hub.clone()).await;
 
     if let (Some(keypair_manager), Some(program_id)) = (desk_keypair, args.escrow_program_id) {
-        let escrow_manager = EscrowManager::new(rpc.clone()).with_program_id(program_id);
-        let hub = hub.clone();
-        tokio::spawn(async move {
-            let mut rx = hub.subscribe();
+        let fee_payer = if let Some(path) = &args.fee_payer_wallet {
+            Some(FileKeypairManager::from_file(path)?.keypair().insecure_clone())
+        } else {
+            None
+        };
 
-            loop {
-                let msg = match rx.recv().await {
-                    Ok(m) => m,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
-
-                if msg.to != desk_agent_id {
-                    continue;
-                }
-
-                let Some(envelope) = parse_otc_envelope(&msg) else {
-                    continue;
-                };
-
-                if envelope.verify_signature().ok() != Some(true) {
-                    continue;
-                }
-
-                let OTCMessage::Accept {
-                    quote_id,
-                    accepting_wallet,
-                } = envelope.message
-                else {
-                    continue;
-                };
-
-                let ctx = match negotiation_manager.quote_context(quote_id).await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        tracing::warn!(error = %e, %quote_id, "Failed to resolve accepted quote");
-                        continue;
-                    }
-                };
-
-                let params = match build_escrow_params(&ctx.rfq, &ctx.quote) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(error = %e, %quote_id, "Failed to build escrow params");
-                        continue;
-                    }
-                };
-
-                let expected_party_a = match &ctx.rfq {
-                    OTCMessage::Rfq {
-                        initiator_wallet, ..
-                    } => *initiator_wallet,
-                    _ => Pubkey::default(),
-                };
-                if accepting_wallet != expected_party_a {
-                    tracing::warn!(
-                        %accepting_wallet,
-                        %expected_party_a,
-                        "Accepting wallet does not match RFQ initiator"
-                    );
-                    continue;
-                }
-
-                let keypair = keypair_manager.keypair();
-
-                let (escrow_address, _) = match escrow_manager.create_escrow(keypair, params.clone()).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Create escrow failed");
-                        continue;
-                    }
-                };
-
-                let token_source = if params.b_owes.kind == drbot_otc_escrow_program::LegKind::SplToken {
-                    Some(EscrowManager::associated_token_address(&keypair.pubkey(), &params.b_owes.mint))
-                } else {
-                    None
-                };
-
-                let sig = match escrow_manager.fund_party_b(keypair, escrow_address, token_source).await {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Fund party B failed");
-                        continue;
-                    }
-                };
-
-                let settled = match escrow_manager.get_escrow(&escrow_address).await {
-                    Ok(_) => false,
-                    Err(SolanaError::RpcError(msg)) => {
-                        msg.contains("AccountNotFound")
-                            || msg.contains("could not find account")
-                            || msg.contains("could not find")
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to confirm escrow state after funding");
-                        false
-                    }
-                };
-
-                let reply_msg = if settled {
-                    let (final_price, final_quantity) = match &ctx.quote {
-                        OTCMessage::Quote { price, quantity, .. } => (*price, *quantity),
-                        _ => (0.0, 0),
-                    };
-                    OTCMessage::Settled {
-                        negotiation_id: ctx.negotiation_id,
-                        signature: sig.to_string(),
-                        final_price,
-                        final_quantity,
-                        reporting_wallet: keypair.pubkey(),
-                    }
-                } else {
-                    OTCMessage::EscrowFunded {
-                        negotiation_id: ctx.negotiation_id,
-                        escrow_address,
-                        signature: sig.to_string(),
-                        funded_by: EscrowParty::PartyB,
-                        reporting_wallet: keypair.pubkey(),
-                    }
-                };
-
-                let reply_env = match OTCEnvelope::new(desk_agent_id.to_string(), reply_msg)
-                    .sign_with(keypair)
-                {
-                    Ok(env) => env,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to sign settlement update");
-                        continue;
-                    }
-                };
-                let reply = otc_notification(desk_agent_id, msg.from, reply_env);
-                if let Err(e) = hub.send(reply).await {
-                    tracing::warn!(error = %e, "Failed to send settlement update");
-                }
-            }
-        });
+        let _settlement_task = spawn_desk_settlement_service(
+            hub.clone(),
+            negotiation_manager.clone(),
+            rpc.clone(),
+            program_id,
+            desk_agent_id,
+            keypair_manager.keypair().insecure_clone(),
+            fee_payer,
+            args.create_escrow,
+        );
     }
 
     let mut cfg = P2PConfig::default();

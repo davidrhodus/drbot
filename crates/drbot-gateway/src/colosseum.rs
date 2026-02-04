@@ -70,16 +70,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()
     write_text_atomic(path, &raw)
 }
 
-fn resolve_colosseum_skill_dir() -> PathBuf {
-    resolve_managed_skills_dir().join(COLOSSEUM_SKILL_KEY)
+fn resolve_colosseum_skill_dir(cfg: &Config) -> PathBuf {
+    resolve_managed_skills_dir(cfg).join(COLOSSEUM_SKILL_KEY)
 }
 
-fn resolve_colosseum_skill_path() -> PathBuf {
-    resolve_colosseum_skill_dir().join("SKILL.md")
+fn resolve_colosseum_skill_path(cfg: &Config) -> PathBuf {
+    resolve_colosseum_skill_dir(cfg).join("SKILL.md")
 }
 
-fn resolve_colosseum_heartbeat_path() -> PathBuf {
-    resolve_colosseum_skill_dir().join("HEARTBEAT.md")
+fn resolve_colosseum_heartbeat_path(cfg: &Config) -> PathBuf {
+    resolve_colosseum_skill_dir(cfg).join("HEARTBEAT.md")
 }
 
 fn resolve_meta_path(path: &Path) -> PathBuf {
@@ -420,8 +420,8 @@ pub async fn sync_colosseum_docs_best_effort(cfg: &Config) {
         return;
     }
 
-    let skill_path = resolve_colosseum_skill_path();
-    let heartbeat_path = resolve_colosseum_heartbeat_path();
+    let skill_path = resolve_colosseum_skill_path(cfg);
+    let heartbeat_path = resolve_colosseum_heartbeat_path(cfg);
 
     let meta_skill = load_meta(&skill_path);
     if !should_attempt_sync(
@@ -491,8 +491,8 @@ pub async fn sync_colosseum_docs_best_effort(cfg: &Config) {
     let _ = cfg;
 }
 
-pub fn load_colosseum_local_heartbeat() -> Option<String> {
-    let path = resolve_colosseum_heartbeat_path();
+pub fn load_colosseum_local_heartbeat(cfg: &Config) -> Option<String> {
+    let path = resolve_colosseum_heartbeat_path(cfg);
     std::fs::read_to_string(path).ok()
 }
 

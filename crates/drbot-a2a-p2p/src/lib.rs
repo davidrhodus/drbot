@@ -78,6 +78,12 @@ pub struct P2PConfig {
     pub dht_query_interval: Duration,
     /// If true, dial peers discovered via DHT provider queries.
     pub dht_dial_providers: bool,
+    /// How long to wait for a request-response ack before retrying.
+    pub outbound_request_timeout: Duration,
+    /// Maximum number of send attempts per outbound message.
+    pub outbound_max_retries: u32,
+    /// Base delay used for retrying after an immediate outbound failure.
+    pub outbound_retry_base_delay: Duration,
 }
 
 impl Default for P2PConfig {
@@ -101,6 +107,9 @@ impl Default for P2PConfig {
             dht_provide_interval: Duration::from_secs(60),
             dht_query_interval: Duration::from_secs(15),
             dht_dial_providers: true,
+            outbound_request_timeout: Duration::from_secs(3),
+            outbound_max_retries: 3,
+            outbound_retry_base_delay: Duration::from_millis(250),
         }
     }
 }
@@ -228,6 +237,16 @@ struct A2AResponse {
 struct KnownPeer {
     addrs: HashSet<Multiaddr>,
     last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOutbound {
+    peer: PeerId,
+    message: A2AMessage,
+    attempts: u32,
+    last_request_id: request_response::OutboundRequestId,
+    last_sent_at: tokio::time::Instant,
+    next_retry_at: tokio::time::Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -774,6 +793,14 @@ async fn run_swarm(
     let mut recent_set: HashSet<Uuid> = HashSet::new();
     let recent_cap = 2048usize;
 
+    // Outbound reliability: track pending requests and retry on failure/timeout.
+    let outbound_timeout = config.outbound_request_timeout;
+    let outbound_max_retries = config.outbound_max_retries;
+    let outbound_retry_base_delay = config.outbound_retry_base_delay;
+    let mut outbound_retry_tick = tokio::time::interval(outbound_retry_base_delay);
+    let mut pending_by_msg: HashMap<Uuid, PendingOutbound> = HashMap::new();
+    let mut pending_by_req: HashMap<request_response::OutboundRequestId, Uuid> = HashMap::new();
+
     let mut announce_tick = tokio::time::interval(config.announce_interval);
 
     info!(%peer_id, "A2A P2P swarm started");
@@ -840,6 +867,49 @@ async fn run_swarm(
                     }
                 }
             }
+            _ = outbound_retry_tick.tick(), if !pending_by_msg.is_empty() => {
+                let now = tokio::time::Instant::now();
+                let mut to_retry: Vec<Uuid> = Vec::new();
+                let mut to_drop: Vec<Uuid> = Vec::new();
+
+                for (id, pending) in pending_by_msg.iter() {
+                    if now < pending.next_retry_at {
+                        continue;
+                    }
+                    if pending.attempts >= outbound_max_retries {
+                        to_drop.push(*id);
+                    } else {
+                        to_retry.push(*id);
+                    }
+                }
+
+                for id in to_drop {
+                    if let Some(p) = pending_by_msg.remove(&id) {
+                        pending_by_req.remove(&p.last_request_id);
+                        debug!(msg_id = %id, to_peer = %p.peer, attempts = p.attempts, "Dropping outbound message after retries");
+                    }
+                }
+
+                for id in to_retry {
+                    let Some(pending) = pending_by_msg.get_mut(&id) else {
+                        continue;
+                    };
+
+                    pending_by_req.remove(&pending.last_request_id);
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&pending.peer, A2ARequest { message: pending.message.clone() });
+
+                    pending.attempts = pending.attempts.saturating_add(1);
+                    pending.last_request_id = req_id;
+                    pending.last_sent_at = now;
+                    pending.next_retry_at = now + outbound_timeout;
+                    pending_by_req.insert(req_id, id);
+
+                    debug!(msg_id = %id, to_peer = %pending.peer, attempt = pending.attempts, "Retrying outbound message");
+                }
+            }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(Command::Dial(addr)) => {
@@ -874,7 +944,29 @@ async fn run_swarm(
                     debug!(to_peer = %peer, "Sending to possibly-not-connected peer");
                 }
 
-                swarm.behaviour_mut().request_response.send_request(&peer, A2ARequest { message: msg });
+                // If already pending (e.g. local duplicates), do not enqueue another send.
+                if pending_by_msg.contains_key(&msg.id) {
+                    continue;
+                }
+
+                let now = tokio::time::Instant::now();
+                let req_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer, A2ARequest { message: msg.clone() });
+
+                pending_by_req.insert(req_id, msg.id);
+                pending_by_msg.insert(
+                    msg.id,
+                    PendingOutbound {
+                        peer,
+                        message: msg,
+                        attempts: 1,
+                        last_request_id: req_id,
+                        last_sent_at: now,
+                        next_retry_at: now + outbound_timeout,
+                    },
+                );
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -913,6 +1005,9 @@ async fn run_swarm(
                             &mut recent_msgs,
                             &mut recent_set,
                             recent_cap,
+                            &mut pending_by_msg,
+                            &mut pending_by_req,
+                            outbound_retry_base_delay,
                         )
                         .await;
                     }
@@ -1216,6 +1311,9 @@ async fn handle_request_response_event(
     recent_msgs: &mut VecDeque<Uuid>,
     recent_set: &mut HashSet<Uuid>,
     recent_cap: usize,
+    pending_by_msg: &mut HashMap<Uuid, PendingOutbound>,
+    pending_by_req: &mut HashMap<request_response::OutboundRequestId, Uuid>,
+    outbound_retry_base_delay: Duration,
 ) {
     match event {
         request_response::Event::Message { peer, message } => match message {
@@ -1223,16 +1321,40 @@ async fn handle_request_response_event(
                 request, channel, ..
             } => {
                 let msg = request.message;
+                let msg_id = msg.id;
                 // Opportunistically learn a route for the sender (helps reply before announcements arrive).
                 routes.insert(msg.from, peer);
-                push_recent(msg.id, recent_cap, recent_msgs, recent_set);
+
+                // Dedup: if we've already delivered this message to the local hub, ack it again.
+                // This covers the case where the sender retried due to a lost response.
+                if recent_set.contains(&msg_id) {
+                    if swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(
+                            channel,
+                            A2AResponse {
+                                accepted: true,
+                                error: None,
+                            },
+                        )
+                        .is_err()
+                    {
+                        debug!(from_peer = %peer, "Failed to send A2A response");
+                    }
+                    return;
+                }
 
                 let deliver = hub.send(msg).await;
                 let resp = match deliver {
-                    Ok(()) => A2AResponse {
-                        accepted: true,
-                        error: None,
-                    },
+                    Ok(()) => {
+                        // Mark as delivered only after hub acceptance so retries can work.
+                        push_recent(msg_id, recent_cap, recent_msgs, recent_set);
+                        A2AResponse {
+                            accepted: true,
+                            error: None,
+                        }
+                    }
                     Err(e) => A2AResponse {
                         accepted: false,
                         error: Some(e.to_string()),
@@ -1247,11 +1369,38 @@ async fn handle_request_response_event(
                     debug!(from_peer = %peer, "Failed to send A2A response");
                 }
             }
-            request_response::Message::Response { response, .. } => {
-                debug!(from_peer = %peer, accepted = response.accepted, error = ?response.error, "A2A response");
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                if let Some(msg_id) = pending_by_req.remove(&request_id) {
+                    if response.accepted {
+                        pending_by_msg.remove(&msg_id);
+                    } else if let Some(pending) = pending_by_msg.get_mut(&msg_id) {
+                        let now = tokio::time::Instant::now();
+                        pending.next_retry_at = now + outbound_retry_base_delay;
+                    }
+                }
+
+                debug!(
+                    from_peer = %peer,
+                    accepted = response.accepted,
+                    error = ?response.error,
+                    "A2A response"
+                );
             }
         },
-        request_response::Event::OutboundFailure { peer, error, .. } => {
+        request_response::Event::OutboundFailure {
+            peer,
+            request_id,
+            error,
+        } => {
+            if let Some(msg_id) = pending_by_req.remove(&request_id) {
+                if let Some(pending) = pending_by_msg.get_mut(&msg_id) {
+                    let now = tokio::time::Instant::now();
+                    pending.next_retry_at = now + outbound_retry_base_delay;
+                }
+            }
             debug!(to_peer = %peer, error = %error, "A2A outbound failure");
         }
         request_response::Event::InboundFailure { peer, error, .. } => {

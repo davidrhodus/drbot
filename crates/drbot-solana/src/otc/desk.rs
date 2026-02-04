@@ -136,13 +136,11 @@ impl SpreadQuoteEngine {
     /// - matches by symbol `"SOL"` and by wSOL mint
     /// - quotes in USDC
     pub fn with_sol_usdc_market(mut self, mid_price: f64, spread_bps: u16) -> Self {
-        let usdc = usdc_mint();
-
         let market = SpreadMarket {
             mid_price,
             spread_bps,
-            settlement_asset: Some("USDC".to_string()),
-            settlement_mint: Some(usdc),
+            settlement_asset: Some(self.default_settlement_asset.clone()),
+            settlement_mint: Some(self.default_settlement_mint),
         };
 
         self.insert_market_symbol("SOL", market.clone());
@@ -324,8 +322,21 @@ impl OtcDeskAgent {
         mid_price: f64,
         spread_bps: u16,
     ) -> Self {
+        Self::new_sol_usdc_spread_with_mint(rpc_client, name, mid_price, spread_bps, usdc_mint())
+    }
+
+    /// Same as [`Self::new_sol_usdc_spread`] but allows overriding the settlement mint.
+    ///
+    /// Useful for devnet/testing where the canonical mainnet USDC mint does not exist.
+    pub fn new_sol_usdc_spread_with_mint(
+        rpc_client: Arc<RpcClient>,
+        name: impl Into<String>,
+        mid_price: f64,
+        spread_bps: u16,
+        settlement_mint: Pubkey,
+    ) -> Self {
         let quote_engine: Arc<dyn QuoteEngine> = Arc::new(
-            SpreadQuoteEngine::new("USDC", usdc_mint()).with_sol_usdc_market(mid_price, spread_bps),
+            SpreadQuoteEngine::new("USDC", settlement_mint).with_sol_usdc_market(mid_price, spread_bps),
         );
 
         Self::new(
@@ -346,8 +357,27 @@ impl OtcDeskAgent {
         spread_bps: u16,
         wallet: Pubkey,
     ) -> Self {
+        Self::new_sol_usdc_spread_with_wallet_and_mint(
+            rpc_client,
+            name,
+            mid_price,
+            spread_bps,
+            wallet,
+            usdc_mint(),
+        )
+    }
+
+    /// Same as [`Self::new_sol_usdc_spread_with_wallet`] but allows overriding the settlement mint.
+    pub fn new_sol_usdc_spread_with_wallet_and_mint(
+        rpc_client: Arc<RpcClient>,
+        name: impl Into<String>,
+        mid_price: f64,
+        spread_bps: u16,
+        wallet: Pubkey,
+        settlement_mint: Pubkey,
+    ) -> Self {
         let quote_engine: Arc<dyn QuoteEngine> = Arc::new(
-            SpreadQuoteEngine::new("USDC", usdc_mint()).with_sol_usdc_market(mid_price, spread_bps),
+            SpreadQuoteEngine::new("USDC", settlement_mint).with_sol_usdc_market(mid_price, spread_bps),
         );
 
         Self::new(

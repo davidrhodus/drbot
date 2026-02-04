@@ -11,8 +11,13 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -22,6 +27,14 @@ pub struct OTCNegotiationManager {
     escrow_manager: EscrowManager,
     negotiations: Arc<RwLock<HashMap<Uuid, Negotiation>>>,
     our_wallet: Option<Pubkey>,
+    persistence: OnceLock<NegotiationPersistence>,
+}
+
+#[derive(Clone)]
+struct NegotiationPersistence {
+    path: PathBuf,
+    dirty: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 /// RFQ + Quote context for building escrow terms.
@@ -40,6 +53,7 @@ impl OTCNegotiationManager {
             escrow_manager: EscrowManager::new(rpc_client),
             negotiations: Arc::new(RwLock::new(HashMap::new())),
             our_wallet: None,
+            persistence: OnceLock::new(),
         }
     }
 
@@ -47,6 +61,146 @@ impl OTCNegotiationManager {
     pub fn with_wallet(mut self, wallet: Pubkey) -> Self {
         self.our_wallet = Some(wallet);
         self
+    }
+
+    /// Enable on-disk persistence for negotiations (crash/restart safety).
+    ///
+    /// - Loads existing state from `path` (if it exists)
+    /// - Spawns an autosave task that flushes whenever state changes
+    pub async fn enable_persistence(
+        self: &Arc<Self>,
+        path: impl Into<PathBuf>,
+        flush_interval: std::time::Duration,
+    ) -> Result<JoinHandle<()>> {
+        let path = path.into();
+
+        let persistence = NegotiationPersistence {
+            path: path.clone(),
+            dirty: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        };
+
+        if self.persistence.set(persistence).is_err() {
+            return Err(SolanaError::ConfigError(
+                "Negotiation persistence already enabled".to_string(),
+            ));
+        }
+
+        // Best-effort load.
+        let _ = self.load_from_file(&path).await?;
+
+        let manager = self.clone();
+        Ok(tokio::spawn(async move {
+            manager.run_autosave(flush_interval).await;
+        }))
+    }
+
+    /// Best-effort load. Returns `Ok(true)` if a file was loaded, `Ok(false)` if missing.
+    pub async fn load_from_file(&self, path: &Path) -> Result<bool> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+
+        let file: NegotiationStoreFile = serde_json::from_slice(&bytes)?;
+        if file.version != NegotiationStoreFile::VERSION {
+            return Err(SolanaError::OTCError(format!(
+                "Unsupported negotiation store version {}",
+                file.version
+            )));
+        }
+
+        let mut map = HashMap::new();
+        for n in file.negotiations {
+            map.insert(n.id, n);
+        }
+
+        *self.negotiations.write().await = map;
+        Ok(true)
+    }
+
+    pub async fn save_to_file(&self, path: &Path) -> Result<()> {
+        let negotiations = self.negotiations.read().await;
+        let mut list: Vec<Negotiation> = negotiations.values().cloned().collect();
+        list.sort_by_key(|n| n.id);
+
+        let file = NegotiationStoreFile {
+            version: NegotiationStoreFile::VERSION,
+            negotiations: list,
+        };
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let tmp_path = temp_path_for(path);
+        tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(&file)?).await?;
+        if tokio::fs::rename(&tmp_path, path).await.is_err() {
+            let _ = tokio::fs::remove_file(path).await;
+            tokio::fs::rename(&tmp_path, path).await?;
+        }
+        Ok(())
+    }
+
+    /// Record that an escrow address was created/derived for this negotiation.
+    pub async fn record_escrow_created(&self, negotiation_id: Uuid, escrow_address: Pubkey) {
+        let mut negotiations = self.negotiations.write().await;
+        let Some(neg) = negotiations.get_mut(&negotiation_id) else {
+            return;
+        };
+
+        neg.escrow_address = Some(escrow_address);
+        neg.updated_at = Utc::now();
+        neg.history
+            .push(NegotiationEvent::EscrowCreated { escrow_address });
+        self.mark_dirty();
+    }
+
+    /// Record that a funding tx occurred (local observation).
+    pub async fn record_escrow_funded_local(&self, negotiation_id: Uuid, party: EscrowParty, signature: String) {
+        let mut negotiations = self.negotiations.write().await;
+        let Some(neg) = negotiations.get_mut(&negotiation_id) else {
+            return;
+        };
+
+        neg.state = NegotiationState::EscrowFunding;
+        neg.updated_at = Utc::now();
+        neg.history
+            .push(NegotiationEvent::EscrowFunded { party, signature });
+        self.mark_dirty();
+    }
+
+    fn mark_dirty(&self) {
+        let Some(p) = self.persistence.get() else {
+            return;
+        };
+        p.dirty.store(true, Ordering::Release);
+        p.notify.notify_one();
+    }
+
+    async fn run_autosave(&self, flush_interval: std::time::Duration) {
+        let Some(p) = self.persistence.get() else {
+            return;
+        };
+
+        let mut tick = tokio::time::interval(flush_interval);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = p.notify.notified() => {}
+            }
+
+            if !p.dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+
+            if let Err(e) = self.save_to_file(&p.path).await {
+                // Keep dirty so we retry next tick.
+                p.dirty.store(true, Ordering::Release);
+                tracing::warn!(error = %e, path = %p.path.display(), "Failed to persist OTC negotiations");
+            }
+        }
     }
 
     /// Handle an incoming OTC message.
@@ -105,6 +259,7 @@ impl OTCNegotiationManager {
             .write()
             .await
             .insert(rfq_id, negotiation.clone());
+        self.mark_dirty();
 
         info!(id = %rfq_id, "Created RFQ");
 
@@ -193,6 +348,8 @@ impl OTCNegotiationManager {
             };
             negotiations.insert(rfq_id, negotiation);
         }
+        drop(negotiations);
+        self.mark_dirty();
 
         info!(rfq_id = %rfq_id, quote_id = %quote_id, price = price, "Created quote");
 
@@ -228,6 +385,8 @@ impl OTCNegotiationManager {
                 break;
             }
         }
+        drop(negotiations);
+        self.mark_dirty();
 
         Ok(accept)
     }
@@ -250,6 +409,8 @@ impl OTCNegotiationManager {
                 break;
             }
         }
+        drop(negotiations);
+        self.mark_dirty();
 
         info!(quote_id = %quote_id, "Rejected quote");
 
@@ -344,6 +505,7 @@ impl OTCNegotiationManager {
             };
 
             self.negotiations.write().await.insert(*id, negotiation);
+            self.mark_dirty();
         }
 
         Ok(None) // No automatic response
@@ -378,6 +540,8 @@ impl OTCNegotiationManager {
                     quote_id: *id,
                     from: envelope.sender.clone(),
                 });
+                drop(negotiations);
+                self.mark_dirty();
             }
         }
 
@@ -418,6 +582,8 @@ impl OTCNegotiationManager {
                     break;
                 }
             }
+            drop(negotiations);
+            self.mark_dirty();
         }
 
         Ok(None)
@@ -452,6 +618,8 @@ impl OTCNegotiationManager {
                     break;
                 }
             }
+            drop(negotiations);
+            self.mark_dirty();
         }
 
         Ok(None)
@@ -480,6 +648,8 @@ impl OTCNegotiationManager {
                     break;
                 }
             }
+            drop(negotiations);
+            self.mark_dirty();
         }
 
         Ok(None)
@@ -506,11 +676,14 @@ impl OTCNegotiationManager {
 
             if let Some(neg) = negotiations.get_mut(negotiation_id) {
                 neg.state = NegotiationState::EscrowFunding;
+                neg.escrow_address = Some(*escrow_address);
                 neg.updated_at = Utc::now();
                 neg.history.push(NegotiationEvent::EscrowFunded {
                     party: *funded_by,
                     signature: signature.clone(),
                 });
+                drop(negotiations);
+                self.mark_dirty();
             }
         }
 
@@ -542,6 +715,8 @@ impl OTCNegotiationManager {
                 neg.history.push(NegotiationEvent::Settled {
                     signature: signature.clone(),
                 });
+                drop(negotiations);
+                self.mark_dirty();
             }
         }
 
@@ -568,11 +743,29 @@ impl OTCNegotiationManager {
                 neg.history.push(NegotiationEvent::Cancelled {
                     reason: reason.clone(),
                 });
+                drop(negotiations);
+                self.mark_dirty();
             }
         }
 
         Ok(None)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NegotiationStoreFile {
+    version: u32,
+    negotiations: Vec<Negotiation>,
+}
+
+impl NegotiationStoreFile {
+    const VERSION: u32 = 1;
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{file_name}.tmp"))
 }
 
 impl OTCNegotiationManager {
@@ -790,5 +983,44 @@ mod tests {
         assert!(NegotiationState::Cancelled.is_terminal());
         assert!(!NegotiationState::RfqSent.is_terminal());
         assert!(!NegotiationState::QuoteReceived.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn test_persistence_roundtrip() {
+        // Use a mock RPC client to avoid network dependency in tests.
+        let rpc = Arc::new(RpcClient::new_mock("succeeds".to_string()));
+        let manager = Arc::new(OTCNegotiationManager::new(rpc).with_wallet(Pubkey::new_unique()));
+
+        let negotiation = manager
+            .create_rfq(
+                "SOL",
+                Pubkey::new_unique(),
+                TradeDirection::Buy,
+                1_000_000_000,
+            )
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("otc_state.json");
+        manager.save_to_file(&path).await.unwrap();
+
+        let rpc2 = Arc::new(RpcClient::new_mock("succeeds".to_string()));
+        let manager2 = OTCNegotiationManager::new(rpc2).with_wallet(Pubkey::new_unique());
+        assert!(manager2.load_from_file(&path).await.unwrap());
+
+        let loaded = manager2.get_negotiation(negotiation.id).await;
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().id, negotiation.id);
+    }
+
+    #[tokio::test]
+    async fn test_load_missing_persistence_file_is_ok() {
+        let rpc = Arc::new(RpcClient::new_mock("succeeds".to_string()));
+        let manager = OTCNegotiationManager::new(rpc);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.json");
+        assert!(!manager.load_from_file(&missing).await.unwrap());
     }
 }

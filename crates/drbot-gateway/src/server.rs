@@ -35,6 +35,9 @@ impl Gateway {
     /// Run the gateway server.
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let addr = self.addr();
+        // Best-effort background services for OpenClaw interop.
+        crate::openclaw_inbound::start_inbound_bridge(self.state.clone()).await;
+
         let router = create_router(self.state);
 
         info!("Starting drbot gateway on {}", addr);
@@ -56,6 +59,9 @@ impl Gateway {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let addr = self.addr();
+        // Best-effort background services for OpenClaw interop.
+        crate::openclaw_inbound::start_inbound_bridge(self.state.clone()).await;
+
         let router = create_router(self.state);
 
         info!("Starting drbot gateway on {}", addr);

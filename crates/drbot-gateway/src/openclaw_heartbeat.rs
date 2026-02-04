@@ -95,6 +95,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn format_system_event_ts(ts_ms: u64) -> String {
+    // OpenClaw formats these in a human-friendly timezone; for drbot interop a UTC
+    // RFC3339 timestamp is sufficient (clients treat this as prompt context only).
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts_ms as i64)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339()
+}
+
 struct OpenclawMainLaneGuard {
     state: GatewayState,
 }
@@ -113,20 +121,7 @@ impl Drop for OpenclawMainLaneGuard {
 }
 
 fn resolve_state_key(state: &GatewayState) -> PathBuf {
-    let cfg = state.config();
-    let base = cfg
-        .storage
-        .database_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(""));
-    if base.is_absolute() {
-        base
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(base)
-    }
+    crate::openclaw_paths::resolve_openclaw_state_dir(state.config()).unwrap_or_else(|| PathBuf::from(""))
 }
 
 fn resolve_agent_workspace_dir(agent_id: &str) -> PathBuf {
@@ -488,7 +483,14 @@ async fn run_heartbeat_once_impl(
         crate::colosseum::sync_colosseum_docs_best_effort(state.config()),
         crate::moltbook::sync_moltbook_docs_best_effort(state.config()),
         crate::agentwallet::sync_agentwallet_docs_best_effort(state.config()),
+        crate::openclaw_skills::sync_configured_remote_skills_best_effort(state.config()),
     );
+
+    // Best-effort: if remote skills updated their requirements, refresh remote node bin probes.
+    let st = state.clone();
+    tokio::spawn(async move {
+        crate::openclaw::refresh_remote_bins_for_connected_nodes_best_effort(st, false).await;
+    });
 
     let provider: Arc<dyn Provider> = match state.provider().cloned() {
         Some(p) => p,
@@ -515,6 +517,7 @@ async fn run_heartbeat_once_impl(
 
     let workspace_dir = resolve_agent_workspace_dir("default");
     let mut heartbeat_sections: Vec<(String, String)> = Vec::new();
+    let remote = crate::openclaw::resolve_remote_skill_eligibility(state).await;
 
     // Workspace heartbeat file (optional).
     let heartbeat_path = workspace_dir.join(DEFAULT_HEARTBEAT_FILENAME);
@@ -527,7 +530,11 @@ async fn run_heartbeat_once_impl(
     //
     // Many OpenClaw skills ship a HEARTBEAT.md alongside SKILL.md (e.g. Colosseum).
     for (skill_name, base_dir) in
-        crate::openclaw_skills::list_eligible_skill_dirs(&workspace_dir, state.config())
+        crate::openclaw_skills::list_eligible_skill_dirs_with_remote(
+            &workspace_dir,
+            state.config(),
+            remote.as_ref(),
+        )
     {
         let path = base_dir.join(DEFAULT_HEARTBEAT_FILENAME);
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -543,9 +550,15 @@ async fn run_heartbeat_once_impl(
         ));
     }
 
+    // Pending system events (ephemeral queue). These should still be visible to
+    // heartbeats even when transcripts are excluded.
+    let queued_system_events = state.openclaw_peek_system_events("main").await;
+    let has_system_events = !queued_system_events.is_empty();
+
     // Skip heartbeat only if we have at least one heartbeat file and all of them
     // are effectively empty (OpenClaw uses this to avoid unnecessary API calls).
-    if !heartbeat_sections.is_empty()
+    if !has_system_events
+        && !heartbeat_sections.is_empty()
         && heartbeat_sections
             .iter()
             .all(|(_, content)| is_heartbeat_content_effectively_empty(content))
@@ -595,6 +608,17 @@ async fn run_heartbeat_once_impl(
             prompt.push_str(&format!("Reason: {}\n\n", trimmed));
         }
     }
+    if has_system_events {
+        for evt in &queued_system_events {
+            let ts = format_system_event_ts(evt.ts_ms);
+            let text = evt.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            prompt.push_str(&format!("System: [{}] {}\n", ts, text));
+        }
+        prompt.push('\n');
+    }
     prompt.push_str(DEFAULT_HEARTBEAT_PROMPT);
 
     // Colosseum-native prefetch: provide /agents/status etc as a pull signal.
@@ -614,7 +638,7 @@ async fn run_heartbeat_once_impl(
     }
 
     // AgentWallet-native prefetch: public network pulse.
-    if let Some(ctx) = crate::agentwallet::fetch_agentwallet_heartbeat_context().await {
+    if let Some(ctx) = crate::agentwallet::fetch_agentwallet_heartbeat_context(state.config()).await {
         if let Ok(pretty) = serde_json::to_string_pretty(&ctx) {
             prompt.push_str("\n\n---\nAgentWallet context (prefetched):\n");
             prompt.push_str(&pretty);
@@ -633,7 +657,11 @@ async fn run_heartbeat_once_impl(
     }
 
     let skills_prompt =
-        crate::openclaw_skills::build_workspace_skills_prompt(&workspace_dir, state.config());
+        crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
+            &workspace_dir,
+            state.config(),
+            remote.as_ref(),
+        );
     let system_prompt_text = skills_prompt.trim().to_string();
     let system_prompt_opt = if system_prompt_text.is_empty() {
         None
@@ -653,6 +681,7 @@ async fn run_heartbeat_once_impl(
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|v| *v >= 1)
                 .unwrap_or(6),
+            model: crate::openclaw::resolve_openclaw_session_model_override(state, "main"),
             system_prompt: system_prompt_text,
             use_planning: false,
             iteration_timeout_secs: std::env::var("DRBOT_OPENCLAW_HEARTBEAT_ITERATION_TIMEOUT_SECS")
@@ -727,7 +756,7 @@ async fn run_heartbeat_once_impl(
         messages.push(Message::user(prompt));
 
         let options = ChatOptions {
-            model: None,
+            model: crate::openclaw::resolve_openclaw_session_model_override(state, "main"),
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -783,6 +812,13 @@ async fn run_heartbeat_once_impl(
     };
 
     let duration_ms = now_ms().saturating_sub(started_at);
+
+    // We've run a heartbeat (success path); clear queued system events so they
+    // don't leak into subsequent prompts.
+    if has_system_events {
+        let _ = state.openclaw_drain_system_event_entries("main").await;
+    }
+
     let trimmed = full.trim();
     if trimmed.is_empty() {
         emit_heartbeat_event(
@@ -896,5 +932,5 @@ async fn emit_heartbeat_event(state: &GatewayState, build: HeartbeatEventBuild) 
 
     let payload = serde_json::Value::Object(obj);
     let _ = state.openclaw_set_last_heartbeat(payload.clone()).await;
-    crate::openclaw::broadcast_openclaw_event(state, "heartbeat", payload, None).await;
+    crate::openclaw::broadcast_openclaw_event_opts(state, "heartbeat", payload, None, true).await;
 }

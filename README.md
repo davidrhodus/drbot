@@ -178,6 +178,9 @@ drbot/
 
 The gateway exposes a WebSocket API at `ws://localhost:18789/ws`.
 
+drbot also exposes an OpenClaw Gateway v3 compatible endpoint at `ws://localhost:18789/openclaw/ws`
+for interoperability with OpenClaw clients (Control UI, nodes).
+
 ### Methods
 
 | Method | Description |
@@ -203,6 +206,12 @@ The gateway exposes a WebSocket API at `ws://localhost:18789/ws`.
   }
 }
 ```
+
+### OpenClaw Notes
+
+- Heartbeats (`set-heartbeats`, `wake`) follow OpenClaw semantics (they run `HEARTBEAT.md`, not WS keepalives).
+- Outbound `send` / `poll` are approval-gated by default via `exec.approval.*`; set `DRBOT_OPENCLAW_SEND_WRITE=1`
+  to bypass approvals.
 
 ## Providers
 

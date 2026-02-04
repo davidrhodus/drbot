@@ -7,12 +7,16 @@
 use drbot_core::Config;
 use drbot_protocol::openclaw::{error_codes, ErrorShape};
 use futures::StreamExt;
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tracing::{debug, warn};
 
 // Keep in sync with OpenClaw's default config truthiness checks.
 const DEFAULT_CONFIG_VALUES: &[(&str, bool)] =
@@ -24,6 +28,15 @@ pub struct OpenclawSkillsConfigFile {
     pub version: u32,
     #[serde(default)]
     pub entries: HashMap<String, OpenclawSkillConfigEntry>,
+    /// Optional allowlist/denylist gates (drbot extension).
+    ///
+    /// OpenClaw itself only allowlists bundled skills via `skills.allowBundled`.
+    /// drbot doesn't ship bundled OpenClaw skills today, but operators may still
+    /// want to explicitly allow/deny managed/workspace skills.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowlist: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denylist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -35,6 +48,24 @@ pub struct OpenclawSkillConfigEntry {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Optional remote SKILL.md source URL to sync into the managed skills dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Whether to sync relative Markdown docs referenced by the SKILL.md (drbot extension).
+    ///
+    /// Defaults to `true` when unset so remote skills can be self-contained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_relative_docs: Option<bool>,
+    /// Additional relative docs to sync even if not referenced (drbot extension).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_docs: Vec<String>,
+    /// Optional remote HEARTBEAT.md URL to sync into the managed skills dir.
+    #[serde(
+        default,
+        rename = "heartbeatUrl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub heartbeat_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +212,18 @@ pub struct SkillStatusReport {
     pub workspace_dir: String,
     pub managed_skills_dir: String,
     pub skills: Vec<SkillStatusEntry>,
+    pub snapshot_version: u64,
+}
+
+/// Remote environment eligibility context (OpenClaw parity).
+///
+/// OpenClaw can satisfy skill requirements via connected/persisted Nodes (e.g. a macOS
+/// node that can run `system.run`). drbot uses this in `skills.status` and prompt
+/// injection so OpenClaw UI can show the same eligibility results.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteSkillEligibility {
+    pub platforms: BTreeSet<String>,
+    pub bins: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,23 +236,24 @@ pub struct SkillInstallResult {
     pub code: Option<i64>,
 }
 
-pub fn resolve_managed_skills_dir() -> PathBuf {
-    // Prefer OpenClaw state dir if present (interop), otherwise use drbot's config dir.
-    if let Some(dir) = resolve_openclaw_state_dir().map(|d| d.join("skills")) {
-        if dir.exists() {
-            return dir;
-        }
-    }
-    if let Some(home) = resolve_home_dir() {
-        let legacy = home.join(".openclaw").join("skills");
-        if legacy.exists() {
-            return legacy;
-        }
-    }
-    if let Some(dir) = Config::config_dir() {
-        return dir.join("skills");
-    }
-    PathBuf::from("skills")
+#[derive(Debug, Clone)]
+pub(crate) struct SkillInstallPlan {
+    pub skill_key: String,
+    pub kind: String,
+    pub os: Vec<String>,
+    pub bins: Vec<String>,
+    pub formula: Option<String>,
+    pub package: Option<String>,
+    pub module: Option<String>,
+    pub url: Option<String>,
+    pub archive: Option<String>,
+    pub extract: Option<bool>,
+    pub strip_components: Option<u64>,
+    pub target_dir: Option<String>,
+}
+
+pub fn resolve_managed_skills_dir(cfg: &Config) -> PathBuf {
+    crate::openclaw_paths::resolve_managed_skills_dir(cfg)
 }
 
 pub fn resolve_openclaw_skills_config_path() -> PathBuf {
@@ -227,6 +271,8 @@ pub fn load_skills_config_file() -> OpenclawSkillsConfigFile {
         .unwrap_or(OpenclawSkillsConfigFile {
             version: 1,
             entries: HashMap::new(),
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
         })
 }
 
@@ -266,10 +312,520 @@ pub fn update_skill_config(
             }
         }
     }
+    if let Some(url) = params.url {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            entry.url = None;
+        } else {
+            entry.url = Some(trimmed.to_string());
+        }
+    }
+    if let Some(fetch_relative_docs) = params.fetch_relative_docs {
+        entry.fetch_relative_docs = Some(fetch_relative_docs);
+    }
+    if let Some(extra_docs) = params.extra_docs {
+        entry.extra_docs = extra_docs
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+    }
+    if let Some(url) = params.heartbeat_url {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            entry.heartbeat_url = None;
+        } else {
+            entry.heartbeat_url = Some(trimmed.to_string());
+        }
+    }
 
     let snapshot = entry.clone();
     save_skills_config_file(&file)?;
+    bump_skills_snapshot_version();
     Ok(snapshot)
+}
+
+// ---------------------------------------------------------------------------
+// Remote skill docs sync (drbot extension)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_REMOTE_SKILL_SYNC_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
+const DEFAULT_REMOTE_SKILL_SYNC_MAX_RELATIVE_DOCS: usize = 32;
+const DEFAULT_REMOTE_SKILL_SYNC_MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+static SKILLS_SNAPSHOT_VERSION: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0)
+}
+
+pub(crate) fn skills_snapshot_version() -> u64 {
+    SKILLS_SNAPSHOT_VERSION.load(Ordering::Relaxed)
+}
+
+pub(crate) fn bump_skills_snapshot_version() -> u64 {
+    let now = now_ms();
+    SKILLS_SNAPSHOT_VERSION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(if now <= cur { cur.saturating_add(1) } else { now })
+        })
+        .unwrap_or_else(|cur| cur)
+}
+
+fn sha256_hex(raw: &str) -> String {
+    let d = digest::digest(&digest::SHA256, raw.as_bytes());
+    drbot_hex_util::encode(d.as_ref())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteFileMeta {
+    url: String,
+    fetched_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+fn resolve_remote_meta_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta.json", path.to_string_lossy()))
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn write_json_atomic_io<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let raw = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
+    write_text_atomic(path, &raw)
+}
+
+fn resolve_remote_skill_sync_min_interval_ms() -> u64 {
+    std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_MIN_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 1_000)
+        .unwrap_or(DEFAULT_REMOTE_SKILL_SYNC_MIN_INTERVAL_MS)
+}
+
+fn resolve_remote_skill_sync_max_relative_docs() -> usize {
+    std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_MAX_RELATIVE_DOCS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(DEFAULT_REMOTE_SKILL_SYNC_MAX_RELATIVE_DOCS)
+}
+
+fn resolve_remote_skill_sync_max_file_bytes() -> usize {
+    std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1_024)
+        .unwrap_or(DEFAULT_REMOTE_SKILL_SYNC_MAX_FILE_BYTES)
+}
+
+async fn fetch_remote_text(
+    client: &reqwest::Client,
+    url: &str,
+    meta: Option<&RemoteFileMeta>,
+    max_bytes: usize,
+) -> Result<(Option<String>, Option<String>, u16, Option<String>), String> {
+    let mut req = client.get(url);
+    if let Some(meta) = meta {
+        if let Some(etag) = meta.etag.as_deref() {
+            req = req.header(IF_NONE_MATCH, etag);
+        }
+        if let Some(lm) = meta.last_modified.as_deref() {
+            req = req.header(IF_MODIFIED_SINCE, lm);
+        }
+    }
+
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    let status = res.status().as_u16();
+    let etag = res
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = res
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if status == 304 {
+        return Ok((etag, last_modified, status, None));
+    }
+    if status < 200 || status >= 300 {
+        return Err(format!("http {} for {}", status, url));
+    }
+    if let Some(len) = res.content_length() {
+        if len as usize > max_bytes {
+            return Err(format!("remote content too large ({} bytes) for {}", len, url));
+        }
+    }
+    let body = res
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|b| {
+            if b.len() > max_bytes {
+                return Err(format!(
+                    "remote content too large ({} bytes) for {}",
+                    b.len(),
+                    url
+                ));
+            }
+            String::from_utf8(b.to_vec()).map_err(|e| e.to_string())
+        })?;
+    Ok((etag, last_modified, status, Some(body)))
+}
+
+async fn sync_remote_markdown(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    min_interval_ms: u64,
+) -> Result<bool, String> {
+    let meta_path = resolve_remote_meta_path(path);
+    let meta = read_json_file::<RemoteFileMeta>(&meta_path);
+    let prev_etag = meta.as_ref().and_then(|m| m.etag.clone());
+    let prev_last_modified = meta.as_ref().and_then(|m| m.last_modified.clone());
+
+    if let Some(meta) = meta.as_ref() {
+        let elapsed = now_ms().saturating_sub(meta.fetched_at_ms);
+        if elapsed < min_interval_ms {
+            return Ok(false);
+        }
+    }
+
+    let max_bytes = resolve_remote_skill_sync_max_file_bytes();
+    let (etag, last_modified, status, maybe_body) =
+        fetch_remote_text(client, url, meta.as_ref(), max_bytes).await?;
+    let fetched_at_ms = now_ms();
+
+    if status == 304 {
+        let next = RemoteFileMeta {
+            url: url.to_string(),
+            fetched_at_ms,
+            etag: etag.or(prev_etag),
+            last_modified: last_modified.or(prev_last_modified),
+            sha256: meta.as_ref().and_then(|m| m.sha256.clone()),
+        };
+        let _ = write_json_atomic_io(&meta_path, &next);
+        return Ok(false);
+    }
+
+    let body = maybe_body.unwrap_or_default();
+    let next_sha = sha256_hex(&body);
+    let prev_sha = meta
+        .as_ref()
+        .and_then(|m| m.sha256.as_deref())
+        .unwrap_or("");
+    if !prev_sha.is_empty() && prev_sha == next_sha && path.exists() {
+        // Update fetchedAt, but avoid rewriting unchanged content.
+        let next = RemoteFileMeta {
+            url: url.to_string(),
+            fetched_at_ms,
+            etag: etag.or(prev_etag),
+            last_modified: last_modified.or(prev_last_modified),
+            sha256: Some(next_sha),
+        };
+        let _ = write_json_atomic_io(&meta_path, &next);
+        return Ok(false);
+    }
+
+    write_text_atomic(path, &body).map_err(|e| e.to_string())?;
+    let next = RemoteFileMeta {
+        url: url.to_string(),
+        fetched_at_ms,
+        etag,
+        last_modified,
+        sha256: Some(next_sha),
+    };
+    let _ = write_json_atomic_io(&meta_path, &next);
+    Ok(true)
+}
+
+fn is_markdown_doc_path(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+fn extract_markdown_inline_link_targets(markdown: &str) -> Vec<String> {
+    let bytes = markdown.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b']' && bytes[i + 1] == b'(' {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b')' {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                break;
+            }
+            if let Some(target) = markdown.get(start..end) {
+                out.push(target.to_string());
+            }
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn normalize_relative_doc_path_from_target(target: &str) -> Option<PathBuf> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let token = trimmed.split_whitespace().next().unwrap_or("");
+    let token = token.trim();
+    if token.is_empty() || token.starts_with('#') {
+        return None;
+    }
+    let token = token.trim_start_matches('<').trim_end_matches('>');
+    if token.contains("://")
+        || token.starts_with("mailto:")
+        || token.starts_with("data:")
+        || token.starts_with("javascript:")
+    {
+        return None;
+    }
+    let path_part = token
+        .split(|c| c == '#' || c == '?')
+        .next()
+        .unwrap_or(token)
+        .trim();
+    if path_part.is_empty() || !is_markdown_doc_path(path_part) {
+        return None;
+    }
+
+    let mut raw = path_part;
+    while raw.starts_with("./") {
+        raw = &raw[2..];
+    }
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return None;
+    }
+
+    let mut out = PathBuf::new();
+    for comp in Path::new(raw).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => out.push(seg),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn resolve_remote_skill_dir(cfg: &Config, skill_key: &str) -> PathBuf {
+    resolve_managed_skills_dir(cfg).join(skill_key)
+}
+
+/// Best-effort sync for any skills configured with `entries.<skillKey>.url`.
+///
+/// This allows drbot to consume OpenClaw/AgentSkills-style remote skills (a
+/// single `skill.md` URL) without requiring a separate installer step.
+pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
+    let file = load_skills_config_file();
+    if file.entries.is_empty() {
+        return;
+    }
+
+    let min_interval_ms = resolve_remote_skill_sync_min_interval_ms();
+    let ua = format!(
+        "drbot/{} (+openclaw-remote-skill-sync)",
+        env!("CARGO_PKG_VERSION")
+    );
+    let timeout_secs = std::env::var("DRBOT_OPENCLAW_REMOTE_SKILLS_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(20);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .user_agent(ua)
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(error = %err, "openclaw_skills: failed to build http client for remote skills");
+            return;
+        }
+    };
+
+    let max_relative_docs = resolve_remote_skill_sync_max_relative_docs();
+
+    let mut updated_any = false;
+    for (skill_key, entry) in file.entries {
+        if entry.enabled == Some(false) {
+            continue;
+        }
+        let Some(url) = entry.url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let dir = resolve_remote_skill_dir(cfg, &skill_key);
+        let skill_path = dir.join("SKILL.md");
+        match sync_remote_markdown(&client, url, &skill_path, min_interval_ms).await {
+            Ok(updated) => {
+                updated_any = updated_any || updated;
+                debug!(
+                    updated,
+                    skill_key = %skill_key,
+                    path = %skill_path.to_string_lossy(),
+                    "openclaw_skills: remote SKILL.md sync"
+                );
+            }
+            Err(err) => warn!(skill_key = %skill_key, error = %err, "openclaw_skills: remote SKILL.md sync failed"),
+        }
+
+        // Best-effort: remote skills can reference additional docs in the same directory.
+        // Sync those so prompt injection can include them without requiring a file-read tool.
+        let fetch_relative = entry.fetch_relative_docs.unwrap_or(true);
+        let mut doc_targets: Vec<String> = Vec::new();
+        if fetch_relative {
+            if let Ok(raw) = std::fs::read_to_string(&skill_path) {
+                let body = strip_frontmatter(&raw);
+                doc_targets.extend(extract_markdown_inline_link_targets(&body));
+            }
+        }
+        if !entry.extra_docs.is_empty() {
+            doc_targets.extend(entry.extra_docs.clone());
+        }
+
+        if !doc_targets.is_empty() {
+            if let Ok(base_url) = reqwest::Url::parse(url) {
+                if let Ok(dir_url) = base_url.join(".") {
+                    let dir_prefix = dir_url.path().to_string();
+                    let mut seen: HashSet<PathBuf> = HashSet::new();
+                    let mut fetched = 0usize;
+                    for target in doc_targets {
+                        if fetched >= max_relative_docs {
+                            break;
+                        }
+                        let token = target.trim();
+                        let token = token.split_whitespace().next().unwrap_or("").trim();
+                        let token = token.trim_start_matches('<').trim_end_matches('>');
+                        let Some(rel_path) = normalize_relative_doc_path_from_target(token) else {
+                            continue;
+                        };
+                        let leaf = rel_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        if leaf.eq_ignore_ascii_case("SKILL.md")
+                            || leaf.eq_ignore_ascii_case("HEARTBEAT.md")
+                        {
+                            continue;
+                        }
+                        if seen.contains(&rel_path) {
+                            continue;
+                        }
+                        seen.insert(rel_path.clone());
+                        fetched += 1;
+
+                        let resolved = match dir_url.join(token) {
+                            Ok(u) => u,
+                            Err(_) => continue,
+                        };
+                        if resolved.scheme() != base_url.scheme()
+                            || resolved.host_str() != base_url.host_str()
+                            || !resolved.path().starts_with(&dir_prefix)
+                        {
+                            continue;
+                        }
+
+                        let dest = dir.join(&rel_path);
+                        match sync_remote_markdown(
+                            &client,
+                            resolved.as_str(),
+                            &dest,
+                            min_interval_ms,
+                        )
+                        .await
+                        {
+                            Ok(updated) => {
+                                updated_any = updated_any || updated;
+                                debug!(
+                                    updated,
+                                    skill_key = %skill_key,
+                                    path = %dest.to_string_lossy(),
+                                    url = %resolved.as_str(),
+                                    "openclaw_skills: remote relative doc sync"
+                                );
+                            }
+                            Err(err) => warn!(
+                                skill_key = %skill_key,
+                                path = %dest.to_string_lossy(),
+                                error = %err,
+                                "openclaw_skills: remote relative doc sync failed"
+                            ),
+                        }
+                    }
+                } else {
+                    warn!(
+                        skill_key = %skill_key,
+                        url = %url,
+                        "openclaw_skills: remote skill base url resolve failed"
+                    );
+                }
+            } else {
+                warn!(
+                    skill_key = %skill_key,
+                    url = %url,
+                    "openclaw_skills: remote skill url parse failed"
+                );
+            }
+        }
+
+        if let Some(heartbeat_url) = entry
+            .heartbeat_url
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let heartbeat_path = dir.join("HEARTBEAT.md");
+            match sync_remote_markdown(&client, heartbeat_url, &heartbeat_path, min_interval_ms).await {
+                Ok(updated) => {
+                    updated_any = updated_any || updated;
+                    debug!(
+                        updated,
+                        skill_key = %skill_key,
+                        path = %heartbeat_path.to_string_lossy(),
+                        "openclaw_skills: remote HEARTBEAT.md sync"
+                    );
+                }
+                Err(err) => warn!(skill_key = %skill_key, error = %err, "openclaw_skills: remote HEARTBEAT.md sync failed"),
+            }
+        }
+    }
+
+    if updated_any {
+        bump_skills_snapshot_version();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -278,17 +834,29 @@ pub struct SkillsUpdateRequest {
     pub enabled: Option<bool>,
     pub api_key: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    pub url: Option<String>,
+    pub fetch_relative_docs: Option<bool>,
+    pub extra_docs: Option<Vec<String>>,
+    pub heartbeat_url: Option<String>,
 }
 
 pub fn build_skills_status_report(workspace_dir: &Path, cfg: &Config) -> SkillStatusReport {
-    let managed_dir = resolve_managed_skills_dir();
+    build_skills_status_report_with_remote(workspace_dir, cfg, None)
+}
+
+pub fn build_skills_status_report_with_remote(
+    workspace_dir: &Path,
+    cfg: &Config,
+    remote: Option<&RemoteSkillEligibility>,
+) -> SkillStatusReport {
+    let managed_dir = resolve_managed_skills_dir(cfg);
     let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
     let config_json = serde_json::to_value(cfg).unwrap_or_else(|_| json!({}));
     let skill_config = load_skills_config_file();
 
     let mut skills = entries
         .into_iter()
-        .map(|entry| build_skill_status_entry(&entry, &config_json, &skill_config))
+        .map(|entry| build_skill_status_entry(&entry, &config_json, &skill_config, remote))
         .collect::<Vec<_>>();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -296,11 +864,12 @@ pub fn build_skills_status_report(workspace_dir: &Path, cfg: &Config) -> SkillSt
         workspace_dir: workspace_dir.to_string_lossy().to_string(),
         managed_skills_dir: managed_dir.to_string_lossy().to_string(),
         skills,
+        snapshot_version: skills_snapshot_version(),
     }
 }
 
-pub fn collect_skill_bins(workspace_dirs: &[PathBuf]) -> Vec<String> {
-    let managed_dir = resolve_managed_skills_dir();
+pub fn collect_skill_bins(workspace_dirs: &[PathBuf], cfg: &Config) -> Vec<String> {
+    let managed_dir = resolve_managed_skills_dir(cfg);
     let mut bins: BTreeSet<String> = BTreeSet::new();
     for workspace_dir in workspace_dirs {
         let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
@@ -342,12 +911,60 @@ pub fn collect_skill_bins(workspace_dirs: &[PathBuf]) -> Vec<String> {
     bins.into_iter().collect()
 }
 
+/// Collect required bins for skills that are eligible on a given platform.
+///
+/// This matches OpenClaw's remote-node probing logic: only `requires.bins` and
+/// `requires.anyBins` are included (installer bins are not).
+pub fn collect_required_skill_bins_for_platform(
+    workspace_dirs: &[PathBuf],
+    cfg: &Config,
+    platform: &str,
+) -> Vec<String> {
+    let managed_dir = resolve_managed_skills_dir(cfg);
+    let mut bins: BTreeSet<String> = BTreeSet::new();
+    for workspace_dir in workspace_dirs {
+        let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
+        for entry in entries {
+            let required_os = entry
+                .metadata
+                .as_ref()
+                .and_then(|m| m.os.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if !required_os.is_empty() && !required_os.iter().any(|os| os == platform) {
+                continue;
+            }
+            let requires = entry
+                .metadata
+                .as_ref()
+                .and_then(|m| m.requires.as_ref());
+            let Some(requires) = requires else { continue };
+
+            for bin in requires.bins.iter().chain(requires.any_bins.iter()) {
+                let trimmed = bin.trim();
+                if !trimmed.is_empty() {
+                    bins.insert(trimmed.to_string());
+                }
+            }
+        }
+    }
+    bins.into_iter().collect()
+}
+
 /// Build the OpenClaw-style skills prompt for a workspace.
 ///
 /// OpenClaw formats skills into a single prompt that is injected into model runs.
 /// drbot keeps the formatting simple (concatenate eligible SKILL.md bodies).
 pub fn build_workspace_skills_prompt(workspace_dir: &Path, cfg: &Config) -> String {
-    let managed_dir = resolve_managed_skills_dir();
+    build_workspace_skills_prompt_with_remote(workspace_dir, cfg, None)
+}
+
+pub fn build_workspace_skills_prompt_with_remote(
+    workspace_dir: &Path,
+    cfg: &Config,
+    remote: Option<&RemoteSkillEligibility>,
+) -> String {
+    let managed_dir = resolve_managed_skills_dir(cfg);
     let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
     if entries.is_empty() {
         return String::new();
@@ -361,7 +978,7 @@ pub fn build_workspace_skills_prompt(workspace_dir: &Path, cfg: &Config) -> Stri
         if entry.invocation.disable_model_invocation {
             continue;
         }
-        let status = build_skill_status_entry(&entry, &config_json, &skill_config);
+        let status = build_skill_status_entry(&entry, &config_json, &skill_config, remote);
         if !status.eligible {
             continue;
         }
@@ -377,10 +994,66 @@ pub fn build_workspace_skills_prompt(workspace_dir: &Path, cfg: &Config) -> Stri
         }
         combined.push_str(body);
 
-        // Some ecosystem skills ship additional docs (e.g. Moltbook's MESSAGING.md).
-        // Include a small, curated set so models can use them without requiring a file-read tool.
-        let extra = entry.skill.base_dir.join("MESSAGING.md");
-        if extra.is_file() {
+        // Some ecosystem skills ship additional docs via relative links (progressive disclosure).
+        // Include them best-effort so models can use them without requiring a file-read tool.
+        let max_extra_bytes = std::env::var("DRBOT_OPENCLAW_SKILLS_PROMPT_MAX_EXTRA_DOC_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 1_024)
+            .unwrap_or(200_000);
+        let mut used_extra_bytes = 0u64;
+
+        let mut extras: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut push_extra = |path: PathBuf| {
+            if seen.contains(&path) {
+                return;
+            }
+            let leaf = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if leaf.eq_ignore_ascii_case("SKILL.md") || leaf.eq_ignore_ascii_case("HEARTBEAT.md") {
+                return;
+            }
+            seen.insert(path.clone());
+            extras.push(path);
+        };
+
+        // Curated extra docs.
+        let messaging = entry.skill.base_dir.join("MESSAGING.md");
+        if messaging.is_file() {
+            push_extra(PathBuf::from("MESSAGING.md"));
+        }
+
+        for target in extract_markdown_inline_link_targets(body) {
+            if let Some(rel) = normalize_relative_doc_path_from_target(&target) {
+                push_extra(rel);
+            }
+        }
+
+        if let Some(cfg_entry) = skill_config.entries.get(&status.skill_key) {
+            for target in &cfg_entry.extra_docs {
+                if let Some(rel) = normalize_relative_doc_path_from_target(target) {
+                    push_extra(rel);
+                }
+            }
+        }
+
+        for rel in extras {
+            if used_extra_bytes >= max_extra_bytes {
+                break;
+            }
+            let extra = entry.skill.base_dir.join(&rel);
+            if !extra.is_file() {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&extra) {
+                if meta.len() > max_extra_bytes {
+                    continue;
+                }
+                if used_extra_bytes.saturating_add(meta.len()) > max_extra_bytes {
+                    continue;
+                }
+                used_extra_bytes = used_extra_bytes.saturating_add(meta.len());
+            }
             if let Ok(raw) = std::fs::read_to_string(&extra) {
                 let body = strip_frontmatter(&raw);
                 let body = body.trim();
@@ -414,7 +1087,15 @@ pub fn build_workspace_skills_prompt(workspace_dir: &Path, cfg: &Config) -> Stri
 /// This is useful for integrations that want to discover skill-adjacent files
 /// (for example, `HEARTBEAT.md`) without duplicating eligibility logic.
 pub fn list_eligible_skill_dirs(workspace_dir: &Path, cfg: &Config) -> Vec<(String, PathBuf)> {
-    let managed_dir = resolve_managed_skills_dir();
+    list_eligible_skill_dirs_with_remote(workspace_dir, cfg, None)
+}
+
+pub fn list_eligible_skill_dirs_with_remote(
+    workspace_dir: &Path,
+    cfg: &Config,
+    remote: Option<&RemoteSkillEligibility>,
+) -> Vec<(String, PathBuf)> {
+    let managed_dir = resolve_managed_skills_dir(cfg);
     let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
     if entries.is_empty() {
         return Vec::new();
@@ -428,7 +1109,7 @@ pub fn list_eligible_skill_dirs(workspace_dir: &Path, cfg: &Config) -> Vec<(Stri
         if entry.invocation.disable_model_invocation {
             continue;
         }
-        let status = build_skill_status_entry(&entry, &config_json, &skill_config);
+        let status = build_skill_status_entry(&entry, &config_json, &skill_config, remote);
         if !status.eligible {
             continue;
         }
@@ -441,13 +1122,14 @@ pub fn list_eligible_skill_dirs(workspace_dir: &Path, cfg: &Config) -> Vec<(Stri
 }
 
 pub async fn run_skill_install(
+    cfg: &Config,
     workspace_dir: &Path,
     skill_name: &str,
     install_id: &str,
     timeout_ms: Option<u64>,
 ) -> SkillInstallResult {
     let timeout_ms = timeout_ms.unwrap_or(300_000).clamp(1_000, 900_000);
-    let managed_dir = resolve_managed_skills_dir();
+    let managed_dir = resolve_managed_skills_dir(cfg);
     let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
     let Some(entry) = entries.into_iter().find(|e| e.skill.name == skill_name) else {
         return SkillInstallResult {
@@ -470,12 +1152,56 @@ pub async fn run_skill_install(
     };
 
     match spec.kind {
-        SkillInstallKind::Download => install_download_spec(&entry, &spec, timeout_ms).await,
+        SkillInstallKind::Download => install_download_spec(cfg, &entry, &spec, timeout_ms).await,
         SkillInstallKind::Brew
         | SkillInstallKind::Node
         | SkillInstallKind::Go
         | SkillInstallKind::Uv => install_command_spec(&spec, timeout_ms).await,
     }
+}
+
+pub(crate) fn resolve_skill_install_plan(
+    cfg: &Config,
+    workspace_dir: &Path,
+    skill_name: &str,
+    install_id: &str,
+) -> Result<SkillInstallPlan, SkillInstallResult> {
+    let managed_dir = resolve_managed_skills_dir(cfg);
+    let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
+    let Some(entry) = entries.into_iter().find(|e| e.skill.name == skill_name) else {
+        return Err(SkillInstallResult {
+            ok: false,
+            message: format!("Skill not found: {}", skill_name),
+            stdout: String::new(),
+            stderr: String::new(),
+            code: None,
+        });
+    };
+
+    let Some((spec, _index)) = find_install_spec(&entry, install_id) else {
+        return Err(SkillInstallResult {
+            ok: false,
+            message: format!("Installer not found: {}", install_id),
+            stdout: String::new(),
+            stderr: String::new(),
+            code: None,
+        });
+    };
+
+    Ok(SkillInstallPlan {
+        skill_key: resolve_skill_key(&entry),
+        kind: spec.kind.as_str().to_string(),
+        os: spec.os.clone(),
+        bins: spec.bins.clone(),
+        formula: spec.formula.clone(),
+        package: spec.package.clone(),
+        module: spec.module.clone(),
+        url: spec.url.clone(),
+        archive: spec.archive.clone(),
+        extract: spec.extract,
+        strip_components: spec.strip_components,
+        target_dir: spec.target_dir.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -486,11 +1212,12 @@ fn build_skill_status_entry(
     entry: &SkillEntry,
     cfg_json: &serde_json::Value,
     skills_cfg: &OpenclawSkillsConfigFile,
+    remote: Option<&RemoteSkillEligibility>,
 ) -> SkillStatusEntry {
     let skill_key = resolve_skill_key(entry);
     let skill_cfg = skills_cfg.entries.get(&skill_key);
     let disabled = skill_cfg.and_then(|c| c.enabled).unwrap_or(true) == false;
-    let blocked_by_allowlist = false;
+    let blocked_by_allowlist = is_blocked_by_skill_allowlist(entry, &skill_key, skills_cfg);
     let always = entry
         .metadata
         .as_ref()
@@ -551,18 +1278,38 @@ fn build_skill_status_entry(
 
     let platform = resolve_runtime_platform();
 
+    let remote_has_bin = |bin: &str| -> bool {
+        remote
+            .map(|r| r.bins.contains(bin.trim()))
+            .unwrap_or(false)
+    };
+
     let missing_bins = required_bins
         .iter()
-        .filter(|bin| !has_binary(bin))
+        .filter(|bin| !has_binary(bin) && !remote_has_bin(bin))
         .cloned()
         .collect::<Vec<_>>();
     let missing_any_bins =
-        if required_any_bins.is_empty() || required_any_bins.iter().any(|bin| has_binary(bin)) {
+        if required_any_bins.is_empty()
+            || required_any_bins.iter().any(|bin| has_binary(bin))
+            || remote
+                .map(|r| required_any_bins.iter().any(|bin| r.bins.contains(bin.trim())))
+                .unwrap_or(false)
+        {
             Vec::new()
         } else {
             required_any_bins.clone()
         };
-    let missing_os = if required_os.is_empty() || required_os.iter().any(|os| os == platform) {
+    let missing_os = if required_os.is_empty()
+        || required_os.iter().any(|os| os == platform)
+        || remote
+            .map(|r| {
+                r.platforms
+                    .iter()
+                    .any(|p| required_os.iter().any(|os| os == p))
+            })
+            .unwrap_or(false)
+    {
         Vec::new()
     } else {
         required_os.clone()
@@ -651,11 +1398,14 @@ fn build_skill_status_entry(
         },
         missing,
         config_checks,
-        install: normalize_install_options(entry),
+        install: normalize_install_options(entry, remote),
     }
 }
 
-fn normalize_install_options(entry: &SkillEntry) -> Vec<SkillInstallOption> {
+fn normalize_install_options(
+    entry: &SkillEntry,
+    remote: Option<&RemoteSkillEligibility>,
+) -> Vec<SkillInstallOption> {
     let install = entry
         .metadata
         .as_ref()
@@ -666,10 +1416,19 @@ fn normalize_install_options(entry: &SkillEntry) -> Vec<SkillInstallOption> {
         return Vec::new();
     }
     let platform = resolve_runtime_platform();
+    let mut platforms: Vec<&str> = vec![platform];
+    let remote_platforms: Vec<String> = remote
+        .map(|r| r.platforms.iter().cloned().collect())
+        .unwrap_or_default();
+    for p in &remote_platforms {
+        platforms.push(p.as_str());
+    }
     let filtered = install
         .into_iter()
         .enumerate()
-        .filter(|(_, spec)| spec.os.is_empty() || spec.os.iter().any(|os| os == platform))
+        .filter(|(_, spec)| {
+            spec.os.is_empty() || spec.os.iter().any(|os| platforms.iter().any(|p| os == *p))
+        })
         .collect::<Vec<_>>();
     if filtered.is_empty() {
         return Vec::new();
@@ -704,6 +1463,61 @@ fn normalize_install_options(entry: &SkillEntry) -> Vec<SkillInstallOption> {
     }
 }
 
+fn resolve_skills_install_prefer_brew() -> bool {
+    match std::env::var("DRBOT_OPENCLAW_SKILLS_INSTALL_PREFER_BREW")
+        .ok()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => true,
+        "1" | "true" | "t" | "yes" | "y" | "on" => true,
+        "0" | "false" | "f" | "no" | "n" | "off" => false,
+        _ => true,
+    }
+}
+
+fn resolve_skills_install_node_manager() -> String {
+    let raw = std::env::var("DRBOT_OPENCLAW_SKILLS_INSTALL_NODE_MANAGER")
+        .ok()
+        .unwrap_or_default();
+    let manager = raw.trim().to_ascii_lowercase();
+    match manager.as_str() {
+        "pnpm" | "yarn" | "bun" | "npm" => manager,
+        _ => "npm".to_string(),
+    }
+}
+
+fn build_node_install_command(package_name: &str) -> Vec<String> {
+    match resolve_skills_install_node_manager().as_str() {
+        "pnpm" => vec![
+            "pnpm".to_string(),
+            "add".to_string(),
+            "-g".to_string(),
+            package_name.to_string(),
+        ],
+        "yarn" => vec![
+            "yarn".to_string(),
+            "global".to_string(),
+            "add".to_string(),
+            package_name.to_string(),
+        ],
+        "bun" => vec![
+            "bun".to_string(),
+            "add".to_string(),
+            "-g".to_string(),
+            package_name.to_string(),
+        ],
+        _ => vec![
+            "npm".to_string(),
+            "install".to_string(),
+            "-g".to_string(),
+            package_name.to_string(),
+        ],
+    }
+}
+
 fn select_preferred_install_spec(
     specs: &[(usize, SkillInstallSpec)],
 ) -> Option<(usize, SkillInstallSpec)> {
@@ -713,7 +1527,7 @@ fn select_preferred_install_spec(
     let go = find_kind(SkillInstallKind::Go);
     let uv = find_kind(SkillInstallKind::Uv);
 
-    if has_binary("brew") {
+    if resolve_skills_install_prefer_brew() && has_binary("brew") {
         if let Some(brew) = brew.clone() {
             return Some(brew);
         }
@@ -748,7 +1562,7 @@ fn build_install_label(spec: &SkillInstallSpec, _index: usize) -> String {
         SkillInstallKind::Node => spec
             .package
             .as_deref()
-            .map(|p| format!("Install {} (npm)", p))
+            .map(|p| format!("Install {} ({})", p, resolve_skills_install_node_manager()))
             .unwrap_or_else(|| "Run installer".to_string()),
         SkillInstallKind::Go => spec
             .module
@@ -777,6 +1591,45 @@ fn resolve_skill_key(entry: &SkillEntry) -> String {
         .as_ref()
         .and_then(|m| m.skill_key.clone())
         .unwrap_or_else(|| entry.skill.name.clone())
+}
+
+fn parse_skill_list_env(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn is_blocked_by_skill_allowlist(
+    entry: &SkillEntry,
+    skill_key: &str,
+    skills_cfg: &OpenclawSkillsConfigFile,
+) -> bool {
+    let env_allow = parse_skill_list_env("DRBOT_OPENCLAW_SKILLS_ALLOWLIST");
+    let env_deny = parse_skill_list_env("DRBOT_OPENCLAW_SKILLS_DENYLIST");
+
+    let allow = if !env_allow.is_empty() {
+        env_allow
+    } else {
+        skills_cfg.allowlist.clone()
+    };
+
+    let mut deny = skills_cfg.denylist.clone();
+    deny.extend(env_deny);
+
+    if deny.iter().any(|s| s == skill_key || s == &entry.skill.name) {
+        return true;
+    }
+
+    if allow.is_empty() {
+        return false;
+    }
+    !allow.iter().any(|s| s == skill_key || s == &entry.skill.name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,15 +2109,7 @@ async fn install_command_spec(spec: &SkillInstallSpec, timeout_ms: u64) -> Skill
                     code: None,
                 };
             };
-            (
-                vec![
-                    "npm".to_string(),
-                    "install".to_string(),
-                    "-g".to_string(),
-                    package.to_string(),
-                ],
-                HashMap::new(),
-            )
+            (build_node_install_command(package), HashMap::new())
         }
         SkillInstallKind::Go => {
             let Some(module) = spec
@@ -1404,6 +2249,7 @@ async fn install_command_spec(spec: &SkillInstallSpec, timeout_ms: u64) -> Skill
 }
 
 async fn install_download_spec(
+    cfg: &Config,
     entry: &SkillEntry,
     spec: &SkillInstallSpec,
     timeout_ms: u64,
@@ -1427,7 +2273,7 @@ async fn install_download_spec(
         .unwrap_or("download")
         .to_string();
 
-    let target_dir = resolve_download_target_dir(entry, spec);
+    let target_dir = resolve_download_target_dir(cfg, entry, spec);
     if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
         let msg = e.to_string();
         return SkillInstallResult {
@@ -1501,16 +2347,16 @@ async fn install_download_spec(
     }
 }
 
-fn resolve_download_target_dir(entry: &SkillEntry, spec: &SkillInstallSpec) -> PathBuf {
+fn resolve_download_target_dir(cfg: &Config, entry: &SkillEntry, spec: &SkillInstallSpec) -> PathBuf {
     if let Some(target) = spec
         .target_dir
         .as_deref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        return resolve_user_path(target);
+        return crate::openclaw_paths::resolve_user_path(target);
     }
-    let state_dir = resolve_openclaw_state_dir()
+    let state_dir = crate::openclaw_paths::resolve_openclaw_state_dir(cfg)
         .or_else(|| Config::config_dir())
         .unwrap_or_else(|| PathBuf::from("."));
     let key = resolve_skill_key(entry);
@@ -1838,51 +2684,6 @@ fn is_config_path_truthy(config: &serde_json::Value, path_str: &str) -> bool {
         }
     }
     is_truthy(value)
-}
-
-fn resolve_openclaw_state_dir() -> Option<PathBuf> {
-    let override_env = std::env::var("OPENCLAW_STATE_DIR")
-        .ok()
-        .or_else(|| std::env::var("CLAWDBOT_STATE_DIR").ok())
-        .unwrap_or_default();
-    let trimmed = override_env.trim().to_string();
-    if !trimmed.is_empty() {
-        return Some(resolve_user_path(&trimmed));
-    }
-
-    let home = resolve_home_dir()?;
-    Some(home.join(".openclaw"))
-}
-
-fn resolve_home_dir() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let trimmed = profile.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    None
-}
-
-fn resolve_user_path(input: &str) -> PathBuf {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return PathBuf::from(trimmed);
-    }
-    if trimmed.starts_with('~') {
-        if let Some(home) = resolve_home_dir() {
-            let expanded = trimmed.replacen('~', &home.to_string_lossy(), 1);
-            let candidate = PathBuf::from(&expanded);
-            return candidate.canonicalize().unwrap_or_else(|_| candidate);
-        }
-    }
-    PathBuf::from(trimmed)
 }
 
 fn write_json_atomic<T: Serialize>(path: &PathBuf, value: &T) -> Result<(), ErrorShape> {

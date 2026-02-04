@@ -77,6 +77,7 @@ pub mod error_codes {
     pub const NOT_PAIRED: &str = "NOT_PAIRED";
     pub const AGENT_TIMEOUT: &str = "AGENT_TIMEOUT";
     pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
+    pub const FORBIDDEN: &str = "FORBIDDEN";
     pub const UNAVAILABLE: &str = "UNAVAILABLE";
 }
 

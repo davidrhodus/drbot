@@ -72,6 +72,15 @@ async fn send_req(
 
 #[tokio::test]
 async fn openclaw_handshake_and_health() {
+    // Enable tracing logs for debugging interop issues when running tests with `--nocapture`.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
     // Pick a free port.
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -173,6 +182,23 @@ async fn openclaw_handshake_and_health() {
     let payload = res.payload.expect("missing health payload");
     assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("ok"));
 
+    // Logs tail should include at least a few lines (connect.challenge + connect handshake).
+    let res = send_req(
+        &mut ws,
+        "logs1",
+        "logs.tail",
+        json!({ "limit": 50, "maxBytes": 200_000 }),
+    )
+    .await;
+    assert!(res.ok, "logs.tail failed: {:?}", res.error);
+    let payload = res.payload.expect("missing logs.tail payload");
+    let lines = payload
+        .get("lines")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(!lines.is_empty(), "expected logs.tail to return lines");
+
     // Smoke: a few additional OpenClaw methods we advertise should be implemented.
     let res = send_req(&mut ws, "3", "tts.status", json!({})).await;
     assert!(res.ok);
@@ -221,6 +247,81 @@ async fn openclaw_handshake_and_health() {
     assert_eq!(
         res.error.as_ref().and_then(|e| Some(e.code.as_str())),
         Some("UNAVAILABLE")
+    );
+
+    // chat.abort should return the OpenClaw payload shape even when nothing is in-flight.
+    let res = send_req(
+        &mut ws,
+        "chat_abort_1",
+        "chat.abort",
+        json!({ "sessionKey": "main" }),
+    )
+    .await;
+    assert!(res.ok, "chat.abort failed: {:?}", res.error);
+    let payload = res.payload.expect("missing chat.abort payload");
+    assert_eq!(payload.get("aborted").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        payload
+            .get("runIds")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
+        Some(0)
+    );
+
+    // chat.send stop command should act like abort and not require a provider.
+    let res = send_req(
+        &mut ws,
+        "chat_stop_1",
+        "chat.send",
+        json!({ "sessionKey": "main", "message": "/stop", "idempotencyKey": "stop-1" }),
+    )
+    .await;
+    assert!(res.ok, "chat.send /stop failed: {:?}", res.error);
+    let payload = res.payload.expect("missing chat.send /stop payload");
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    // chat.inject should append an assistant message that shows up in chat.history.
+    let res = send_req(
+        &mut ws,
+        "chat_inject_1",
+        "chat.inject",
+        json!({ "sessionKey": "main", "message": "hello", "label": "note" }),
+    )
+    .await;
+    assert!(res.ok, "chat.inject failed: {:?}", res.error);
+    let payload = res.payload.expect("missing chat.inject payload");
+    assert!(payload
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .is_some());
+
+    let res = send_req(
+        &mut ws,
+        "chat_history_1",
+        "chat.history",
+        json!({ "sessionKey": "main", "limit": 10 }),
+    )
+    .await;
+    assert!(res.ok, "chat.history failed: {:?}", res.error);
+    let payload = res.payload.expect("missing chat.history payload");
+    let messages = payload
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("chat.history did not return messages array");
+    assert!(!messages.is_empty());
+    let last = messages.last().unwrap();
+    assert_eq!(last.get("role").and_then(|v| v.as_str()), Some("assistant"));
+    let text = last
+        .get("content")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        text.contains("[note]"),
+        "expected injected label prefix in assistant message, got: {:?}",
+        text
     );
 
     // Heartbeats: enable and ensure last-heartbeat updates.
@@ -332,6 +433,364 @@ async fn openclaw_handshake_and_health() {
     assert_eq!(payload.get("removed").and_then(|v| v.as_bool()), Some(true));
 
     drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_node_role_authorization() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    // connect.challenge
+    let frame = recv_frame(&mut ws).await;
+    assert!(matches!(frame, GatewayFrame::Event(_)));
+
+    // connect as a node
+    let connect = GatewayFrame::Req(RequestFrame {
+        id: "1".to_string(),
+        method: "connect".to_string(),
+        params: Some(json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "role": "node",
+            "client": {
+                "id": "test-node",
+                "version": "0.0.0-test",
+                "platform": "test",
+                "mode": "test"
+            }
+        })),
+    });
+    ws.send(Message::Text(
+        serde_json::to_string(&connect).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut connect_res = None;
+    for _ in 0..10 {
+        match recv_frame(&mut ws).await {
+            GatewayFrame::Res(res) if res.id == "1" => {
+                connect_res = Some(res);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let res = connect_res.expect("did not receive connect response");
+    assert!(res.ok, "node connect failed: {:?}", res.error);
+
+    // Node role should be blocked from operator-only methods.
+    let res = send_req(&mut ws, "2", "config.get", json!({})).await;
+    assert!(!res.ok);
+    assert_eq!(
+        res.error.as_ref().map(|e| e.code.as_str()),
+        Some("FORBIDDEN")
+    );
+
+    // ...but should be able to request pairing.
+    let res = send_req(
+        &mut ws,
+        "3",
+        "node.pair.request",
+        json!({ "nodeId": "node-test-1" }),
+    )
+    .await;
+    assert!(res.ok, "node.pair.request failed: {:?}", res.error);
+
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_sessions_patch_and_resolve_label() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    // connect.challenge
+    let frame = recv_frame(&mut ws).await;
+    assert!(matches!(frame, GatewayFrame::Event(_)));
+
+    // connect as operator
+    let connect = GatewayFrame::Req(RequestFrame {
+        id: "1".to_string(),
+        method: "connect".to_string(),
+        params: Some(json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": {
+                "id": "test",
+                "version": "0.0.0-test",
+                "platform": "test",
+                "mode": "test"
+            }
+        })),
+    });
+    ws.send(Message::Text(
+        serde_json::to_string(&connect).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    for _ in 0..10 {
+        if matches!(recv_frame(&mut ws).await, GatewayFrame::Res(res) if res.id == "1" && res.ok) {
+            break;
+        }
+    }
+
+    // Patch session label + metadata (should create session if missing).
+    let res = send_req(
+        &mut ws,
+        "patch1",
+        "sessions.patch",
+        json!({
+            "key": "test-session",
+            "label": "my-test-worker",
+            "thinkingLevel": "low",
+            "model": "test-model"
+        }),
+    )
+    .await;
+    assert!(res.ok, "sessions.patch failed: {:?}", res.error);
+    let payload = res.payload.expect("missing sessions.patch payload");
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+    let entry = payload
+        .get("entry")
+        .and_then(|v| v.as_object())
+        .expect("sessions.patch did not return entry object");
+    assert_eq!(
+        entry.get("label").and_then(|v| v.as_str()),
+        Some("my-test-worker")
+    );
+    assert_eq!(
+        entry.get("thinkingLevel").and_then(|v| v.as_str()),
+        Some("low")
+    );
+    assert_eq!(
+        entry.get("model").and_then(|v| v.as_str()),
+        Some("test-model")
+    );
+
+    // Resolve by label.
+    let res = send_req(
+        &mut ws,
+        "resolve1",
+        "sessions.resolve",
+        json!({ "label": "my-test-worker" }),
+    )
+    .await;
+    assert!(res.ok, "sessions.resolve failed: {:?}", res.error);
+    let payload = res.payload.expect("missing sessions.resolve payload");
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        payload.get("key").and_then(|v| v.as_str()),
+        Some("test-session")
+    );
+
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_node_command_allowlist_enforced() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+
+    // Operator connection.
+    let (mut op_ws, _resp) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+    let _ = recv_frame(&mut op_ws).await; // connect.challenge
+    let _ = send_req(
+        &mut op_ws,
+        "op_connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "op", "version": "0.0.0-test", "platform": "test", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // Node connection (linux platform => system-only commands allowlisted).
+    let (mut node_ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = recv_frame(&mut node_ws).await; // connect.challenge
+    let _ = send_req(
+        &mut node_ws,
+        "node_connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "role": "node",
+            "commands": ["canvas.present", "system.run"],
+            "client": { "id": "node", "version": "0.0.0-test", "platform": "linux", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // Operator should see node and its filtered command list.
+    let res = send_req(&mut op_ws, "node_list_1", "node.list", json!({})).await;
+    assert!(res.ok, "node.list failed: {:?}", res.error);
+    let payload = res.payload.expect("missing node.list payload");
+    let nodes = payload
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first = nodes
+        .iter()
+        .find(|n| n.get("connected").and_then(|v| v.as_bool()) == Some(true))
+        .expect("expected a connected node");
+    let node_id = first
+        .get("nodeId")
+        .and_then(|v| v.as_str())
+        .expect("nodeId missing")
+        .to_string();
+    let commands = first
+        .get("commands")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let commands_str = commands
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        commands_str.contains(&"system.run"),
+        "expected system.run to be allowlisted"
+    );
+    assert!(
+        !commands_str.contains(&"canvas.present"),
+        "expected canvas.present to be filtered out for linux nodes"
+    );
+
+    // Operator should be blocked from invoking a non-allowlisted command.
+    let res = send_req(
+        &mut op_ws,
+        "node_invoke_1",
+        "node.invoke",
+        json!({
+            "nodeId": node_id,
+            "command": "canvas.present",
+            "idempotencyKey": "idem-1",
+            "timeoutMs": 10
+        }),
+    )
+    .await;
+    assert!(!res.ok, "expected node.invoke to fail");
+    assert_eq!(
+        res.error.as_ref().map(|e| e.code.as_str()),
+        Some("INVALID_REQUEST")
+    );
+    assert_eq!(
+        res.error.as_ref().map(|e| e.message.as_str()),
+        Some("node command not allowed")
+    );
+    let details = res.error.as_ref().and_then(|e| e.details.as_ref());
+    assert_eq!(
+        details
+            .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str()),
+        Some("command not allowlisted")
+    );
+
+    drop(op_ws);
+    drop(node_ws);
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
         .await

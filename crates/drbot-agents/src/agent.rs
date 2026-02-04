@@ -16,6 +16,8 @@ use uuid::Uuid;
 pub struct AgentConfig {
     /// Maximum iterations before stopping.
     pub max_iterations: usize,
+    /// Model override for provider calls (optional).
+    pub model: Option<String>,
     /// System prompt for the agent.
     pub system_prompt: String,
     /// Whether to use planning.
@@ -28,6 +30,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iterations: 10,
+            model: None,
             system_prompt:
                 "You are a helpful AI assistant that can use tools to accomplish tasks. \
                            Think step by step and use tools when needed."
@@ -226,7 +229,7 @@ impl Agent {
         );
 
         let options = ChatOptions {
-            model: None,
+            model: self.config.model.clone(),
             max_tokens: Some(4096),
             temperature: Some(0.7),
             top_p: None,

@@ -2,6 +2,13 @@
 
 use crate::client::Client;
 use crate::channel_manager::ChannelManager;
+use crate::openclaw_system::{
+    OpenclawSystemEvents, OpenclawSystemPresence, SystemEventEntry, SystemPresence,
+    SystemPresencePayload, SystemPresenceUpdate,
+};
+use crate::openclaw_polls::OpenclawPollStore;
+use crate::openclaw_logs::OpenclawLogBuffer;
+use crate::openclaw_web_login::OpenclawWebLoginStore;
 use drbot_anthropic::AnthropicProvider;
 use drbot_core::Config;
 use drbot_ollama::OllamaProvider;
@@ -13,9 +20,21 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::watch;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Outbound messages for the OpenClaw-compatible websocket connection.
+///
+/// We keep this enum independent of axum's websocket message type so the
+/// gateway state doesn't depend on the HTTP stack.
+#[derive(Debug, Clone)]
+pub enum OpenclawOutbound {
+    Text(String),
+    Close { code: u16, reason: String },
+}
 
 /// A connected OpenClaw gateway client (OpenClaw v3 compatibility endpoint).
 #[derive(Clone)]
@@ -26,6 +45,8 @@ pub struct OpenclawClient {
     pub client_mode: String,
     pub client_version: String,
     pub platform: String,
+    pub device_family: Option<String>,
+    pub model_identifier: Option<String>,
     pub display_name: Option<String>,
     pub instance_id: Option<String>,
     pub device_id: Option<String>,
@@ -36,7 +57,12 @@ pub struct OpenclawClient {
     pub permissions: HashMap<String, bool>,
     pub path_env: Option<String>,
     pub connected_at_ms: u64,
-    pub tx: mpsc::Sender<String>,
+    pub tx: mpsc::UnboundedSender<OpenclawOutbound>,
+    /// Approximate per-connection send buffer accounting (OpenClaw parity with
+    /// `ws.bufferedAmount` checks).
+    pub queued_bytes: Arc<AtomicU64>,
+    /// Set to true when the gateway has initiated a close for this connection.
+    pub closing: Arc<AtomicBool>,
     pub event_seq: Arc<AtomicU64>,
 }
 
@@ -71,13 +97,42 @@ struct GatewayStateInner {
     session_store: Option<Arc<dyn SessionStore>>,
     /// Outbound channels runtime (best-effort; used by OpenClaw send/poll).
     channel_manager: Arc<ChannelManager>,
+    /// OpenClaw "system events" queue (ephemeral, session-scoped).
+    openclaw_system_events: Arc<OpenclawSystemEvents>,
+    /// OpenClaw "system presence" table (ephemeral, TTL-pruned).
+    openclaw_system_presence: Arc<OpenclawSystemPresence>,
+    /// OpenClaw poll tracking store (best-effort).
+    openclaw_polls: Arc<OpenclawPollStore>,
+    /// OpenClaw `web.login.*` runtime (QR codes + connection status).
+    openclaw_web_login: Arc<OpenclawWebLoginStore>,
+    /// OpenClaw `logs.tail` buffer (best-effort).
+    openclaw_logs: Arc<OpenclawLogBuffer>,
+    /// Tracks which inbound channel listeners have been started (OpenClaw interop).
+    openclaw_inbound_started: Mutex<std::collections::HashSet<String>>,
+    /// In-flight OpenClaw `chat.send` runs (global registry for cross-connection abort).
+    openclaw_chat_runs: Mutex<HashMap<String, OpenclawChatRun>>,
+}
+
+#[derive(Clone)]
+pub struct OpenclawChatRun {
+    pub session_key: String,
+    pub run_id: String,
+    /// When set to `Some(reason)`, the run should abort and emit a `chat` event with
+    /// `state=aborted` and `stopReason=reason`.
+    pub cancel_tx: watch::Sender<Option<String>>,
+    pub started_at_ms: u64,
 }
 
 impl GatewayState {
     /// Create a new gateway state.
     pub fn new(config: Config) -> Self {
         let provider = init_provider(&config);
-        let channel_manager = Arc::new(ChannelManager::new(&config));
+        let openclaw_web_login = Arc::new(OpenclawWebLoginStore::new());
+        let channel_manager = Arc::new(ChannelManager::new(&config, openclaw_web_login.clone()));
+        let openclaw_system_events = Arc::new(OpenclawSystemEvents::new());
+        let openclaw_system_presence = Arc::new(OpenclawSystemPresence::new());
+        let openclaw_polls = Arc::new(OpenclawPollStore::new());
+        let openclaw_logs = Arc::new(OpenclawLogBuffer::new());
 
         // Initialize session store
         let session_store: Option<Arc<dyn SessionStore>> =
@@ -99,6 +154,13 @@ impl GatewayState {
                 provider,
                 session_store,
                 channel_manager,
+                openclaw_system_events,
+                openclaw_system_presence,
+                openclaw_polls,
+                openclaw_web_login,
+                openclaw_logs,
+                openclaw_inbound_started: Mutex::new(std::collections::HashSet::new()),
+                openclaw_chat_runs: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -120,6 +182,194 @@ impl GatewayState {
 
     pub fn channel_manager(&self) -> &ChannelManager {
         self.inner.channel_manager.as_ref()
+    }
+
+    pub fn openclaw_polls(&self) -> &OpenclawPollStore {
+        self.inner.openclaw_polls.as_ref()
+    }
+
+    pub fn openclaw_web_login(&self) -> &OpenclawWebLoginStore {
+        self.inner.openclaw_web_login.as_ref()
+    }
+
+    pub fn openclaw_logs(&self) -> &OpenclawLogBuffer {
+        self.inner.openclaw_logs.as_ref()
+    }
+
+    /// Register a channel listener as started for the inbound bridge.
+    ///
+    /// Returns `true` if this call should start the listener (i.e. it wasn't already started).
+    pub async fn openclaw_try_start_inbound_channel(&self, channel_type: &str) -> bool {
+        let channel_type = channel_type.trim();
+        if channel_type.is_empty() {
+            return false;
+        }
+        let mut started = self.inner.openclaw_inbound_started.lock().await;
+        if started.contains(channel_type) {
+            false
+        } else {
+            started.insert(channel_type.to_string());
+            true
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // OpenClaw chat run registry (for global idempotency + abort)
+    // ---------------------------------------------------------------------
+
+    pub async fn openclaw_register_chat_run(&self, key: &str, entry: OpenclawChatRun) {
+        let key = key.trim();
+        if key.is_empty() {
+            return;
+        }
+        let mut runs = self.inner.openclaw_chat_runs.lock().await;
+        // Preserve the first entry; concurrent leaders should not happen, but avoid
+        // clobbering a live cancel handle if cleanup was delayed.
+        runs.entry(key.to_string()).or_insert(entry);
+    }
+
+    /// Attempt to register a chat run if it does not already exist.
+    ///
+    /// Returns `true` if the run was inserted (caller is the leader) or `false` if a run
+    /// with the same key is already active.
+    pub async fn openclaw_try_register_chat_run(&self, key: &str, entry: OpenclawChatRun) -> bool {
+        let key = key.trim();
+        if key.is_empty() {
+            return false;
+        }
+        let mut runs = self.inner.openclaw_chat_runs.lock().await;
+        if runs.contains_key(key) {
+            return false;
+        }
+        runs.insert(key.to_string(), entry);
+        true
+    }
+
+    pub async fn openclaw_has_chat_run(&self, key: &str) -> bool {
+        let key = key.trim();
+        if key.is_empty() {
+            return false;
+        }
+        let runs = self.inner.openclaw_chat_runs.lock().await;
+        runs.contains_key(key)
+    }
+
+    pub async fn openclaw_unregister_chat_run(&self, key: &str) {
+        let key = key.trim();
+        if key.is_empty() {
+            return;
+        }
+        let mut runs = self.inner.openclaw_chat_runs.lock().await;
+        runs.remove(key);
+    }
+
+    pub async fn openclaw_abort_chat_runs(
+        &self,
+        session_key: &str,
+        run_id: Option<&str>,
+        stop_reason: &str,
+    ) -> Vec<String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Vec::new();
+        }
+        let run_id = run_id.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let stop_reason = stop_reason.trim();
+        let stop_reason = if stop_reason.is_empty() {
+            "rpc"
+        } else {
+            stop_reason
+        };
+
+        let mut aborted = Vec::new();
+        let runs = self.inner.openclaw_chat_runs.lock().await;
+        for entry in runs.values() {
+            if entry.session_key != session_key {
+                continue;
+            }
+            if let Some(target) = run_id.as_deref() {
+                if entry.run_id != target {
+                    continue;
+                }
+            }
+            let _ = entry.cancel_tx.send(Some(stop_reason.to_string()));
+            aborted.push(entry.run_id.clone());
+        }
+        aborted.sort();
+        aborted.dedup();
+        aborted
+    }
+
+    pub async fn openclaw_find_chat_run_session_key(&self, run_id: &str) -> Option<String> {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return None;
+        }
+        let runs = self.inner.openclaw_chat_runs.lock().await;
+        runs.values()
+            .find(|entry| entry.run_id == run_id)
+            .map(|entry| entry.session_key.clone())
+    }
+
+    // ---------------------------------------------------------------------
+    // OpenClaw system events + presence
+    // ---------------------------------------------------------------------
+
+    pub async fn openclaw_is_system_event_context_changed(
+        &self,
+        session_key: &str,
+        context_key: Option<&str>,
+    ) -> bool {
+        self.inner
+            .openclaw_system_events
+            .is_context_changed(session_key, context_key)
+            .await
+    }
+
+    pub async fn openclaw_enqueue_system_event(
+        &self,
+        session_key: &str,
+        text: &str,
+        context_key: Option<&str>,
+    ) {
+        self.inner
+            .openclaw_system_events
+            .enqueue(session_key, text, context_key)
+            .await;
+    }
+
+    pub async fn openclaw_peek_system_events(&self, session_key: &str) -> Vec<SystemEventEntry> {
+        self.inner.openclaw_system_events.peek(session_key).await
+    }
+
+    pub async fn openclaw_has_system_events(&self, session_key: &str) -> bool {
+        self.inner.openclaw_system_events.has_events(session_key).await
+    }
+
+    pub async fn openclaw_drain_system_event_entries(
+        &self,
+        session_key: &str,
+    ) -> Vec<SystemEventEntry> {
+        self.inner.openclaw_system_events.drain(session_key).await
+    }
+
+    pub async fn openclaw_update_system_presence(
+        &self,
+        payload: SystemPresencePayload,
+    ) -> SystemPresenceUpdate {
+        self.inner.openclaw_system_presence.update(payload).await
+    }
+
+    pub async fn openclaw_list_system_presence(&self) -> Vec<SystemPresence> {
+        self.inner.openclaw_system_presence.list().await
     }
 
     /// Register a new client.
@@ -162,6 +412,16 @@ impl GatewayState {
     pub async fn list_openclaw_clients(&self) -> Vec<OpenclawClient> {
         let clients = self.inner.openclaw_clients.read().await;
         clients.values().cloned().collect()
+    }
+
+    /// Get a connected OpenClaw v3 client by conn_id.
+    pub async fn get_openclaw_client(&self, conn_id: &str) -> Option<OpenclawClient> {
+        let conn_id = conn_id.trim();
+        if conn_id.is_empty() {
+            return None;
+        }
+        let clients = self.inner.openclaw_clients.read().await;
+        clients.get(conn_id).cloned()
     }
 
     /// Get the current OpenClaw presence state version.

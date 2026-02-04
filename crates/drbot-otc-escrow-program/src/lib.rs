@@ -13,6 +13,27 @@ use solana_program::system_instruction;
 use solana_program::sysvar::Sysvar;
 
 pub const ESCROW_SEED_PREFIX: &[u8] = b"drbot_otc_escrow";
+pub const RECEIPT_SEED_PREFIX: &[u8] = b"drbot_otc_receipt";
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[borsh(use_discriminant = true)]
+pub enum ReceiptStatus {
+    Open = 0,
+    Settled = 1,
+    Cancelled = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct EscrowReceiptState {
+    pub version: u8,
+    pub status: ReceiptStatus,
+}
+
+impl EscrowReceiptState {
+    pub const VERSION: u8 = 1;
+    pub const LEN: usize = 1 + 1;
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -122,6 +143,7 @@ pub enum EscrowError {
     InvalidTokenAccount = 9,
     MissingAccounts = 10,
     NotCancelable = 11,
+    AlreadyConsumed = 12,
 }
 
 impl From<EscrowError> for ProgramError {
@@ -147,6 +169,23 @@ pub fn derive_escrow_pda(
     )
 }
 
+pub fn derive_receipt_pda(
+    program_id: &Pubkey,
+    negotiation_id: &[u8; 16],
+    party_a: &Pubkey,
+    party_b: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            RECEIPT_SEED_PREFIX,
+            negotiation_id,
+            party_a.as_ref(),
+            party_b.as_ref(),
+        ],
+        program_id,
+    )
+}
+
 entrypoint!(process_instruction);
 
 pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -162,6 +201,7 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
     let mut ai = accounts.iter();
     let payer = next_account_info(&mut ai)?;
     let escrow = next_account_info(&mut ai)?;
+    let receipt = next_account_info(&mut ai)?;
     let party_a = next_account_info(&mut ai)?;
     let party_b = next_account_info(&mut ai)?;
     let system_program = next_account_info(&mut ai)?;
@@ -171,6 +211,9 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
+    }
+    if party_a.key != &terms.party_a || party_b.key != &terms.party_b {
+        return Err(EscrowError::InvalidParty.into());
     }
     if payer.key != party_a.key && payer.key != party_b.key {
         return Err(EscrowError::InvalidPayer.into());
@@ -182,6 +225,56 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
     let (expected_escrow, bump) =
         derive_escrow_pda(program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
     if &expected_escrow != escrow.key {
+        return Err(EscrowError::InvalidPda.into());
+    }
+
+    let (expected_receipt, receipt_bump) =
+        derive_receipt_pda(program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
+    if &expected_receipt != receipt.key {
+        return Err(EscrowError::InvalidPda.into());
+    }
+
+    let rent = Rent::from_account_info(rent_sysvar)?;
+
+    // Receipt replay protection:
+    // - create once per negotiation id (PDA)
+    // - status transitions: Open -> Settled / Cancelled
+    // - any non-Open status blocks re-creating an escrow for the same negotiation id
+    if receipt.owner == program_id && !receipt.data_is_empty() {
+        let existing = EscrowReceiptState::try_from_slice(&receipt.data.borrow())
+            .map_err(|_| EscrowError::TermsMismatch)?;
+        if existing.version != EscrowReceiptState::VERSION {
+            return Err(EscrowError::TermsMismatch.into());
+        }
+        if existing.status != ReceiptStatus::Open {
+            return Err(EscrowError::AlreadyConsumed.into());
+        }
+    } else if receipt.data_is_empty() {
+        let receipt_lamports = std::cmp::max(1, rent.minimum_balance(EscrowReceiptState::LEN));
+        let create_receipt_ix = system_instruction::create_account(
+            payer.key,
+            receipt.key,
+            receipt_lamports,
+            EscrowReceiptState::LEN as u64,
+            program_id,
+        );
+        invoke_signed(
+            &create_receipt_ix,
+            &[payer.clone(), receipt.clone(), system_program.clone()],
+            &[&[
+                RECEIPT_SEED_PREFIX,
+                &terms.negotiation_id,
+                terms.party_a.as_ref(),
+                terms.party_b.as_ref(),
+                &[receipt_bump],
+            ]],
+        )?;
+        let receipt_state = EscrowReceiptState {
+            version: EscrowReceiptState::VERSION,
+            status: ReceiptStatus::Open,
+        };
+        receipt_state.serialize(&mut &mut receipt.data.borrow_mut()[..])?;
+    } else if receipt.owner != program_id {
         return Err(EscrowError::InvalidPda.into());
     }
 
@@ -215,8 +308,7 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
     }
 
     // Create escrow PDA account.
-    let rent = Rent::from_account_info(rent_sysvar)?;
-    let lamports = rent.minimum_balance(EscrowState::LEN);
+    let lamports = std::cmp::max(1, rent.minimum_balance(EscrowState::LEN));
     let create_ix = system_instruction::create_account(
         payer.key,
         escrow.key,
@@ -323,6 +415,7 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
 
     let funder = next_account_info(&mut ai)?;
     let escrow = next_account_info(&mut ai)?;
+    let receipt = next_account_info(&mut ai)?;
     let party_a = next_account_info(&mut ai)?;
     let party_b = next_account_info(&mut ai)?;
     let rent_refund = next_account_info(&mut ai)?;
@@ -347,6 +440,22 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
         derive_escrow_pda(program_id, &state.negotiation_id, &state.party_a, &state.party_b);
     if &expected_escrow != escrow.key {
         return Err(EscrowError::InvalidPda.into());
+    }
+    let (expected_receipt, _receipt_bump) =
+        derive_receipt_pda(program_id, &state.negotiation_id, &state.party_a, &state.party_b);
+    if &expected_receipt != receipt.key {
+        return Err(EscrowError::InvalidPda.into());
+    }
+    if receipt.owner != program_id || receipt.data_is_empty() {
+        return Err(EscrowError::TermsMismatch.into());
+    }
+    let mut receipt_state =
+        EscrowReceiptState::try_from_slice(&receipt.data.borrow()).map_err(|_| EscrowError::TermsMismatch)?;
+    if receipt_state.version != EscrowReceiptState::VERSION {
+        return Err(EscrowError::TermsMismatch.into());
+    }
+    if receipt_state.status != ReceiptStatus::Open {
+        return Err(EscrowError::AlreadyConsumed.into());
     }
     if party_a.key != &state.party_a || party_b.key != &state.party_b {
         return Err(EscrowError::InvalidParty.into());
@@ -439,6 +548,8 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
     if state.a_funded && state.b_funded {
         msg!("Escrow fully funded; settling");
         settle(program_id, escrow, &state, party_a, party_b, rent_refund, token_program, a_vault, a_recipient, b_vault, b_recipient)?;
+        receipt_state.status = ReceiptStatus::Settled;
+        receipt_state.serialize(&mut &mut receipt.data.borrow_mut()[..])?;
     }
 
     Ok(())
@@ -506,7 +617,7 @@ fn settle<'a>(
 }
 
 fn token_transfer_from_escrow<'a>(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,
     escrow: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
     source_vault: &AccountInfo<'a>,
@@ -544,7 +655,7 @@ fn token_transfer_from_escrow<'a>(
 }
 
 fn token_close_from_escrow<'a>(
-    program_id: &Pubkey,
+    _program_id: &Pubkey,
     escrow: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
     vault: &AccountInfo<'a>,
@@ -600,6 +711,7 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let mut ai = accounts.iter();
     let caller = next_account_info(&mut ai)?;
     let escrow = next_account_info(&mut ai)?;
+    let receipt = next_account_info(&mut ai)?;
     let party_a = next_account_info(&mut ai)?;
     let party_b = next_account_info(&mut ai)?;
     let rent_refund = next_account_info(&mut ai)?;
@@ -620,6 +732,22 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         EscrowState::try_from_slice(&escrow.data.borrow()).map_err(|_| EscrowError::InvalidInstruction)?;
     if party_a.key != &state.party_a || party_b.key != &state.party_b {
         return Err(EscrowError::InvalidParty.into());
+    }
+    let (expected_receipt, _receipt_bump) =
+        derive_receipt_pda(program_id, &state.negotiation_id, &state.party_a, &state.party_b);
+    if &expected_receipt != receipt.key {
+        return Err(EscrowError::InvalidPda.into());
+    }
+    if receipt.owner != program_id || receipt.data_is_empty() {
+        return Err(EscrowError::TermsMismatch.into());
+    }
+    let mut receipt_state =
+        EscrowReceiptState::try_from_slice(&receipt.data.borrow()).map_err(|_| EscrowError::TermsMismatch)?;
+    if receipt_state.version != EscrowReceiptState::VERSION {
+        return Err(EscrowError::TermsMismatch.into());
+    }
+    if receipt_state.status != ReceiptStatus::Open {
+        return Err(EscrowError::AlreadyConsumed.into());
     }
     if rent_refund.key != &state.rent_refund {
         return Err(EscrowError::TermsMismatch.into());
@@ -697,6 +825,9 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let vault = b_vault.ok_or(EscrowError::MissingAccounts)?;
         token_close_from_escrow(program_id, escrow, token_program, vault, rent_refund, &state)?;
     }
+
+    receipt_state.status = ReceiptStatus::Cancelled;
+    receipt_state.serialize(&mut &mut receipt.data.borrow_mut()[..])?;
 
     close_account(escrow, rent_refund)?;
     Ok(())

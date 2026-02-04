@@ -13,7 +13,10 @@
 
 use crate::{Result, SolanaError};
 use borsh::BorshDeserialize;
-use drbot_otc_escrow_program::{derive_escrow_pda, EscrowInstruction, EscrowTerms, Leg, LegKind};
+use drbot_otc_escrow_program::{
+    derive_escrow_pda, derive_receipt_pda, EscrowInstruction, EscrowReceiptState, EscrowTerms, Leg,
+    LegKind, ReceiptStatus,
+};
 use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -24,15 +27,24 @@ use solana_sdk::signer::Signer;
 use solana_sdk::system_program;
 use solana_sdk::transaction::Transaction;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub type OnChainEscrowState = drbot_otc_escrow_program::EscrowState;
+pub type OnChainReceiptState = drbot_otc_escrow_program::EscrowReceiptState;
 
 /// Escrow state with address convenience.
 #[derive(Debug, Clone)]
 pub struct EscrowAccount {
     pub address: Pubkey,
     pub state: OnChainEscrowState,
+}
+
+/// Receipt state with address convenience.
+#[derive(Debug, Clone)]
+pub struct ReceiptAccount {
+    pub address: Pubkey,
+    pub state: OnChainReceiptState,
 }
 
 /// Parameters for creating an escrow (client-side convenience).
@@ -114,19 +126,47 @@ impl EscrowManager {
         ))
     }
 
+    /// Deterministically derive the receipt PDA for a given negotiation and counterparty pair.
+    pub fn derive_receipt_address(&self, negotiation_id: Uuid, party_a: Pubkey, party_b: Pubkey) -> Result<(Pubkey, u8)> {
+        let program_id = self.program_id()?;
+        Ok(derive_receipt_pda(
+            &program_id,
+            negotiation_id.as_bytes(),
+            &party_a,
+            &party_b,
+        ))
+    }
+
     pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
         spl_associated_token_account::get_associated_token_address(owner, mint)
     }
 
     /// Create (or verify) an escrow on-chain. Idempotent if escrow already exists with matching terms.
     pub async fn create_escrow(&self, payer: &Keypair, params: CreateEscrowParams) -> Result<(Pubkey, Signature)> {
+        self.create_escrow_with_fee_payer(payer, payer, params).await
+    }
+
+    /// Same as [`Self::create_escrow`] but allows a separate transaction fee-payer.
+    pub async fn create_escrow_with_fee_payer(
+        &self,
+        fee_payer: &Keypair,
+        rent_payer: &Keypair,
+        params: CreateEscrowParams,
+    ) -> Result<(Pubkey, Signature)> {
         let program_id = self.program_id()?;
         let terms = params.to_terms();
         let (escrow, _bump) = self.derive_address(params.negotiation_id, params.party_a, params.party_b)?;
+        let (receipt, _receipt_bump) = derive_receipt_pda(
+            &program_id,
+            params.negotiation_id.as_bytes(),
+            &params.party_a,
+            &params.party_b,
+        );
 
         let mut accounts = vec![
-            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(rent_payer.pubkey(), true),
             AccountMeta::new(escrow, false),
+            AccountMeta::new(receipt, false),
             AccountMeta::new_readonly(params.party_a, false),
             AccountMeta::new_readonly(params.party_b, false),
             AccountMeta::new_readonly(system_program::id(), false),
@@ -159,7 +199,8 @@ impl EscrowManager {
             .await
             .map_err(|e| SolanaError::RpcError(e.to_string()))?;
 
-        let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], bh);
+        let signers = unique_signers(fee_payer, &[rent_payer]);
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&fee_payer.pubkey()), &signers, bh);
 
         let sig = self
             .rpc_client
@@ -172,12 +213,19 @@ impl EscrowManager {
 
     /// Read escrow state from chain.
     pub async fn get_escrow(&self, address: &Pubkey) -> Result<EscrowAccount> {
+        self.try_get_escrow(address)
+            .await?
+            .ok_or_else(|| SolanaError::TransactionError(format!("Escrow account not found: {address}")))
+    }
+
+    /// Read escrow state from chain, returning `Ok(None)` if the account does not exist.
+    pub async fn try_get_escrow(&self, address: &Pubkey) -> Result<Option<EscrowAccount>> {
         let program_id = self.program_id()?;
-        let account = self
-            .rpc_client
-            .get_account(address)
-            .await
-            .map_err(|e| SolanaError::RpcError(e.to_string()))?;
+        let account = match self.rpc_client.get_account(address).await {
+            Ok(a) => a,
+            Err(e) if is_account_not_found(&e) => return Ok(None),
+            Err(e) => return Err(SolanaError::RpcError(e.to_string())),
+        };
 
         if account.owner != program_id {
             return Err(SolanaError::TransactionError(format!(
@@ -189,26 +237,154 @@ impl EscrowManager {
         let state = OnChainEscrowState::try_from_slice(&account.data)
             .map_err(|e| SolanaError::TransactionError(format!("Failed to decode escrow state: {e}")))?;
 
-        Ok(EscrowAccount {
+        Ok(Some(EscrowAccount {
             address: *address,
             state,
-        })
+        }))
+    }
+
+    /// Read receipt state from chain (replay protection marker).
+    pub async fn get_receipt(
+        &self,
+        negotiation_id: Uuid,
+        party_a: Pubkey,
+        party_b: Pubkey,
+    ) -> Result<Option<ReceiptAccount>> {
+        let program_id = self.program_id()?;
+        let (address, _bump) = self.derive_receipt_address(negotiation_id, party_a, party_b)?;
+
+        let account = match self.rpc_client.get_account(&address).await {
+            Ok(a) => a,
+            Err(e) if is_account_not_found(&e) => return Ok(None),
+            Err(e) => return Err(SolanaError::RpcError(e.to_string())),
+        };
+
+        if account.owner != program_id {
+            return Err(SolanaError::TransactionError(format!(
+                "Account owner mismatch (expected {}, got {})",
+                program_id, account.owner
+            )));
+        }
+
+        let state = EscrowReceiptState::try_from_slice(&account.data).map_err(|e| {
+            SolanaError::TransactionError(format!("Failed to decode receipt state: {e}"))
+        })?;
+
+        Ok(Some(ReceiptAccount { address, state }))
+    }
+
+    /// Convenience: return just the receipt status, if a receipt exists.
+    pub async fn get_receipt_status(
+        &self,
+        negotiation_id: Uuid,
+        party_a: Pubkey,
+        party_b: Pubkey,
+    ) -> Result<Option<ReceiptStatus>> {
+        Ok(self
+            .get_receipt(negotiation_id, party_a, party_b)
+            .await?
+            .map(|r| r.state.status))
+    }
+
+    /// Check if the escrow account is closed (not found).
+    ///
+    /// Notes:
+    /// - This is the expected state after auto-settlement (the second funding tx closes escrow).
+    /// - "Not found" can also mean "never created"; callers should ensure the escrow was created
+    ///   (or is deterministically derivable) before treating this as a settlement signal.
+    pub async fn is_escrow_closed(&self, address: &Pubkey) -> Result<bool> {
+        match self.rpc_client.get_account(address).await {
+            Ok(_) => Ok(false),
+            Err(e) if is_account_not_found(&e) => Ok(true),
+            Err(e) => Err(SolanaError::RpcError(e.to_string())),
+        }
+    }
+
+    /// Wait for escrow to close (auto-settlement) up to `timeout`.
+    ///
+    /// Returns `Ok(true)` if the account was observed closed before timeout.
+    pub async fn await_escrow_closed(
+        &self,
+        address: &Pubkey,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_escrow_closed(address).await? {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::cmp::min(poll_interval, remaining)).await;
+        }
     }
 
     /// Fund Party A. If this is the second fund, it will auto-settle and close escrow/vaults.
     pub async fn fund_party_a(&self, funder: &Keypair, escrow: Pubkey, token_source: Option<Pubkey>) -> Result<Signature> {
-        self.fund(funder, escrow, drbot_otc_escrow_program::EscrowParty::PartyA, token_source)
+        self.fund_with_fee_payer(
+            funder,
+            funder,
+            escrow,
+            drbot_otc_escrow_program::EscrowParty::PartyA,
+            token_source,
+        )
             .await
+    }
+
+    /// Same as [`Self::fund_party_a`] but allows a separate transaction fee-payer.
+    pub async fn fund_party_a_with_fee_payer(
+        &self,
+        fee_payer: &Keypair,
+        funder: &Keypair,
+        escrow: Pubkey,
+        token_source: Option<Pubkey>,
+    ) -> Result<Signature> {
+        self.fund_with_fee_payer(
+            fee_payer,
+            funder,
+            escrow,
+            drbot_otc_escrow_program::EscrowParty::PartyA,
+            token_source,
+        )
+        .await
     }
 
     /// Fund Party B. If this is the second fund, it will auto-settle and close escrow/vaults.
     pub async fn fund_party_b(&self, funder: &Keypair, escrow: Pubkey, token_source: Option<Pubkey>) -> Result<Signature> {
-        self.fund(funder, escrow, drbot_otc_escrow_program::EscrowParty::PartyB, token_source)
+        self.fund_with_fee_payer(
+            funder,
+            funder,
+            escrow,
+            drbot_otc_escrow_program::EscrowParty::PartyB,
+            token_source,
+        )
             .await
     }
 
-    async fn fund(
+    /// Same as [`Self::fund_party_b`] but allows a separate transaction fee-payer.
+    pub async fn fund_party_b_with_fee_payer(
         &self,
+        fee_payer: &Keypair,
+        funder: &Keypair,
+        escrow: Pubkey,
+        token_source: Option<Pubkey>,
+    ) -> Result<Signature> {
+        self.fund_with_fee_payer(
+            fee_payer,
+            funder,
+            escrow,
+            drbot_otc_escrow_program::EscrowParty::PartyB,
+            token_source,
+        )
+        .await
+    }
+
+    async fn fund_with_fee_payer(
+        &self,
+        fee_payer: &Keypair,
         funder: &Keypair,
         escrow: Pubkey,
         party: drbot_otc_escrow_program::EscrowParty,
@@ -217,6 +393,18 @@ impl EscrowManager {
         let program_id = self.program_id()?;
         let escrow_acct = self.get_escrow(&escrow).await?;
         let st = &escrow_acct.state;
+        let (receipt, _receipt_bump) =
+            derive_receipt_pda(&program_id, &st.negotiation_id, &st.party_a, &st.party_b);
+
+        let already_funded = match party {
+            drbot_otc_escrow_program::EscrowParty::PartyA => st.a_funded,
+            drbot_otc_escrow_program::EscrowParty::PartyB => st.b_funded,
+        };
+        if already_funded {
+            return Err(SolanaError::OTCError(format!(
+                "Escrow leg already funded ({party:?})"
+            )));
+        }
 
         // Best-effort: ensure recipient ATAs exist before funding so auto-settlement cannot fail
         // due to a missing destination token account.
@@ -226,7 +414,7 @@ impl EscrowManager {
             if should_create_account(self.rpc_client.get_account(&recipient).await.as_ref().err()) {
                 pre_instructions.push(
                     spl_associated_token_account::instruction::create_associated_token_account(
-                        &funder.pubkey(),
+                        &fee_payer.pubkey(),
                         &st.party_b,
                         &st.a_owes.mint,
                         &spl_token::id(),
@@ -239,7 +427,7 @@ impl EscrowManager {
             if should_create_account(self.rpc_client.get_account(&recipient).await.as_ref().err()) {
                 pre_instructions.push(
                     spl_associated_token_account::instruction::create_associated_token_account(
-                        &funder.pubkey(),
+                        &fee_payer.pubkey(),
                         &st.party_a,
                         &st.b_owes.mint,
                         &spl_token::id(),
@@ -251,6 +439,7 @@ impl EscrowManager {
         let mut accounts = vec![
             AccountMeta::new(funder.pubkey(), true),
             AccountMeta::new(escrow, false),
+            AccountMeta::new(receipt, false),
             AccountMeta::new(st.party_a, false),
             AccountMeta::new(st.party_b, false),
             AccountMeta::new(st.rent_refund, false),
@@ -303,7 +492,8 @@ impl EscrowManager {
 
         let mut ixs = pre_instructions;
         ixs.push(ix);
-        let tx = Transaction::new_signed_with_payer(&ixs, Some(&funder.pubkey()), &[funder], bh);
+        let signers = unique_signers(fee_payer, &[funder]);
+        let tx = Transaction::new_signed_with_payer(&ixs, Some(&fee_payer.pubkey()), &signers, bh);
         let sig = self
             .rpc_client
             .send_and_confirm_transaction(&tx)
@@ -314,13 +504,26 @@ impl EscrowManager {
 
     /// Cancel and refund any funded legs, then close escrow and vaults.
     pub async fn cancel(&self, caller: &Keypair, escrow: Pubkey) -> Result<Signature> {
+        self.cancel_with_fee_payer(caller, caller, escrow).await
+    }
+
+    /// Same as [`Self::cancel`] but allows a separate transaction fee-payer.
+    pub async fn cancel_with_fee_payer(
+        &self,
+        fee_payer: &Keypair,
+        caller: &Keypair,
+        escrow: Pubkey,
+    ) -> Result<Signature> {
         let program_id = self.program_id()?;
         let escrow_acct = self.get_escrow(&escrow).await?;
         let st = &escrow_acct.state;
+        let (receipt, _receipt_bump) =
+            derive_receipt_pda(&program_id, &st.negotiation_id, &st.party_a, &st.party_b);
 
         let mut accounts = vec![
             AccountMeta::new(caller.pubkey(), true),
             AccountMeta::new(escrow, false),
+            AccountMeta::new(receipt, false),
             AccountMeta::new(st.party_a, false),
             AccountMeta::new(st.party_b, false),
             AccountMeta::new(st.rent_refund, false),
@@ -354,7 +557,8 @@ impl EscrowManager {
             .await
             .map_err(|e| SolanaError::RpcError(e.to_string()))?;
 
-        let tx = Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], bh);
+        let signers = unique_signers(fee_payer, &[caller]);
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&fee_payer.pubkey()), &signers, bh);
         let sig = self
             .rpc_client
             .send_and_confirm_transaction(&tx)
@@ -364,8 +568,23 @@ impl EscrowManager {
     }
 }
 
+fn unique_signers<'a>(fee_payer: &'a Keypair, others: &[&'a Keypair]) -> Vec<&'a Keypair> {
+    let mut out: Vec<&'a Keypair> = Vec::with_capacity(1 + others.len());
+    out.push(fee_payer);
+    for signer in others {
+        if signer.pubkey() == fee_payer.pubkey() {
+            continue;
+        }
+        out.push(*signer);
+    }
+    out
+}
+
 fn should_create_account(err: Option<&ClientError>) -> bool {
-    let Some(err) = err else { return false };
+    err.is_some_and(is_account_not_found)
+}
+
+fn is_account_not_found(err: &ClientError) -> bool {
     let msg = err.to_string();
     msg.contains("AccountNotFound") || msg.contains("could not find account") || msg.contains("could not find")
 }

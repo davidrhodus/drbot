@@ -72,24 +72,24 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()
     write_text_atomic(path, &raw)
 }
 
-fn resolve_moltbook_skill_dir() -> PathBuf {
-    resolve_managed_skills_dir().join(MOLTBOOK_SKILL_KEY)
+fn resolve_moltbook_skill_dir(cfg: &Config) -> PathBuf {
+    resolve_managed_skills_dir(cfg).join(MOLTBOOK_SKILL_KEY)
 }
 
-fn resolve_moltbook_skill_path() -> PathBuf {
-    resolve_moltbook_skill_dir().join("SKILL.md")
+fn resolve_moltbook_skill_path(cfg: &Config) -> PathBuf {
+    resolve_moltbook_skill_dir(cfg).join("SKILL.md")
 }
 
-fn resolve_moltbook_heartbeat_path() -> PathBuf {
-    resolve_moltbook_skill_dir().join("HEARTBEAT.md")
+fn resolve_moltbook_heartbeat_path(cfg: &Config) -> PathBuf {
+    resolve_moltbook_skill_dir(cfg).join("HEARTBEAT.md")
 }
 
-fn resolve_moltbook_messaging_path() -> PathBuf {
-    resolve_moltbook_skill_dir().join("MESSAGING.md")
+fn resolve_moltbook_messaging_path(cfg: &Config) -> PathBuf {
+    resolve_moltbook_skill_dir(cfg).join("MESSAGING.md")
 }
 
-fn resolve_moltbook_package_json_path() -> PathBuf {
-    resolve_moltbook_skill_dir().join("package.json")
+fn resolve_moltbook_package_json_path(cfg: &Config) -> PathBuf {
+    resolve_moltbook_skill_dir(cfg).join("package.json")
 }
 
 fn resolve_meta_path(path: &Path) -> PathBuf {
@@ -417,12 +417,12 @@ pub async fn moltbook_request(
     }))
 }
 
-pub async fn sync_moltbook_docs_best_effort(_cfg: &Config) {
+pub async fn sync_moltbook_docs_best_effort(cfg: &Config) {
     if !moltbook_skill_enabled() {
         return;
     }
 
-    let skill_path = resolve_moltbook_skill_path();
+    let skill_path = resolve_moltbook_skill_path(cfg);
     if !should_attempt_sync(&skill_path) {
         return;
     }
@@ -454,9 +454,9 @@ pub async fn sync_moltbook_docs_best_effort(_cfg: &Config) {
         .filter(|v| *v >= 1_000)
         .unwrap_or(DEFAULT_SYNC_MIN_INTERVAL_MS);
 
-    let heartbeat_path = resolve_moltbook_heartbeat_path();
-    let messaging_path = resolve_moltbook_messaging_path();
-    let package_json_path = resolve_moltbook_package_json_path();
+    let heartbeat_path = resolve_moltbook_heartbeat_path(cfg);
+    let messaging_path = resolve_moltbook_messaging_path(cfg);
+    let package_json_path = resolve_moltbook_package_json_path(cfg);
 
     match sync_remote_text(&client, MOLTBOOK_SKILL_URL, &skill_path, min_interval_ms).await {
         Ok(updated) => debug!(

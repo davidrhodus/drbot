@@ -13,6 +13,7 @@ drbot-openai.workspace = true
 drbot-ollama.workspace = true
 drbot-sessions.workspace = true
 drbot-hex-util.workspace = true
+drbot-base64-util.workspace = true
 drbot-cron.workspace = true
 drbot-voice.workspace = true
 drbot-browser.workspace = true
@@ -47,6 +48,7 @@ chrono.workspace = true
 futures.workspace = true
 ring.workspace = true
 async-trait.workspace = true
+qrcode = "0.14"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
