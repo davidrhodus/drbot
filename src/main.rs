@@ -85,6 +85,14 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
 
+        /// Auto-approve bash commands with these prefixes (comma-separated). Use with --agent -y.
+        #[arg(long)]
+        bash_auto_approve_prefixes: Option<String>,
+
+        /// Auto-approve any bash command (still blocks rm/sudo/etc). Use with --agent -y. (Dangerous)
+        #[arg(long, default_value_t = false)]
+        bash_auto_approve_all: bool,
+
         /// Root directory for tool access (defaults to current directory)
         #[arg(long)]
         root: Option<String>,
@@ -232,6 +240,8 @@ async fn main() -> Result<()> {
             skill_url,
             agent,
             yes,
+            bash_auto_approve_prefixes,
+            bash_auto_approve_all,
             root,
             max_tool_rounds,
             message,
@@ -252,6 +262,8 @@ async fn main() -> Result<()> {
                 skill_url,
                 agent,
                 yes,
+                bash_auto_approve_prefixes,
+                bash_auto_approve_all,
                 root,
                 max_tool_rounds,
                 message,
@@ -633,7 +645,9 @@ fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
     s.push_str("- search: Search for a pattern under a path (uses ripgrep when available).\n");
     s.push_str("  args: { \"pattern\": string, \"path\": string }\n");
     s.push_str("\nRules:\n");
+    s.push_str("- In tool mode, you are an autonomous coding agent: when the user asks you to create/modify/run something, do it with tools (don't ask the user to run commands).\n");
     s.push_str("- Use relative paths unless absolutely necessary.\n");
+    s.push_str("- Each bash tool call runs with current_dir set to the tool root; it does NOT preserve state between calls (including cd). Use `cd some/dir && ...` within a single bash command when needed.\n");
     s.push_str("- Prefer safe, read-only commands (git status/diff, rg, cargo test, etc.).\n");
     s.push_str("- After a tool runs, you will receive a message starting with [Tool Result] or [Tool Denied]. Use it to continue.\n");
     s.push_str(&format!("\nTool root: {}\n", tool_root.display()));
@@ -906,15 +920,58 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
 }
 
 fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
-    let mut calls = Vec::new();
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BlockKind {
+        ToolJson,
+        BashCommand,
+    }
+
+    fn parse_fence_lang(trimmed: &str) -> Option<String> {
+        if !trimmed.starts_with("```") {
+            return None;
+        }
+        Some(
+            trimmed
+                .trim_start_matches("```")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase(),
+        )
+    }
+
+    fn normalize_bash_block(mut block: String) -> String {
+        // Strip common prompt prefixes (`$ `) to improve execution success.
+        let mut out = String::new();
+        for line in block.lines() {
+            let l = line.trim_end();
+            let l = l.strip_prefix("$ ").unwrap_or(l);
+            out.push_str(l);
+            out.push('\n');
+        }
+        out.trim().to_string()
+    }
+
+    let mut calls: Vec<ToolCallSpec> = Vec::new();
     let mut in_block = false;
     let mut block = String::new();
+    let mut kind: Option<BlockKind> = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
         if !in_block {
-            if trimmed.starts_with("```drbot_tool") {
+            let Some(lang) = parse_fence_lang(trimmed) else {
+                continue;
+            };
+            let block_kind = match lang.as_str() {
+                "drbot_tool" | "json" => Some(BlockKind::ToolJson),
+                "bash" | "sh" | "shell" | "zsh" => Some(BlockKind::BashCommand),
+                _ => None,
+            };
+            if let Some(bk) = block_kind {
                 in_block = true;
+                kind = Some(bk);
                 block.clear();
             }
             continue;
@@ -922,23 +979,39 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
 
         if trimmed.starts_with("```") {
             // End block -> parse
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&block) {
-                match value {
-                    serde_json::Value::Array(items) => {
-                        for item in items {
-                            if let Some(call) = parse_tool_call_value(&item) {
-                                calls.push(call);
+            match kind {
+                Some(BlockKind::ToolJson) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&block) {
+                        match value {
+                            serde_json::Value::Array(items) => {
+                                for item in items {
+                                    if let Some(call) = parse_tool_call_value(&item) {
+                                        calls.push(call);
+                                    }
+                                }
+                            }
+                            other => {
+                                if let Some(call) = parse_tool_call_value(&other) {
+                                    calls.push(call);
+                                }
                             }
                         }
                     }
-                    other => {
-                        if let Some(call) = parse_tool_call_value(&other) {
-                            calls.push(call);
-                        }
+                }
+                Some(BlockKind::BashCommand) => {
+                    let command = normalize_bash_block(std::mem::take(&mut block));
+                    if !command.is_empty() {
+                        calls.push(ToolCallSpec {
+                            tool: "bash".to_string(),
+                            args: serde_json::json!({ "command": command }),
+                        });
                     }
                 }
+                None => {}
             }
+
             in_block = false;
+            kind = None;
             block.clear();
             continue;
         }
@@ -947,11 +1020,115 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
         block.push('\n');
     }
 
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    // Allow lightweight patterns that local models often emit when "tool mode" prompts are ignored.
+    // Example: `bash: cd app && pnpm test`
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lowered = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lowered.strip_prefix("bash:") {
+            let cmd = trimmed[trimmed.len() - rest.len()..].trim();
+            if !cmd.is_empty() {
+                return vec![ToolCallSpec {
+                    tool: "bash".to_string(),
+                    args: serde_json::json!({ "command": cmd }),
+                }];
+            }
+        }
+    }
+
+    // Fallback: some models ignore the requested code-fence language and emit a raw JSON object/array.
+    // Extract the first JSON value that looks like a tool call.
+    fn extract_json_value_bounds(s: &str, start: usize, open: char, close: char) -> Option<(usize, usize)> {
+        let slice = s.get(start..)?;
+        let mut depth: i64 = 0;
+        let mut in_string = false;
+        let mut escape = false;
+
+        for (off, ch) in slice.char_indices() {
+            if in_string {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escape = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((start, start + off + ch.len_utf8()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        let (open, close) = match ch {
+            '{' => ('{', '}'),
+            '[' => ('[', ']'),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let Some((start, end)) = extract_json_value_bounds(text, i, open, close) else {
+            i += 1;
+            continue;
+        };
+        let json_str = &text[start..end];
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+            match value {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        if let Some(call) = parse_tool_call_value(&item) {
+                            calls.push(call);
+                        }
+                    }
+                }
+                other => {
+                    if let Some(call) = parse_tool_call_value(&other) {
+                        calls.push(call);
+                    }
+                }
+            }
+            if !calls.is_empty() {
+                break;
+            }
+        }
+
+        i = end;
+    }
+
     calls
 }
 
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ToolCallSpec> {
+    const SUPPORTED_TOOLS: &[&str] = &["bash", "read_file", "write_file", "list_dir", "search"];
+
     let tool = value.get("tool")?.as_str()?.to_string();
+    if !SUPPORTED_TOOLS.iter().any(|t| *t == tool) {
+        return None;
+    }
     let args = value
         .get("args")
         .cloned()
@@ -968,31 +1145,61 @@ fn prompt_approve(prompt: &str) -> Result<bool> {
     Ok(ans == "y" || ans == "yes")
 }
 
-fn bash_command_is_safe_for_auto_approve(command: &str) -> bool {
+#[derive(Debug, Clone, Default)]
+struct BashAutoApprovePolicy {
+    allow_all: bool,
+    prefixes: Vec<String>,
+}
+
+fn bash_command_is_safe_for_auto_approve(command: &str, policy: &BashAutoApprovePolicy) -> bool {
     const SAFE_PREFIXES: &[&str] = &[
         "git", "cargo", "rg", "ls", "cat", "sed", "grep", "find", "head", "tail", "wc", "sort",
         "uniq", "pwd", "echo",
     ];
+    const FORBIDDEN_COMMANDS: &[&str] = &["sudo", "rm", "mkfs", "dd", "shutdown", "reboot"];
 
     let cmd = command.trim();
     if cmd.is_empty() {
         return false;
     }
 
-    // Extremely conservative: block clearly destructive patterns.
-    let lowered = cmd.to_lowercase();
-    let forbidden = [
-        "sudo", " rm ", "rm -", " rm\t", "mkfs", "dd ", "shutdown", "reboot",
-    ];
-    if forbidden.iter().any(|f| lowered.contains(f))
-        || lowered.starts_with("rm ")
-        || lowered == "rm"
-    {
-        return false;
+    // Extremely conservative: block clearly destructive commands even when auto-approving.
+    //
+    // Avoid substring matching like `"dd "` which would incorrectly block innocuous commands
+    // containing that sequence (e.g. `pnpm add ...`).
+    let normalized = cmd.replace("&&", ";").replace("||", ";").replace('\n', ";");
+    for segment in normalized.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        for part in segment.split('|') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let first = part.split_whitespace().next().unwrap_or("");
+            let first_lower = first.to_ascii_lowercase();
+            let first_lower = first_lower.trim_start_matches('\\');
+            let base = first_lower.rsplit('/').next().unwrap_or(first_lower);
+            if FORBIDDEN_COMMANDS.contains(&base) {
+                return false;
+            }
+        }
     }
 
+    if policy.allow_all {
+        return true;
+    }
+
+    let allowed = if policy.prefixes.is_empty() {
+        SAFE_PREFIXES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    } else {
+        policy.prefixes.clone()
+    };
+
     let first = cmd.split_whitespace().next().unwrap_or("");
-    SAFE_PREFIXES.contains(&first)
+    allowed.iter().any(|p| first == p || first.ends_with(&format!("/{}", p)))
 }
 
 fn truncate_for_context(text: &str, max_chars: usize) -> String {
@@ -1227,6 +1434,8 @@ async fn run_chat(
     skill_url: Option<String>,
     agent: bool,
     yes: bool,
+    bash_auto_approve_prefixes: Option<String>,
+    bash_auto_approve_all: bool,
     root: Option<String>,
     max_tool_rounds: usize,
     single_message: Option<String>,
@@ -1330,6 +1539,9 @@ async fn run_chat(
     } else if new_session {
         // Force new session
         let mut session = Session::new(user_id, "cli", "terminal");
+        // `sessions` has a UNIQUE(channel_type, channel_id) constraint. For CLI we want multiple
+        // sessions, so make the channel_id unique per session.
+        session.channel_id = format!("terminal:{}", session.id);
         session.title = title.or_else(|| Some("CLI Chat".to_string()));
         session.model = model.clone();
         session.system_prompt = system.clone();
@@ -1359,6 +1571,8 @@ async fn run_chat(
             last_session
         } else {
             let mut session = Session::new(user_id, "cli", "terminal");
+            // See note above: ensure CLI sessions don't collide on UNIQUE(channel_type, channel_id).
+            session.channel_id = format!("terminal:{}", session.id);
             session.title = title.or_else(|| Some("CLI Chat".to_string()));
             session.model = model.clone();
             session.system_prompt = system.clone();
@@ -1384,6 +1598,30 @@ async fn run_chat(
         auto_approve: yes,
         root: tool_root,
         max_rounds: max_tool_rounds.max(1),
+    };
+
+    let bash_policy = {
+        let mut prefixes: Vec<String> = Vec::new();
+        if let Some(raw) = bash_auto_approve_prefixes
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            prefixes = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+        }
+        let allow_all =
+            bash_auto_approve_all || prefixes.iter().any(|p| p == "*" || p.eq_ignore_ascii_case("all"));
+        if allow_all {
+            prefixes.clear();
+        }
+        BashAutoApprovePolicy {
+            allow_all,
+            prefixes,
+        }
     };
 
     // Apply persona if specified
@@ -1503,7 +1741,7 @@ async fn run_chat(
                         .get("command")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if !bash_command_is_safe_for_auto_approve(command) {
+                    if !bash_command_is_safe_for_auto_approve(command, &bash_policy) {
                         let denied = Message::user(format!(
                             "[Tool Denied] tool=bash reason=unsafe_for_auto_approve\ncommand: {}",
                             command
@@ -1845,7 +2083,7 @@ async fn run_chat(
                             .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        bash_command_is_safe_for_auto_approve(command)
+                        bash_command_is_safe_for_auto_approve(command, &bash_policy)
                     } else {
                         true
                     };
@@ -2059,12 +2297,56 @@ hello
     }
 
     #[test]
+    fn extract_bash_fence_as_tool_call() {
+        let text = r#"
+Here is the command:
+
+```bash
+cd app && pnpm test
+```
+"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "bash");
+        assert_eq!(
+            calls[0].args.get("command").and_then(|v| v.as_str()),
+            Some("cd app && pnpm test")
+        );
+    }
+
+    #[test]
+    fn extract_bash_colon_line_as_tool_call() {
+        let text = "bash: cd app && pnpm build";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "bash");
+        assert_eq!(
+            calls[0].args.get("command").and_then(|v| v.as_str()),
+            Some("cd app && pnpm build")
+        );
+    }
+
+    #[test]
     fn safe_bash_auto_approve() {
-        assert!(bash_command_is_safe_for_auto_approve("git status"));
-        assert!(bash_command_is_safe_for_auto_approve("cargo test -q"));
-        assert!(!bash_command_is_safe_for_auto_approve("rm -rf /"));
-        assert!(!bash_command_is_safe_for_auto_approve("sudo ls"));
-        assert!(!bash_command_is_safe_for_auto_approve("./script.sh"));
+        let policy = BashAutoApprovePolicy::default();
+        assert!(bash_command_is_safe_for_auto_approve("git status", &policy));
+        assert!(bash_command_is_safe_for_auto_approve("cargo test -q", &policy));
+        assert!(!bash_command_is_safe_for_auto_approve("rm -rf /", &policy));
+        assert!(!bash_command_is_safe_for_auto_approve("sudo ls", &policy));
+        assert!(!bash_command_is_safe_for_auto_approve("dd if=/dev/zero of=/dev/null", &policy));
+        assert!(!bash_command_is_safe_for_auto_approve("./script.sh", &policy));
+    }
+
+    #[test]
+    fn safe_bash_auto_approve_does_not_false_positive_on_add() {
+        let policy = BashAutoApprovePolicy {
+            allow_all: false,
+            prefixes: vec!["cd".to_string(), "pnpm".to_string()],
+        };
+        assert!(bash_command_is_safe_for_auto_approve(
+            "cd app && pnpm add @solana/client",
+            &policy
+        ));
     }
 }
 

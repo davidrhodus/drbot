@@ -110,6 +110,8 @@ Options:
   -s, --system <PROMPT>    System prompt
       --skill-url <URL>    Load an OpenClaw-style SKILL.md from a URL (and linked relative docs)
       --agent              Enable tool use (bash, read/write files, search)
+      --bash-auto-approve-prefixes <CSV>  Auto-approve bash commands with these prefixes (use with --agent -y)
+      --bash-auto-approve-all            Auto-approve any bash command (still blocks rm/sudo/etc) (dangerous)
       --root <PATH>        Root directory for tool access (defaults to current directory)
   -M, --message <MSG>      Single message (non-interactive)
       --no-stream          Disable streaming
