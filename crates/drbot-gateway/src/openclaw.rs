@@ -5852,6 +5852,7 @@ async fn spawn_agent_run(
     provider: Arc<dyn Provider>,
     req_id: String,
     run_id: String,
+    agent_id: String,
     session_key: String,
     user_msg: Message,
     timeout_ms: Option<u64>,
@@ -5902,7 +5903,7 @@ async fn spawn_agent_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
-    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir("default");
+    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
     let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
         &workspace_dir,
         ctx.state.config(),
@@ -8164,6 +8165,12 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             }
             let session_key = session_key.unwrap_or_else(|| "main".to_string());
 
+            let agent_id_raw = params
+                .get("agentId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(crate::openclaw_paths::DEFAULT_AGENT_ID);
+            let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id_raw);
+
             let timeout_ms = params.get("timeout").and_then(|v| v.as_u64());
             let extra_system_prompt = params
                 .get("extraSystemPrompt")
@@ -8285,6 +8292,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     provider,
                     req.id.clone(),
                     run_id.clone(),
+                    agent_id.clone(),
                     session_key,
                     user_msg,
                     timeout_ms,
