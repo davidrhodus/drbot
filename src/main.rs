@@ -86,12 +86,21 @@ enum Commands {
         yes: bool,
 
         /// Auto-approve bash commands with these prefixes (comma-separated). Use with --agent -y.
+        /// This list is additive to the default safe prefixes.
         #[arg(long)]
         bash_auto_approve_prefixes: Option<String>,
+
+        /// Override the bash auto-approve allowlist entirely (comma-separated). Use with --agent -y.
+        #[arg(long)]
+        bash_auto_approve_allowlist: Option<String>,
 
         /// Auto-approve any bash command (still blocks rm/sudo/etc). Use with --agent -y. (Dangerous)
         #[arg(long, default_value_t = false)]
         bash_auto_approve_all: bool,
+
+        /// Strict agent mode: if the assistant gives instructions but no tool calls, reprompt for tools.
+        #[arg(long, default_value_t = false)]
+        agent_strict: bool,
 
         /// Root directory for tool access (defaults to current directory)
         #[arg(long)]
@@ -104,6 +113,10 @@ enum Commands {
         /// Single message (non-interactive mode)
         #[arg(short = 'M', long)]
         message: Option<String>,
+
+        /// Read the single message from a file (or '-' for stdin)
+        #[arg(long)]
+        message_file: Option<String>,
 
         /// Disable streaming
         #[arg(long)]
@@ -241,10 +254,13 @@ async fn main() -> Result<()> {
             agent,
             yes,
             bash_auto_approve_prefixes,
+            bash_auto_approve_allowlist,
             bash_auto_approve_all,
+            agent_strict,
             root,
             max_tool_rounds,
             message,
+            message_file,
             no_stream,
             session,
             new_session,
@@ -263,10 +279,13 @@ async fn main() -> Result<()> {
                 agent,
                 yes,
                 bash_auto_approve_prefixes,
+                bash_auto_approve_allowlist,
                 bash_auto_approve_all,
+                agent_strict,
                 root,
                 max_tool_rounds,
                 message,
+                message_file,
                 !no_stream,
                 session,
                 new_session,
@@ -547,6 +566,50 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+fn read_message_from_source(source: &str) -> Result<String> {
+    use std::io::Read;
+
+    if source == "-" {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        return Ok(buf);
+    }
+
+    let path = expand_tilde(source);
+    std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("failed to read message file '{}': {}", path, e))
+}
+
+fn resolve_single_message(
+    message: Option<String>,
+    message_file: Option<String>,
+) -> Result<Option<String>> {
+    if message.is_some() && message_file.is_some() {
+        return Err(anyhow::anyhow!(
+            "Provide only one of -M/--message or --message-file."
+        ));
+    }
+
+    if let Some(path) = message_file.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Ok(Some(read_message_from_source(path)?));
+    }
+
+    let Some(msg) = message else {
+        return Ok(None);
+    };
+    let trimmed = msg.trim();
+    if trimmed == "-" {
+        return Ok(Some(read_message_from_source("-")?));
+    }
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            return Ok(Some(read_message_from_source(rest)?));
+        }
+    }
+    Ok(Some(msg))
+}
+
 fn canonicalize_root(root: &Path) -> Result<PathBuf> {
     root.canonicalize()
         .map_err(|e| anyhow::anyhow!("Failed to resolve root '{}': {}", root.display(), e))
@@ -634,8 +697,9 @@ fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
     s.push_str("The JSON must be either a single object or an array of objects in this form:\n");
     s.push_str("{\"tool\":\"bash\",\"args\":{\"command\":\"git status\"}}\n");
     s.push_str("\nAvailable tools:\n");
-    s.push_str("- bash: Run a shell command in the tool root.\n");
-    s.push_str("  args: { \"command\": string }\n");
+    s.push_str("- bash: Run a shell command.\n");
+    s.push_str("  args: { \"command\": string, \"cwd\"?: string }\n");
+    s.push_str("  If cwd is provided, it must be a path under the tool root.\n");
     s.push_str("- read_file: Read a UTF-8 text file under the tool root.\n");
     s.push_str("  args: { \"path\": string }\n");
     s.push_str("- write_file: Write/replace a UTF-8 text file under the tool root.\n");
@@ -644,10 +708,12 @@ fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
     s.push_str("  args: { \"path\": string }\n");
     s.push_str("- search: Search for a pattern under a path (uses ripgrep when available).\n");
     s.push_str("  args: { \"pattern\": string, \"path\": string }\n");
+    s.push_str("- apply_patch: Apply a unified diff patch to files under the tool root.\n");
+    s.push_str("  args: { \"patch\": string }\n");
     s.push_str("\nRules:\n");
     s.push_str("- In tool mode, you are an autonomous coding agent: when the user asks you to create/modify/run something, do it with tools (don't ask the user to run commands).\n");
     s.push_str("- Use relative paths unless absolutely necessary.\n");
-    s.push_str("- Each bash tool call runs with current_dir set to the tool root; it does NOT preserve state between calls (including cd). Use `cd some/dir && ...` within a single bash command when needed.\n");
+    s.push_str("- Each bash tool call does NOT preserve state between calls (including cd). Prefer args.cwd instead of `cd ... && ...`.\n");
     s.push_str("- Prefer safe, read-only commands (git status/diff, rg, cargo test, etc.).\n");
     s.push_str("- After a tool runs, you will receive a message starting with [Tool Result] or [Tool Denied]. Use it to continue.\n");
     s.push_str(&format!("\nTool root: {}\n", tool_root.display()));
@@ -692,6 +758,26 @@ fn extract_markdown_inline_link_targets(markdown: &str) -> Vec<String> {
             continue;
         }
         i += 1;
+    }
+    out
+}
+
+fn extract_markdown_reference_definition_targets(markdown: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        let Some(end) = trimmed.find("]:") else {
+            continue;
+        };
+        let rest = trimmed[end + 2..].trim();
+        let token = rest.split_whitespace().next().unwrap_or("").trim();
+        if token.is_empty() {
+            continue;
+        }
+        out.push(token.to_string());
     }
     out
 }
@@ -797,11 +883,90 @@ async fn fetch_url_text(
     url: &str,
     max_bytes: usize,
 ) -> Result<String> {
-    let res = client.get(url).send().await?;
+    fn cache_path_for_url(url: &str) -> Option<PathBuf> {
+        let dir = Config::config_dir()?.join("skill_url_cache");
+        let key = Uuid::new_v5(&Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
+        Some(dir.join(format!("{}.json", key)))
+    }
+
+    fn load_cache(path: &Path) -> Option<(String, Option<String>, Option<String>)> {
+        let txt = std::fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+        let body = v.get("body")?.as_str()?.to_string();
+        let etag = v.get("etag").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let last_modified = v
+            .get("last_modified")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        Some((body, etag, last_modified))
+    }
+
+    fn store_cache(
+        path: &Path,
+        url: &str,
+        body: &str,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let v = serde_json::json!({
+            "url": url,
+            "etag": etag,
+            "last_modified": last_modified,
+            "body": body,
+        });
+        if let Ok(txt) = serde_json::to_string(&v) {
+            let _ = std::fs::write(path, txt);
+        }
+    }
+
+    let cache_path = cache_path_for_url(url);
+    let cached = cache_path
+        .as_deref()
+        .and_then(|p| load_cache(p));
+
+    let mut req = client.get(url);
+    if let Some((_, etag, last_modified)) = &cached {
+        if let Some(etag) = etag.as_deref() {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(lm) = last_modified.as_deref() {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+        }
+    }
+
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some((body, _, _)) = cached {
+                warn!(error = %e, url = %url, "skill-url fetch failed; using cached body");
+                return Ok(body);
+            }
+            return Err(anyhow::anyhow!("failed to fetch {}: {}", url, e));
+        }
+    };
+
+    if res.status() == reqwest::StatusCode::NOT_MODIFIED {
+        if let Some((body, _, _)) = cached {
+            return Ok(body);
+        }
+        return Err(anyhow::anyhow!("http 304 but no cache for {}", url));
+    }
+
     let status = res.status().as_u16();
     if status < 200 || status >= 300 {
+        if let Some((body, _, _)) = cached {
+            warn!(status, url = %url, "skill-url fetch returned error; using cached body");
+            return Ok(body);
+        }
         return Err(anyhow::anyhow!("http {} for {}", status, url));
     }
+
     if let Some(len) = res.content_length() {
         if len as usize > max_bytes {
             return Err(anyhow::anyhow!(
@@ -811,6 +976,18 @@ async fn fetch_url_text(
             ));
         }
     }
+
+    let etag = res
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = res
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let bytes = res.bytes().await?;
     if bytes.len() > max_bytes {
         return Err(anyhow::anyhow!(
@@ -819,7 +996,14 @@ async fn fetch_url_text(
             url
         ));
     }
-    String::from_utf8(bytes.to_vec()).map_err(|e| anyhow::anyhow!("invalid utf8 from {}: {}", url, e))
+    let body = String::from_utf8(bytes.to_vec())
+        .map_err(|e| anyhow::anyhow!("invalid utf8 from {}: {}", url, e))?;
+
+    if let Some(path) = cache_path.as_deref() {
+        store_cache(path, url, &body, etag, last_modified);
+    }
+
+    Ok(body)
 }
 
 async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
@@ -861,13 +1045,17 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
         ));
     }
 
-    let mut out = String::new();
-    out.push_str(main_body);
+    const SEP: &str = "\n\n---\n\n";
     let mut used_bytes = main_body.len();
+    let mut docs: Vec<String> = Vec::new();
+    let mut loaded_docs: Vec<String> = Vec::new();
 
     let mut seen = std::collections::HashSet::<PathBuf>::new();
     let mut docs_added = 0usize;
-    for target in extract_markdown_inline_link_targets(main_body) {
+    let mut targets = Vec::new();
+    targets.extend(extract_markdown_inline_link_targets(main_body));
+    targets.extend(extract_markdown_reference_definition_targets(main_body));
+    for target in targets {
         if docs_added >= max_relative_docs || used_bytes >= max_total_bytes {
             break;
         }
@@ -880,6 +1068,7 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
         if leaf.eq_ignore_ascii_case("SKILL.md") || leaf.eq_ignore_ascii_case("HEARTBEAT.md") {
             continue;
         }
+        let rel_display = rel_path.to_string_lossy().to_string();
         if !seen.insert(rel_path) {
             continue;
         }
@@ -907,13 +1096,50 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
         if body.is_empty() {
             continue;
         }
-        if used_bytes.saturating_add(body.len()) > max_total_bytes {
+        if used_bytes
+            .saturating_add(SEP.len())
+            .saturating_add(body.len())
+            > max_total_bytes
+        {
             break;
         }
-        out.push_str("\n\n---\n\n");
-        out.push_str(body);
-        used_bytes = used_bytes.saturating_add(body.len());
+        docs.push(body.to_string());
+        loaded_docs.push(rel_display);
+        used_bytes = used_bytes
+            .saturating_add(SEP.len())
+            .saturating_add(body.len());
         docs_added = docs_added.saturating_add(1);
+    }
+
+    let mut prefix = String::new();
+    prefix.push_str(&format!("[Skill URL] {}\n", url));
+    if !loaded_docs.is_empty() {
+        prefix.push_str(&format!(
+            "[Loaded Docs] {} linked markdown file(s):\n",
+            loaded_docs.len()
+        ));
+        for doc in &loaded_docs {
+            prefix.push_str(&format!("- {}\n", doc));
+        }
+    } else {
+        prefix.push_str("[Loaded Docs] (none)\n");
+    }
+    prefix.push_str("\n---\n\n");
+
+    // Keep the skill pack within bounds; drop the verbose prefix if needed.
+    if prefix.len().saturating_add(used_bytes) > max_total_bytes {
+        prefix = format!("[Skill URL] {}\n\n---\n\n", url);
+        if prefix.len().saturating_add(used_bytes) > max_total_bytes {
+            prefix.clear();
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&prefix);
+    out.push_str(main_body);
+    for body in docs {
+        out.push_str(SEP);
+        out.push_str(&body);
     }
 
     Ok(out)
@@ -1123,7 +1349,14 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
 }
 
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ToolCallSpec> {
-    const SUPPORTED_TOOLS: &[&str] = &["bash", "read_file", "write_file", "list_dir", "search"];
+    const SUPPORTED_TOOLS: &[&str] = &[
+        "bash",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "search",
+        "apply_patch",
+    ];
 
     let tool = value.get("tool")?.as_str()?.to_string();
     if !SUPPORTED_TOOLS.iter().any(|t| *t == tool) {
@@ -1148,7 +1381,8 @@ fn prompt_approve(prompt: &str) -> Result<bool> {
 #[derive(Debug, Clone, Default)]
 struct BashAutoApprovePolicy {
     allow_all: bool,
-    prefixes: Vec<String>,
+    extra_prefixes: Vec<String>,
+    override_prefixes: Option<Vec<String>>,
 }
 
 fn bash_command_is_safe_for_auto_approve(command: &str, policy: &BashAutoApprovePolicy) -> bool {
@@ -1192,10 +1426,24 @@ fn bash_command_is_safe_for_auto_approve(command: &str, policy: &BashAutoApprove
         return true;
     }
 
-    let allowed = if policy.prefixes.is_empty() {
+    let allowed: Vec<String> = if let Some(list) = &policy.override_prefixes {
+        list.clone()
+    } else if policy.extra_prefixes.is_empty() {
         SAFE_PREFIXES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
     } else {
-        policy.prefixes.clone()
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut out: Vec<String> = Vec::new();
+        for p in SAFE_PREFIXES.iter().map(|s| s.to_string()) {
+            if seen.insert(p.clone()) {
+                out.push(p);
+            }
+        }
+        for p in &policy.extra_prefixes {
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
+            }
+        }
+        out
     };
 
     let first = cmd.split_whitespace().next().unwrap_or("");
@@ -1210,7 +1458,7 @@ fn truncate_for_context(text: &str, max_chars: usize) -> String {
     format!("{}...\n[truncated]", truncated)
 }
 
-async fn run_bash_tool(root: &Path, command: &str) -> Result<(String, bool)> {
+async fn run_bash_tool(cwd: &Path, command: &str) -> Result<(String, bool)> {
     use tokio::process::Command;
 
     let output = tokio::time::timeout(
@@ -1218,7 +1466,7 @@ async fn run_bash_tool(root: &Path, command: &str) -> Result<(String, bool)> {
         Command::new("bash")
             .arg("-lc")
             .arg(command)
-            .current_dir(root)
+            .current_dir(cwd)
             .output(),
     )
     .await
@@ -1362,6 +1610,278 @@ async fn run_search_tool(root: &Path, pattern: &str, path: &str) -> Result<(Stri
     Ok((truncate_for_context(out.trim_end(), 40_000), is_error))
 }
 
+#[derive(Debug, Clone)]
+struct UnifiedDiffHunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    lines: Vec<(char, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedDiffFile {
+    old_path: String,
+    new_path: String,
+    hunks: Vec<UnifiedDiffHunk>,
+}
+
+fn strip_unified_diff_path(raw: &str) -> String {
+    let token = raw.trim().trim_matches('"');
+    if token == "/dev/null" {
+        return token.to_string();
+    }
+    token
+        .strip_prefix("a/")
+        .or_else(|| token.strip_prefix("b/"))
+        .unwrap_or(token)
+        .to_string()
+}
+
+fn parse_unified_diff_hunk_header(line: &str) -> Result<(usize, usize, usize, usize)> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("@@") {
+        return Err(anyhow::anyhow!("invalid hunk header: {}", line));
+    }
+    let Some(end) = trimmed[2..].find("@@").map(|i| i + 2) else {
+        return Err(anyhow::anyhow!("invalid hunk header: {}", line));
+    };
+    let body = trimmed[2..end].trim();
+    let mut parts = body.split_whitespace();
+    let old = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid hunk header: {}", line))?;
+    let new = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid hunk header: {}", line))?;
+
+    fn parse_range(token: &str, sigil: char) -> Result<(usize, usize)> {
+        let t = token
+            .strip_prefix(sigil)
+            .ok_or_else(|| anyhow::anyhow!("invalid hunk range: {}", token))?;
+        let mut it = t.split(',');
+        let start = it
+            .next()
+            .unwrap_or("")
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("invalid hunk start: {}", token))?;
+        let count = it
+            .next()
+            .map(|v| v.parse::<usize>())
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("invalid hunk count: {}", token))?
+            .unwrap_or(1);
+        Ok((start, count))
+    }
+
+    let (old_start, old_count) = parse_range(old, '-')?;
+    let (new_start, new_count) = parse_range(new, '+')?;
+    Ok((old_start, old_count, new_start, new_count))
+}
+
+fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>> {
+    let mut files: Vec<UnifiedDiffFile> = Vec::new();
+    let mut cur_old: Option<String> = None;
+    let mut cur_new: Option<String> = None;
+    let mut cur_hunks: Vec<UnifiedDiffHunk> = Vec::new();
+    let mut cur_hunk: Option<UnifiedDiffHunk> = None;
+
+    fn finish_hunk(cur_hunks: &mut Vec<UnifiedDiffHunk>, cur_hunk: &mut Option<UnifiedDiffHunk>) {
+        if let Some(h) = cur_hunk.take() {
+            cur_hunks.push(h);
+        }
+    }
+
+    fn finish_file(
+        files: &mut Vec<UnifiedDiffFile>,
+        cur_old: &mut Option<String>,
+        cur_new: &mut Option<String>,
+        cur_hunks: &mut Vec<UnifiedDiffHunk>,
+        cur_hunk: &mut Option<UnifiedDiffHunk>,
+    ) {
+        finish_hunk(cur_hunks, cur_hunk);
+        if let (Some(old_path), Some(new_path)) = (cur_old.take(), cur_new.take()) {
+            files.push(UnifiedDiffFile {
+                old_path,
+                new_path,
+                hunks: std::mem::take(cur_hunks),
+            });
+        } else {
+            cur_old.take();
+            cur_new.take();
+            cur_hunks.clear();
+        }
+    }
+
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            finish_file(&mut files, &mut cur_old, &mut cur_new, &mut cur_hunks, &mut cur_hunk);
+            let token = rest.trim().split_whitespace().next().unwrap_or("");
+            if token.is_empty() {
+                return Err(anyhow::anyhow!("invalid --- line: {}", line));
+            }
+            cur_old = Some(strip_unified_diff_path(token));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let token = rest.trim().split_whitespace().next().unwrap_or("");
+            if token.is_empty() {
+                return Err(anyhow::anyhow!("invalid +++ line: {}", line));
+            }
+            cur_new = Some(strip_unified_diff_path(token));
+            continue;
+        }
+        if line.trim_start().starts_with("@@") {
+            finish_hunk(&mut cur_hunks, &mut cur_hunk);
+            let (old_start, old_count, new_start, new_count) = parse_unified_diff_hunk_header(line)?;
+            cur_hunk = Some(UnifiedDiffHunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(h) = cur_hunk.as_mut() {
+            if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ') {
+                let kind = line.chars().next().unwrap();
+                let text = line[1..].to_string();
+                h.lines.push((kind, text));
+            } else if line.starts_with('\\') {
+                // "\ No newline at end of file" - ignore.
+            }
+        }
+    }
+
+    finish_file(&mut files, &mut cur_old, &mut cur_new, &mut cur_hunks, &mut cur_hunk);
+    Ok(files)
+}
+
+fn apply_unified_diff_to_text(original: &str, hunks: &[UnifiedDiffHunk]) -> Result<String> {
+    let had_trailing_newline = original.ends_with('\n');
+    let mut orig_lines: Vec<String> = original.split('\n').map(|s| s.to_string()).collect();
+    if had_trailing_newline {
+        if orig_lines.last().is_some_and(|l| l.is_empty()) {
+            orig_lines.pop();
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut orig_idx: usize = 0;
+
+    for hunk in hunks {
+        let target = hunk.old_start.saturating_sub(1);
+        if target < orig_idx {
+            return Err(anyhow::anyhow!("overlapping or out-of-order hunks"));
+        }
+        if target > orig_lines.len() {
+            return Err(anyhow::anyhow!("hunk starts past end of file"));
+        }
+
+        out.extend_from_slice(&orig_lines[orig_idx..target]);
+        let mut pos = target;
+        for (kind, text) in &hunk.lines {
+            match *kind {
+                ' ' => {
+                    let cur = orig_lines.get(pos).ok_or_else(|| {
+                        anyhow::anyhow!("context past end of file at line {}", pos + 1)
+                    })?;
+                    if cur != text {
+                        return Err(anyhow::anyhow!(
+                            "context mismatch at line {} (expected {:?}, found {:?})",
+                            pos + 1,
+                            text,
+                            cur
+                        ));
+                    }
+                    out.push(text.clone());
+                    pos += 1;
+                }
+                '-' => {
+                    let cur = orig_lines.get(pos).ok_or_else(|| {
+                        anyhow::anyhow!("remove past end of file at line {}", pos + 1)
+                    })?;
+                    if cur != text {
+                        return Err(anyhow::anyhow!(
+                            "remove mismatch at line {} (expected {:?}, found {:?})",
+                            pos + 1,
+                            text,
+                            cur
+                        ));
+                    }
+                    pos += 1;
+                }
+                '+' => {
+                    out.push(text.clone());
+                }
+                other => {
+                    return Err(anyhow::anyhow!("unknown hunk line kind: {}", other));
+                }
+            }
+        }
+        orig_idx = pos;
+    }
+
+    out.extend_from_slice(&orig_lines[orig_idx..]);
+
+    let mut rendered = out.join("\n");
+    if had_trailing_newline {
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+async fn run_apply_patch_tool(root: &Path, patch: &str) -> Result<String> {
+    let files = parse_unified_diff(patch)?;
+    if files.is_empty() {
+        return Err(anyhow::anyhow!("apply_patch: no file patches found"));
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    for fp in files {
+        let old_path = fp.old_path.clone();
+        let new_path = fp.new_path.clone();
+
+        if old_path != "/dev/null" && new_path != "/dev/null" && old_path != new_path {
+            return Err(anyhow::anyhow!(
+                "apply_patch: renames are not supported ({} -> {})",
+                old_path,
+                new_path
+            ));
+        }
+
+        if new_path == "/dev/null" {
+            let file = resolve_path_under_root(root, &old_path, true)?;
+            tokio::fs::remove_file(&file)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to delete '{}': {}", file.display(), e))?;
+            out_lines.push(format!("deleted {}", old_path));
+            continue;
+        }
+
+        let target_path = new_path.clone();
+        let original = if old_path == "/dev/null" {
+            String::new()
+        } else {
+            let file = resolve_path_under_root(root, &target_path, true)?;
+            let bytes = tokio::fs::read(&file)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", file.display(), e))?;
+            String::from_utf8_lossy(&bytes).to_string()
+        };
+
+        let mut updated = apply_unified_diff_to_text(&original, &fp.hunks)?;
+        if old_path == "/dev/null" && !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        let _ = run_write_file_tool(root, &target_path, &updated).await?;
+        out_lines.push(format!("patched {}", target_path));
+    }
+
+    Ok(out_lines.join("\n"))
+}
+
 async fn execute_tool_call(
     tool_cfg: &ToolModeConfig,
     call: &ToolCallSpec,
@@ -1373,7 +1893,22 @@ async fn execute_tool_call(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("bash tool requires args.command"))?;
-            let (output, is_error) = run_bash_tool(&tool_cfg.root, command).await?;
+            let cwd = call
+                .args
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let cwd_path = if let Some(cwd) = cwd {
+                let dir = resolve_path_under_root(&tool_cfg.root, cwd, true)?;
+                if !dir.is_dir() {
+                    return Err(anyhow::anyhow!("bash.cwd is not a directory: {}", cwd));
+                }
+                dir
+            } else {
+                tool_cfg.root.clone()
+            };
+            let (output, is_error) = run_bash_tool(&cwd_path, command).await?;
             Ok((output, is_error))
         }
         "read_file" => {
@@ -1422,8 +1957,74 @@ async fn execute_tool_call(
             let (output, is_error) = run_search_tool(&tool_cfg.root, pattern, path).await?;
             Ok((output, is_error))
         }
+        "apply_patch" => {
+            let patch = call
+                .args
+                .get("patch")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("apply_patch tool requires args.patch"))?;
+            let output = run_apply_patch_tool(&tool_cfg.root, patch).await?;
+            Ok((output, false))
+        }
         other => Err(anyhow::anyhow!("Unknown tool: {}", other)),
     }
+}
+
+fn should_reprompt_for_tool_calls(user_text: &str, assistant_text: &str) -> bool {
+    fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+        needles.iter().any(|n| haystack.contains(n))
+    }
+
+    let user = user_text.to_ascii_lowercase();
+    let assistant = assistant_text.to_ascii_lowercase();
+
+    // If the user is asking for actions/edits/runs, we strongly prefer tool calls.
+    let user_intends_actions = contains_any(
+        &user,
+        &[
+            "create",
+            "scaffold",
+            "build",
+            "install",
+            "run",
+            "execute",
+            "fix",
+            "update",
+            "edit",
+            "write",
+            "implement",
+            "refactor",
+            "add ",
+            "remove",
+            "generate",
+            "test",
+            "compile",
+            "lint",
+            "format",
+            "apply",
+            "patch",
+        ],
+    );
+
+    // If the assistant is outputting command-like content without tool calls, reprompt.
+    let assistant_looks_actionable = contains_any(
+        &assistant,
+        &[
+            "```", // code fences (often `bash` without tool JSON)
+            "$ ",
+            "cd ",
+            "pnpm ",
+            "npm ",
+            "npx ",
+            "node ",
+            "cargo ",
+            "git ",
+            "rg ",
+            "cat <<",
+        ],
+    );
+
+    user_intends_actions || assistant_looks_actionable
 }
 
 async fn run_chat(
@@ -1435,10 +2036,13 @@ async fn run_chat(
     agent: bool,
     yes: bool,
     bash_auto_approve_prefixes: Option<String>,
+    bash_auto_approve_allowlist: Option<String>,
     bash_auto_approve_all: bool,
+    agent_strict: bool,
     root: Option<String>,
     max_tool_rounds: usize,
     single_message: Option<String>,
+    message_file: Option<String>,
     stream: bool,
     session_id: Option<String>,
     new_session: bool,
@@ -1500,6 +2104,8 @@ async fn run_chat(
         }
         return Ok(());
     }
+
+    let single_message = resolve_single_message(single_message, message_file)?;
 
     // Determine which provider to use
     let provider_name = provider_name
@@ -1601,26 +2207,51 @@ async fn run_chat(
     };
 
     let bash_policy = {
-        let mut prefixes: Vec<String> = Vec::new();
-        if let Some(raw) = bash_auto_approve_prefixes
+        fn parse_csv(raw: &str) -> Vec<String> {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        }
+
+        let mut override_prefixes: Option<Vec<String>> = bash_auto_approve_allowlist
             .as_deref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-        {
-            prefixes = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>();
+            .map(parse_csv);
+
+        if let Some(list) = &override_prefixes {
+            if list.is_empty() {
+                override_prefixes = None;
+            }
         }
-        let allow_all =
-            bash_auto_approve_all || prefixes.iter().any(|p| p == "*" || p.eq_ignore_ascii_case("all"));
+
+        let mut extra_prefixes: Vec<String> = bash_auto_approve_prefixes
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(parse_csv)
+            .unwrap_or_default();
+
+        let mut allow_all = bash_auto_approve_all;
+        allow_all = allow_all
+            || override_prefixes
+                .as_ref()
+                .map(|v| v.iter().any(|p| p == "*" || p.eq_ignore_ascii_case("all")))
+                .unwrap_or(false)
+            || extra_prefixes
+                .iter()
+                .any(|p| p == "*" || p.eq_ignore_ascii_case("all"));
+
         if allow_all {
-            prefixes.clear();
+            override_prefixes = None;
+            extra_prefixes.clear();
         }
+
         BashAutoApprovePolicy {
             allow_all,
-            prefixes,
+            extra_prefixes,
+            override_prefixes,
         }
     };
 
@@ -1702,6 +2333,7 @@ async fn run_chat(
         let _ = context_manager.add_message(&user_msg);
         session.add_message(user_msg);
 
+        let mut strict_remaining = if agent_strict { 2usize } else { 0usize };
         let mut rounds = 0usize;
         loop {
             rounds += 1;
@@ -1731,6 +2363,18 @@ async fn run_chat(
 
             let calls = extract_tool_calls(&response);
             if calls.is_empty() {
+                if agent_strict
+                    && strict_remaining > 0
+                    && should_reprompt_for_tool_calls(&msg, &response)
+                {
+                    strict_remaining -= 1;
+                    let reminder = Message::user(
+                        "[Tool Mode Strict] Convert the previous response into tool calls. Reply ONLY with a `drbot_tool` code block containing JSON tool calls (object or array). No prose.",
+                    );
+                    let _ = context_manager.add_message(&reminder);
+                    session.add_message(reminder);
+                    continue;
+                }
                 break;
             }
 
@@ -1894,17 +2538,19 @@ async fn run_chat(
             println!();
             println!("Tools");
             println!("-----");
-            println!("bash       - run a shell command (rooted)");
+            println!("bash       - run a shell command (args: command, cwd?)");
             println!("read_file  - read a file under root");
             println!("write_file - write a file under root");
             println!("list_dir   - list a directory under root");
             println!("search     - search for a pattern under root");
+            println!("apply_patch - apply a unified diff patch under root");
             println!();
             println!("Tool mode: {}", if tool_cfg.enabled { "ON" } else { "OFF" });
             println!(
                 "Auto-approve: {}",
                 if tool_cfg.auto_approve { "ON" } else { "OFF" }
             );
+            println!("Strict agent: {}", if agent_strict { "ON" } else { "OFF" });
             println!("Root: {}", tool_cfg.root.display());
             println!("Max tool rounds: {}", tool_cfg.max_rounds);
             println!();
@@ -1995,6 +2641,7 @@ async fn run_chat(
 
             // Create new session
             session = Session::new(user_id, "cli", "terminal");
+            session.channel_id = format!("terminal:{}", session.id);
             session.title = Some("CLI Chat".to_string());
             session.model = model.clone();
             session.system_prompt = base_system.clone();
@@ -2019,6 +2666,7 @@ async fn run_chat(
         let _ = context_manager.add_message(&user_msg);
         session.add_message(user_msg.clone());
 
+        let mut strict_remaining = if agent_strict { 2usize } else { 0usize };
         let mut rounds = 0usize;
         loop {
             rounds += 1;
@@ -2067,6 +2715,18 @@ async fn run_chat(
 
             let calls = extract_tool_calls(&response);
             if calls.is_empty() {
+                if agent_strict
+                    && strict_remaining > 0
+                    && should_reprompt_for_tool_calls(input, &response)
+                {
+                    strict_remaining -= 1;
+                    let reminder = Message::user(
+                        "[Tool Mode Strict] Convert the previous response into tool calls. Reply ONLY with a `drbot_tool` code block containing JSON tool calls (object or array). No prose.",
+                    );
+                    let _ = context_manager.add_message(&reminder);
+                    session.add_message(reminder);
+                    continue;
+                }
                 // Auto-save after each exchange
                 session.update_timestamp();
                 let _ = store.update(&session).await;
@@ -2097,7 +2757,16 @@ async fn run_chat(
                                 .get("command")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            println!("[Tool] bash\n  command: {}", command);
+                            let cwd = call
+                                .args
+                                .get("cwd")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if cwd.trim().is_empty() {
+                                println!("[Tool] bash\n  command: {}", command);
+                            } else {
+                                println!("[Tool] bash\n  cwd: {}\n  command: {}", cwd.trim(), command);
+                            }
                         }
                         "read_file" => {
                             let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -2133,6 +2802,15 @@ async fn run_chat(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(".");
                             println!("[Tool] search\n  pattern: {}\n  path: {}", pattern, path);
+                        }
+                        "apply_patch" => {
+                            let bytes = call
+                                .args
+                                .get("patch")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            println!("[Tool] apply_patch\n  bytes: {}", bytes);
                         }
                         _ => {
                             println!("[Tool] {}", call.tool);
@@ -2341,7 +3019,8 @@ cd app && pnpm test
     fn safe_bash_auto_approve_does_not_false_positive_on_add() {
         let policy = BashAutoApprovePolicy {
             allow_all: false,
-            prefixes: vec!["cd".to_string(), "pnpm".to_string()],
+            extra_prefixes: vec!["cd".to_string(), "pnpm".to_string()],
+            override_prefixes: None,
         };
         assert!(bash_command_is_safe_for_auto_approve(
             "cd app && pnpm add @solana/client",
