@@ -155,6 +155,32 @@ async fn openclaw_handshake_and_health() {
     );
     assert_eq!(payload.get("protocol").and_then(|v| v.as_u64()), Some(3));
 
+    // OpenClaw clients rely on these defaults to choose the initial session key.
+    let session_defaults = payload
+        .get("snapshot")
+        .and_then(|v| v.get("sessionDefaults"))
+        .expect("missing snapshot.sessionDefaults");
+    assert_eq!(
+        session_defaults
+            .get("defaultAgentId")
+            .and_then(|v| v.as_str()),
+        Some("default")
+    );
+    assert_eq!(
+        session_defaults.get("mainKey").and_then(|v| v.as_str()),
+        Some("main")
+    );
+    assert_eq!(
+        session_defaults
+            .get("mainSessionKey")
+            .and_then(|v| v.as_str()),
+        Some("agent:default:main")
+    );
+    assert_eq!(
+        session_defaults.get("scope").and_then(|v| v.as_str()),
+        Some("per-sender")
+    );
+
     // Call health.
     let health = GatewayFrame::Req(RequestFrame {
         id: "2".to_string(),

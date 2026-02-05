@@ -9010,7 +9010,8 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 json!({
                     "defaultId": crate::openclaw_paths::DEFAULT_AGENT_ID,
                     "mainKey": "main",
-                    "scope": "global",
+                    // OpenClaw default unless explicitly configured as global.
+                    "scope": "per-sender",
                     "agents": agents,
                 }),
             )
@@ -14179,10 +14180,14 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                 state_dir: resolve_openclaw_state_dir(&state)
                     .map(|p| p.to_string_lossy().to_string()),
                 session_defaults: Some(json!({
-                    "defaultAgentId": "default",
+                    "defaultAgentId": crate::openclaw_paths::DEFAULT_AGENT_ID,
                     "mainKey": "main",
-                    "mainSessionKey": "main",
-                    "scope": "global"
+                    "mainSessionKey": canonicalize_openclaw_session_key(
+                        crate::openclaw_paths::DEFAULT_AGENT_ID,
+                        "main"
+                    ),
+                    // OpenClaw default unless explicitly configured as global.
+                    "scope": "per-sender"
                 })),
             };
 
