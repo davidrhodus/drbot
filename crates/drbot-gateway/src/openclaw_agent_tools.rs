@@ -301,6 +301,606 @@ impl AgentTool for MoltbookRequestTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Moltbook typed convenience tools
+// ---------------------------------------------------------------------------
+
+pub struct MoltbookPostTool {
+    state: GatewayState,
+}
+
+impl MoltbookPostTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookPostTool {
+    fn name(&self) -> &str {
+        "moltbook.post"
+    }
+
+    fn description(&self) -> &str {
+        "Create a post on Moltbook (approval-gated)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Post title." },
+                "content": { "type": "string", "description": "Post body (markdown)." },
+                "submolt": { "type": "string", "description": "Target submolt name." },
+                "dryRun": { "type": "boolean", "description": "If true, return a request preview without sending." }
+            },
+            "required": ["title", "content", "submolt"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let submolt = args.get("submolt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if title.is_empty() || content.is_empty() || submolt.is_empty() {
+            return Err(AgentError::ToolError("title, content, and submolt are required".to_string()));
+        }
+
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if !dry_run && !allow_write_by_env {
+            let approval = ExecApprovalRequestPayload {
+                command: format!("moltbook.post in s/{}", submolt),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some(format!("Allow creating a Moltbook post in s/{}?", submolt)),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some("https://www.moltbook.com/api/v1/posts".to_string()),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.post", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_create_post(&title, &content, &submolt, dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookFeedTool;
+
+#[async_trait]
+impl AgentTool for MoltbookFeedTool {
+    fn name(&self) -> &str {
+        "moltbook.feed"
+    }
+
+    fn description(&self) -> &str {
+        "Read the Moltbook feed (read-only)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "sort": { "type": "string", "description": "Sort order: hot, new, or top. Default: hot." },
+                "limit": { "type": "number", "description": "Number of posts (1-50, default 25)." },
+                "submolt": { "type": "string", "description": "Filter by submolt name (optional)." }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let sort = args.get("sort").and_then(|v| v.as_str()).unwrap_or("hot").trim().to_string();
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(25).max(1).min(50);
+        let submolt = args.get("submolt").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+
+        match crate::moltbook::moltbook_get_feed(&sort, limit, submolt.as_deref()).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookCommentTool {
+    state: GatewayState,
+}
+
+impl MoltbookCommentTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookCommentTool {
+    fn name(&self) -> &str {
+        "moltbook.comment"
+    }
+
+    fn description(&self) -> &str {
+        "Comment on a Moltbook post (approval-gated)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "postId": { "type": "string", "description": "ID of the post to comment on." },
+                "content": { "type": "string", "description": "Comment body (markdown)." },
+                "parentId": { "type": "string", "description": "Parent comment ID for threaded replies (optional)." },
+                "dryRun": { "type": "boolean", "description": "If true, return a request preview without sending." }
+            },
+            "required": ["postId", "content"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let post_id = args.get("postId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let parent_id = args.get("parentId").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if post_id.is_empty() || content.is_empty() {
+            return Err(AgentError::ToolError("postId and content are required".to_string()));
+        }
+
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if !dry_run && !allow_write_by_env {
+            let approval = ExecApprovalRequestPayload {
+                command: format!("moltbook.comment on post {}", post_id),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some(format!("Allow commenting on Moltbook post {}?", post_id)),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some(format!("https://www.moltbook.com/api/v1/posts/{}/comments", post_id)),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.comment", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_create_comment(&post_id, &content, parent_id.as_deref(), dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookVoteTool {
+    state: GatewayState,
+}
+
+impl MoltbookVoteTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookVoteTool {
+    fn name(&self) -> &str {
+        "moltbook.vote"
+    }
+
+    fn description(&self) -> &str {
+        "Upvote or downvote a Moltbook post (approval-gated)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "postId": { "type": "string", "description": "ID of the post to vote on." },
+                "direction": { "type": "string", "description": "Vote direction: up or down. Default: up." },
+                "dryRun": { "type": "boolean", "description": "If true, return a request preview without sending." }
+            },
+            "required": ["postId"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let post_id = args.get("postId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("up").trim().to_string();
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if post_id.is_empty() {
+            return Err(AgentError::ToolError("postId is required".to_string()));
+        }
+
+        let suffix = if direction == "down" { "downvote" } else { "upvote" };
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if !dry_run && !allow_write_by_env {
+            let approval = ExecApprovalRequestPayload {
+                command: format!("moltbook.vote {} post {}", suffix, post_id),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some(format!("Allow {} Moltbook post {}?", suffix, post_id)),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some(format!("https://www.moltbook.com/api/v1/posts/{}/{}", post_id, suffix)),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.vote", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_vote(&post_id, &direction, dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookIdentityTool {
+    state: GatewayState,
+}
+
+impl MoltbookIdentityTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookIdentityTool {
+    fn name(&self) -> &str {
+        "moltbook.identity"
+    }
+
+    fn description(&self) -> &str {
+        "Get agent profile, status, or generate an identity token."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "description": "Action: profile, status, or token. Default: profile. The token action is write (approval-gated)." },
+                "dryRun": { "type": "boolean", "description": "If true (token action only), return a request preview without sending." }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("profile").trim().to_string();
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let is_write = action == "token";
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if is_write && !dry_run && !allow_write_by_env {
+            let approval = ExecApprovalRequestPayload {
+                command: "moltbook.identity token".to_string(),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some("Allow generating a Moltbook identity token?".to_string()),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some("https://www.moltbook.com/api/v1/agents/me/identity-token".to_string()),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.identity", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_get_identity(&action, dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookSearchTool;
+
+#[async_trait]
+impl AgentTool for MoltbookSearchTool {
+    fn name(&self) -> &str {
+        "moltbook.search"
+    }
+
+    fn description(&self) -> &str {
+        "Search Moltbook posts, agents, and submolts (read-only)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query." },
+                "limit": { "type": "number", "description": "Max results (default 25)." }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(25).max(1).min(50);
+
+        if query.is_empty() {
+            return Err(AgentError::ToolError("query is required".to_string()));
+        }
+
+        match crate::moltbook::moltbook_search(&query, limit).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookFollowTool {
+    state: GatewayState,
+}
+
+impl MoltbookFollowTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookFollowTool {
+    fn name(&self) -> &str {
+        "moltbook.follow"
+    }
+
+    fn description(&self) -> &str {
+        "Follow or unfollow a Moltbook agent (approval-gated)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent": { "type": "string", "description": "Agent name to follow/unfollow." },
+                "unfollow": { "type": "boolean", "description": "If true, unfollow instead of follow. Default: false." },
+                "dryRun": { "type": "boolean", "description": "If true, return a request preview without sending." }
+            },
+            "required": ["agent"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let unfollow = args.get("unfollow").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if agent.is_empty() {
+            return Err(AgentError::ToolError("agent is required".to_string()));
+        }
+
+        let action_label = if unfollow { "unfollow" } else { "follow" };
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if !dry_run && !allow_write_by_env {
+            let approval = ExecApprovalRequestPayload {
+                command: format!("moltbook.follow {} {}", action_label, agent),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some(format!("Allow {} Moltbook agent {}?", action_label, agent)),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some(format!("https://www.moltbook.com/api/v1/agents/{}/follow", agent)),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.follow", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_follow(&agent, unfollow, dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookSubscribeTool {
+    state: GatewayState,
+}
+
+impl MoltbookSubscribeTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookSubscribeTool {
+    fn name(&self) -> &str {
+        "moltbook.subscribe"
+    }
+
+    fn description(&self) -> &str {
+        "Subscribe or unsubscribe from a Moltbook submolt (approval-gated)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "submolt": { "type": "string", "description": "Submolt name to subscribe/unsubscribe." },
+                "unsubscribe": { "type": "boolean", "description": "If true, unsubscribe instead of subscribe. Default: false." },
+                "dryRun": { "type": "boolean", "description": "If true, return a request preview without sending." }
+            },
+            "required": ["submolt"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let submolt = args.get("submolt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let unsubscribe = args.get("unsubscribe").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if submolt.is_empty() {
+            return Err(AgentError::ToolError("submolt is required".to_string()));
+        }
+
+        let action_label = if unsubscribe { "unsubscribe" } else { "subscribe" };
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if !dry_run && !allow_write_by_env {
+            let approval = ExecApprovalRequestPayload {
+                command: format!("moltbook.subscribe {} s/{}", action_label, submolt),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some(format!("Allow {} Moltbook submolt s/{}?", action_label, submolt)),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some(format!("https://www.moltbook.com/api/v1/submolts/{}/subscribe", submolt)),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.subscribe", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_subscribe(&submolt, unsubscribe, dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
+pub struct MoltbookDmTool {
+    state: GatewayState,
+}
+
+impl MoltbookDmTool {
+    pub fn new(state: GatewayState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MoltbookDmTool {
+    fn name(&self) -> &str {
+        "moltbook.dm"
+    }
+
+    fn description(&self) -> &str {
+        "Check for or send Moltbook direct messages (sends are approval-gated)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "description": "Action: check or send. Default: check." },
+                "to": { "type": "string", "description": "Recipient agent name (required for send)." },
+                "message": { "type": "string", "description": "Message text (required for send)." },
+                "dryRun": { "type": "boolean", "description": "If true (send action only), return a request preview without sending." }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("check").trim().to_string();
+        let to = args.get("to").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+        let message = args.get("message").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+        let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let is_write = action == "send";
+        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+        let mut allow_write = allow_write_by_env;
+        if is_write && !dry_run && !allow_write_by_env {
+            let to_label = to.as_deref().unwrap_or("?");
+            let approval = ExecApprovalRequestPayload {
+                command: format!("moltbook.dm send to {}", to_label),
+                cwd: None,
+                host: Some("moltbook".to_string()),
+                security: Some("integration-http-write".to_string()),
+                ask: Some(format!("Allow sending a Moltbook DM to {}?", to_label)),
+                agent_id: Some("default".to_string()),
+                resolved_path: Some("https://www.moltbook.com/api/v1/agents/dm/send".to_string()),
+                session_key: None,
+            };
+            crate::openclaw_exec_approvals::ensure_tool_write_allowed(&self.state, "moltbook.dm", approval, 120_000)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("{}: {}", e.code, e.message)))?;
+            allow_write = true;
+        }
+
+        match crate::moltbook::moltbook_dm(&action, to.as_deref(), message.as_deref(), dry_run, allow_write).await {
+            Ok(payload) => serde_json::to_string_pretty(&payload).map_err(|e| AgentError::ToolError(e.to_string())),
+            Err(err) => {
+                let mut msg = format!("{}: {}", err.code, err.message);
+                if let Some(details) = err.details {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&details) { msg.push('\n'); msg.push_str(&pretty); }
+                }
+                Err(AgentError::ToolError(msg))
+            }
+        }
+    }
+}
+
 pub struct SendTool {
     state: GatewayState,
 }

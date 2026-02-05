@@ -417,6 +417,149 @@ pub async fn moltbook_request(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Typed helpers — convenience wrappers around `moltbook_request()`.
+// ---------------------------------------------------------------------------
+
+/// Create a post on Moltbook.
+pub async fn moltbook_create_post(
+    title: &str,
+    content: &str,
+    submolt: &str,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    let body = json!({
+        "title": title,
+        "content": content,
+        "submolt": submolt,
+    });
+    moltbook_request("POST", "/posts", None, Some(&body), None, dry_run, allow_write).await
+}
+
+/// Read the feed (optionally filtered by submolt).
+pub async fn moltbook_get_feed(
+    sort: &str,
+    limit: u64,
+    submolt: Option<&str>,
+) -> Result<serde_json::Value, ErrorShape> {
+    let mut q = serde_json::Map::new();
+    q.insert("sort".to_string(), json!(sort));
+    q.insert("limit".to_string(), json!(limit));
+    let path = if let Some(s) = submolt {
+        q.insert("submolt".to_string(), json!(s));
+        "/feed".to_string()
+    } else {
+        "/feed".to_string()
+    };
+    let query = serde_json::Value::Object(q);
+    moltbook_request("GET", &path, Some(&query), None, None, false, false).await
+}
+
+/// Comment on a post.
+pub async fn moltbook_create_comment(
+    post_id: &str,
+    content: &str,
+    parent_id: Option<&str>,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    let mut body = serde_json::Map::new();
+    body.insert("content".to_string(), json!(content));
+    if let Some(pid) = parent_id {
+        body.insert("parentId".to_string(), json!(pid));
+    }
+    let path = format!("/posts/{}/comments", post_id);
+    let body_val = serde_json::Value::Object(body);
+    moltbook_request("POST", &path, None, Some(&body_val), None, dry_run, allow_write).await
+}
+
+/// Upvote or downvote a post.
+pub async fn moltbook_vote(
+    post_id: &str,
+    direction: &str,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    let suffix = if direction == "down" { "downvote" } else { "upvote" };
+    let path = format!("/posts/{}/{}", post_id, suffix);
+    moltbook_request("POST", &path, None, None, None, dry_run, allow_write).await
+}
+
+/// Get agent identity info (profile, status, or identity token).
+pub async fn moltbook_get_identity(
+    action: &str,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    match action {
+        "status" => moltbook_request("GET", "/agents/status", None, None, None, false, false).await,
+        "token" => moltbook_request("POST", "/agents/me/identity-token", None, None, None, dry_run, allow_write).await,
+        _ => moltbook_request("GET", "/agents/me", None, None, None, false, false).await, // "profile" or default
+    }
+}
+
+/// Search posts, agents, or submolts.
+pub async fn moltbook_search(
+    query_str: &str,
+    limit: u64,
+) -> Result<serde_json::Value, ErrorShape> {
+    let q = json!({ "q": query_str, "limit": limit });
+    moltbook_request("GET", "/search", Some(&q), None, None, false, false).await
+}
+
+/// Follow or unfollow an agent.
+pub async fn moltbook_follow(
+    agent: &str,
+    unfollow: bool,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    let path = format!("/agents/{}/follow", agent);
+    let method = if unfollow { "DELETE" } else { "POST" };
+    moltbook_request(method, &path, None, None, None, dry_run, allow_write).await
+}
+
+/// Subscribe or unsubscribe from a submolt.
+pub async fn moltbook_subscribe(
+    submolt: &str,
+    unsubscribe: bool,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    let path = format!("/submolts/{}/subscribe", submolt);
+    let method = if unsubscribe { "DELETE" } else { "POST" };
+    moltbook_request(method, &path, None, None, None, dry_run, allow_write).await
+}
+
+/// Check or send direct messages.
+pub async fn moltbook_dm(
+    action: &str,
+    to: Option<&str>,
+    message: Option<&str>,
+    dry_run: bool,
+    allow_write: bool,
+) -> Result<serde_json::Value, ErrorShape> {
+    match action {
+        "send" => {
+            let to = to.unwrap_or("");
+            let message = message.unwrap_or("");
+            if to.is_empty() || message.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "to and message are required for action=send",
+                ));
+            }
+            let body = json!({ "to": to, "message": message });
+            moltbook_request("POST", "/agents/dm/send", None, Some(&body), None, dry_run, allow_write).await
+        }
+        _ => {
+            // "check" or default
+            moltbook_request("GET", "/agents/dm/check", None, None, None, false, false).await
+        }
+    }
+}
+
 pub async fn sync_moltbook_docs_best_effort(cfg: &Config) {
     if !moltbook_skill_enabled() {
         return;

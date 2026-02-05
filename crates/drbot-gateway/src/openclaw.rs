@@ -159,6 +159,15 @@ const METHODS: &[&str] = &[
     // Integrations (non-OpenClaw; for hackathon interop)
     "colosseum.request",
     "moltbook.request",
+    "moltbook.post",
+    "moltbook.feed",
+    "moltbook.comment",
+    "moltbook.vote",
+    "moltbook.identity",
+    "moltbook.search",
+    "moltbook.follow",
+    "moltbook.subscribe",
+    "moltbook.dm",
     // Browser (stubbed/minimal)
     "browser.request",
     // Nodes + Devices (schema-light)
@@ -568,6 +577,94 @@ fn session_key_to_channel(key: &str) -> (String, String) {
     } else {
         ("openclaw".to_string(), key.to_string())
     }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedAgentSessionKey {
+    agent_id: String,
+    rest: String,
+}
+
+fn parse_agent_session_key(session_key: &str) -> Option<ParsedAgentSessionKey> {
+    let raw = session_key.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = raw.split(':').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    if !parts[0].eq_ignore_ascii_case("agent") {
+        return None;
+    }
+    let agent_id = parts[1].trim();
+    let rest = parts[2..].join(":");
+    if agent_id.is_empty() || rest.trim().is_empty() {
+        return None;
+    }
+    Some(ParsedAgentSessionKey {
+        agent_id: agent_id.to_string(),
+        rest,
+    })
+}
+
+fn canonicalize_openclaw_session_key(default_agent_id: &str, key: &str) -> String {
+    let raw = key.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.eq_ignore_ascii_case("global") {
+        return "global".to_string();
+    }
+    if raw.eq_ignore_ascii_case("unknown") {
+        return "unknown".to_string();
+    }
+
+    if raw.to_ascii_lowercase().starts_with("agent:") {
+        if let Some(parsed) = parse_agent_session_key(raw) {
+            let agent_id = crate::openclaw_paths::normalize_agent_id(&parsed.agent_id);
+            return format!("agent:{}:{}", agent_id, parsed.rest.trim());
+        }
+        return raw.to_string();
+    }
+
+    let agent_id = crate::openclaw_paths::normalize_agent_id(default_agent_id);
+    format!("agent:{}:{}", agent_id, raw)
+}
+
+fn openclaw_session_key_to_store_key(key: &str) -> String {
+    let raw = key.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    parse_agent_session_key(raw)
+        .map(|p| p.rest.trim().to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn openclaw_session_key_agent_id(key: &str, default_agent_id: &str) -> String {
+    let raw = key.trim();
+    if raw.is_empty() {
+        return crate::openclaw_paths::normalize_agent_id(default_agent_id);
+    }
+    if let Some(parsed) = parse_agent_session_key(raw) {
+        return crate::openclaw_paths::normalize_agent_id(&parsed.agent_id);
+    }
+    crate::openclaw_paths::normalize_agent_id(default_agent_id)
+}
+
+fn classify_openclaw_session_kind(key: &str) -> &'static str {
+    let normalized = key.trim().to_ascii_lowercase();
+    if normalized == "global" {
+        return "global";
+    }
+    if normalized == "unknown" {
+        return "unknown";
+    }
+    if normalized.contains(":group:") || normalized.contains(":channel:") {
+        return "group";
+    }
+    "direct"
 }
 
 const WS_CLOSE_CODE_POLICY_VIOLATION: u16 = 1008;
@@ -2755,8 +2852,7 @@ impl Default for OpenclawSessionsSidecarFile {
 }
 
 fn resolve_openclaw_sessions_sidecar_path(state: &GatewayState, agent_id: &str) -> PathBuf {
-    let agent_id = agent_id.trim();
-    let agent_id = if agent_id.is_empty() { "default" } else { agent_id };
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
     if let Some(dir) = resolve_openclaw_state_dir(state) {
         return dir
             .join("agents")
@@ -2848,70 +2944,377 @@ pub(crate) fn resolve_openclaw_session_model_override(
     if key.is_empty() {
         return None;
     }
-    let file = load_openclaw_sessions_sidecar(state, "default");
-    extract_sidecar_string(file.entries.get(key), "model")
+    let canonical = canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, key);
+    let agent_id = openclaw_session_key_agent_id(
+        &canonical,
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+    );
+    let file = load_openclaw_sessions_sidecar(state, &agent_id);
+    let entry = file.entries.get(&canonical).or_else(|| file.entries.get(key));
+    extract_sidecar_string(entry, "model")
 }
 
-async fn handle_sessions_list(state: &GatewayState) -> serde_json::Value {
+async fn handle_sessions_list(
+    state: &GatewayState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, ErrorShape> {
     let now = now_ms();
-    let sidecar_path = resolve_openclaw_sessions_sidecar_path(state, "default");
-    let sidecar = load_openclaw_sessions_sidecar(state, "default");
+    let params_obj = params.as_object().ok_or_else(|| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "invalid sessions.list params: expected object",
+        )
+    })?;
 
-    let mut sessions_out: Vec<serde_json::Value> = Vec::new();
-    let mut count = 0usize;
+    let mut limit: Option<usize> = None;
+    if let Some(v) = params_obj.get("limit") {
+        let Some(n) = v.as_i64() else {
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                "invalid sessions.list params: limit",
+            ));
+        };
+        if n < 1 {
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                "invalid sessions.list params: limit must be >= 1",
+            ));
+        }
+        limit = Some(n as usize);
+    }
 
-    if let Some(store) = state.session_store() {
-        let list = store
-            .list(drbot_sessions::ListOptions::default())
-            .await
-            .unwrap_or_default();
-        count = list.len();
+    let mut active_minutes: Option<u64> = None;
+    if let Some(v) = params_obj.get("activeMinutes") {
+        let Some(n) = v.as_i64() else {
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                "invalid sessions.list params: activeMinutes",
+            ));
+        };
+        if n < 1 {
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                "invalid sessions.list params: activeMinutes must be >= 1",
+            ));
+        }
+        active_minutes = Some(n as u64);
+    }
 
-        for s in list {
-            // For interop, treat OpenClaw sessions as those stored under channel_type "openclaw".
-            let key = if s.channel_type == "openclaw" {
-                s.channel_id.clone()
-            } else {
-                format!("{}:{}", s.channel_type, s.channel_id)
-            };
-            let kind = if key == "main" { "global" } else { "unknown" };
-            let sidecar_entry = sidecar.entries.get(&key);
-            sessions_out.push(json!({
-                "key": key,
-                "kind": kind,
-                "label": s.title,
-                "updatedAt": s.updated_at.timestamp_millis(),
-                "sessionId": s.id.to_string(),
-                "thinkingLevel": extract_sidecar_string(sidecar_entry, "thinkingLevel"),
-                "verboseLevel": extract_sidecar_string(sidecar_entry, "verboseLevel"),
-                "reasoningLevel": extract_sidecar_string(sidecar_entry, "reasoningLevel"),
-                "responseUsage": extract_sidecar_literal(sidecar_entry, "responseUsage"),
-                "elevatedLevel": extract_sidecar_string(sidecar_entry, "elevatedLevel"),
-                "execHost": extract_sidecar_string(sidecar_entry, "execHost"),
-                "execSecurity": extract_sidecar_string(sidecar_entry, "execSecurity"),
-                "execAsk": extract_sidecar_string(sidecar_entry, "execAsk"),
-                "execNode": extract_sidecar_string(sidecar_entry, "execNode"),
-                "sendPolicy": extract_sidecar_literal(sidecar_entry, "sendPolicy"),
-                "groupActivation": extract_sidecar_literal(sidecar_entry, "groupActivation"),
-                "spawnedBy": extract_sidecar_string(sidecar_entry, "spawnedBy"),
-                "inputTokens": s.metadata.total_input_tokens,
-                "outputTokens": s.metadata.total_output_tokens,
-                "totalTokens": s.metadata.total_input_tokens + s.metadata.total_output_tokens,
-                "model": extract_sidecar_string(sidecar_entry, "model").or(s.model),
-            }));
+    let bool_field = |name: &str| -> Result<bool, ErrorShape> {
+        match params_obj.get(name) {
+            None => Ok(false),
+            Some(v) => v.as_bool().ok_or_else(|| {
+                ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    format!("invalid sessions.list params: {}", name),
+                )
+            }),
+        }
+    };
+
+    let include_global = bool_field("includeGlobal")?;
+    let include_unknown = bool_field("includeUnknown")?;
+    let include_derived_titles = bool_field("includeDerivedTitles")?;
+    let include_last_message = bool_field("includeLastMessage")?;
+
+    let string_field = |name: &str| -> Result<Option<String>, ErrorShape> {
+        match params_obj.get(name) {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+            Some(_) => Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                format!("invalid sessions.list params: {}", name),
+            )),
+        }
+    };
+
+    let label_filter = string_field("label")?;
+    let spawned_by_filter = string_field("spawnedBy")?;
+    let agent_id_filter = string_field("agentId")?
+        .map(|s| crate::openclaw_paths::normalize_agent_id(&s))
+        .filter(|s| !s.is_empty());
+    let search_filter = string_field("search")?
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let store_path = state.config().storage.database_path.to_string_lossy().to_string();
+    let defaults = json!({
+        "modelProvider": state.config().providers.default_provider,
+        "model": state.config().providers.default_model,
+        "contextTokens": null,
+    });
+
+    let Some(store) = state.session_store() else {
+        return Ok(json!({
+            "ts": now,
+            "path": store_path,
+            "sidecarPath": resolve_openclaw_sessions_sidecar_path(state, crate::openclaw_paths::DEFAULT_AGENT_ID).to_string_lossy(),
+            "count": 0,
+            "defaults": defaults,
+            "sessions": [],
+        }));
+    };
+
+    let list = store
+        .list(drbot_sessions::ListOptions::default())
+        .await
+        .unwrap_or_default();
+
+    struct Row {
+        session_id: Uuid,
+        canonical_key: String,
+        agent_id: String,
+        row: serde_json::Map<String, serde_json::Value>,
+    }
+
+    let mut sidecar_cache: HashMap<String, OpenclawSessionsSidecarFile> = HashMap::new();
+    let mut rows: Vec<Row> = Vec::new();
+
+    let default_agent_id = crate::openclaw_paths::DEFAULT_AGENT_ID;
+
+    for s in list {
+        let raw_key = if s.channel_type == "openclaw" {
+            s.channel_id.clone()
+        } else {
+            format!("{}:{}", s.channel_type, s.channel_id)
+        };
+        let canonical_key = canonicalize_openclaw_session_key(default_agent_id, &raw_key);
+        if canonical_key.is_empty() {
+            continue;
+        }
+
+        let kind = classify_openclaw_session_kind(&canonical_key);
+        if kind == "global" && !include_global {
+            continue;
+        }
+        if kind == "unknown" && !include_unknown {
+            continue;
+        }
+
+        let agent_id = openclaw_session_key_agent_id(&canonical_key, default_agent_id);
+        if let Some(filter) = agent_id_filter.as_deref() {
+            if kind == "global" || kind == "unknown" {
+                continue;
+            }
+            if agent_id != filter {
+                continue;
+            }
+        }
+
+        if let Some(label) = label_filter.as_deref() {
+            if s.title.as_deref() != Some(label) {
+                continue;
+            }
+        }
+
+        let sidecar = sidecar_cache
+            .entry(agent_id.clone())
+            .or_insert_with(|| load_openclaw_sessions_sidecar(state, &agent_id));
+        let sidecar_entry = sidecar
+            .entries
+            .get(&canonical_key)
+            .or_else(|| sidecar.entries.get(&raw_key));
+
+        if let Some(spawned_by) = spawned_by_filter.as_deref() {
+            if kind == "global" || kind == "unknown" {
+                continue;
+            }
+            if extract_sidecar_string(sidecar_entry, "spawnedBy").as_deref() != Some(spawned_by) {
+                continue;
+            }
+        }
+
+        let updated_at_ms = s.updated_at.timestamp_millis();
+        if let Some(active) = active_minutes {
+            let cutoff = (now as i64).saturating_sub((active as i64).saturating_mul(60_000));
+            if updated_at_ms < cutoff {
+                continue;
+            }
+        }
+
+        let total_tokens = s.metadata.total_input_tokens + s.metadata.total_output_tokens;
+        let model = extract_sidecar_string(sidecar_entry, "model")
+            .or(s.model.clone())
+            .or_else(|| state.config().providers.default_model.clone());
+
+        let mut row = serde_json::Map::new();
+        row.insert("key".to_string(), json!(canonical_key.clone()));
+        row.insert("kind".to_string(), json!(kind));
+        row.insert("updatedAt".to_string(), json!(updated_at_ms));
+        row.insert("sessionId".to_string(), json!(s.id.to_string()));
+
+        if let Some(label) = s.title.clone() {
+            row.insert("label".to_string(), json!(label.clone()));
+            row.insert("displayName".to_string(), json!(label));
+        }
+
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "thinkingLevel") {
+            row.insert("thinkingLevel".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "verboseLevel") {
+            row.insert("verboseLevel".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "reasoningLevel") {
+            row.insert("reasoningLevel".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_literal(sidecar_entry, "responseUsage") {
+            row.insert("responseUsage".to_string(), v);
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "elevatedLevel") {
+            row.insert("elevatedLevel".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "execHost") {
+            row.insert("execHost".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "execSecurity") {
+            row.insert("execSecurity".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "execAsk") {
+            row.insert("execAsk".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "execNode") {
+            row.insert("execNode".to_string(), json!(v));
+        }
+        if let Some(v) = extract_sidecar_literal(sidecar_entry, "sendPolicy") {
+            row.insert("sendPolicy".to_string(), v);
+        }
+        if let Some(v) = extract_sidecar_literal(sidecar_entry, "groupActivation") {
+            row.insert("groupActivation".to_string(), v);
+        }
+        if let Some(v) = extract_sidecar_string(sidecar_entry, "spawnedBy") {
+            row.insert("spawnedBy".to_string(), json!(v));
+        }
+
+        row.insert("inputTokens".to_string(), json!(s.metadata.total_input_tokens));
+        row.insert("outputTokens".to_string(), json!(s.metadata.total_output_tokens));
+        row.insert("totalTokens".to_string(), json!(total_tokens));
+
+        if let Some(v) = state.config().providers.default_provider.clone() {
+            row.insert("modelProvider".to_string(), json!(v));
+        }
+        if let Some(v) = model {
+            row.insert("model".to_string(), json!(v));
+        }
+
+        if let Some(search) = search_filter.as_deref() {
+            let hay = [
+                row.get("displayName").and_then(|v| v.as_str()),
+                row.get("label").and_then(|v| v.as_str()),
+                Some(canonical_key.as_str()),
+                row.get("sessionId").and_then(|v| v.as_str()),
+            ];
+            let mut matched = false;
+            for field in hay {
+                if let Some(text) = field {
+                    if text.to_ascii_lowercase().contains(search) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if !matched {
+                continue;
+            }
+        }
+
+        rows.push(Row {
+            session_id: s.id,
+            canonical_key,
+            agent_id,
+            row,
+        });
+    }
+
+    if let Some(limit) = limit {
+        if rows.len() > limit {
+            rows.truncate(limit);
         }
     }
 
-    json!({
+    if include_derived_titles || include_last_message {
+        let collapse = |text: &str| -> String {
+            let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            joined.trim().to_string()
+        };
+        let truncate_chars = |text: &str, max_chars: usize| -> String {
+            if max_chars == 0 {
+                return String::new();
+            }
+            let mut out = String::new();
+            for ch in text.chars().take(max_chars) {
+                out.push(ch);
+            }
+            out
+        };
+
+        for row in rows.iter_mut() {
+            let session = store.get(row.session_id).await.ok().flatten();
+            let Some(session) = session else {
+                continue;
+            };
+
+            if include_derived_titles && !row.row.contains_key("derivedTitle") {
+                let first_user = session
+                    .messages
+                    .iter()
+                    .find(|m| m.role == Role::User)
+                    .map(|m| m.text_content())
+                    .unwrap_or_default();
+                let derived = collapse(&first_user);
+                if !derived.is_empty() {
+                    let derived = truncate_chars(&derived, 60);
+                    if !derived.is_empty() {
+                        row.row.insert("derivedTitle".to_string(), json!(derived));
+                    }
+                }
+            }
+
+            if include_last_message && !row.row.contains_key("lastMessagePreview") {
+                let last_text = session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| {
+                        let text = m.text_content();
+                        let collapsed = collapse(&text);
+                        if collapsed.is_empty() {
+                            None
+                        } else {
+                            Some(collapsed)
+                        }
+                    })
+                    .unwrap_or_default();
+                if !last_text.is_empty() {
+                    let preview = truncate_chars(&last_text, 240);
+                    if !preview.is_empty() {
+                        row.row
+                            .insert("lastMessagePreview".to_string(), json!(preview));
+                    }
+                }
+            }
+        }
+    }
+
+    let sessions_out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| serde_json::Value::Object(r.row))
+        .collect();
+
+    Ok(json!({
         "ts": now,
-        "path": sidecar_path,
-        "count": count,
-        "defaults": {
-            "model": state.config().providers.default_model,
-            "contextTokens": null
-        },
+        "path": store_path,
+        "sidecarPath": resolve_openclaw_sessions_sidecar_path(state, crate::openclaw_paths::DEFAULT_AGENT_ID).to_string_lossy(),
+        "count": sessions_out.len(),
+        "defaults": defaults,
         "sessions": sessions_out,
-    })
+    }))
 }
 
 async fn handle_sessions_patch(
@@ -2919,6 +3322,19 @@ async fn handle_sessions_patch(
     key: &str,
     patch: &serde_json::Value,
 ) -> Result<serde_json::Value, ErrorShape> {
+    let raw_key = key.trim();
+    if raw_key.is_empty() {
+        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+    }
+
+    let canonical_key =
+        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+    let store_key = openclaw_session_key_to_store_key(&canonical_key);
+    let agent_id = openclaw_session_key_agent_id(
+        &canonical_key,
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+    );
+
     let store = state
         .session_store()
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
@@ -2928,11 +3344,11 @@ async fn handle_sessions_patch(
 
     // Try "openclaw" first, then fall back to split keys. If missing, create.
     let mut session = store
-        .get_by_channel("openclaw", key)
+        .get_by_channel("openclaw", &store_key)
         .await
         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
     if session.is_none() {
-        let (channel_type, channel_id) = session_key_to_channel(key);
+        let (channel_type, channel_id) = session_key_to_channel(&store_key);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
@@ -2966,6 +3382,24 @@ async fn handle_sessions_patch(
                     Some(trimmed.chars().take(200).collect::<String>())
                 };
                 if session.title != next {
+                    if let Some(next_label) = next.as_deref() {
+                        // OpenClaw parity: labels are unique.
+                        let list = store
+                            .list(drbot_sessions::ListOptions::default())
+                            .await
+                            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+                        for other in list {
+                            if other.id == session.id {
+                                continue;
+                            }
+                            if other.title.as_deref() == Some(next_label) {
+                                return Err(ErrorShape::new(
+                                    error_codes::INVALID_REQUEST,
+                                    format!("label already in use: {}", next_label),
+                                ));
+                            }
+                        }
+                    }
                     session.title = next;
                     touched = true;
                 }
@@ -2975,10 +3409,12 @@ async fn handle_sessions_patch(
     }
 
     // Update sidecar metadata (OpenClaw parity).
-    let mut sidecar = load_openclaw_sessions_sidecar(state, "default");
+    let mut sidecar = load_openclaw_sessions_sidecar(state, &agent_id);
     let mut sidecar_entry = sidecar
         .entries
-        .get(key)
+        .get(&canonical_key)
+        .or_else(|| sidecar.entries.get(raw_key))
+        .or_else(|| sidecar.entries.get(store_key.as_str()))
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
@@ -3008,11 +3444,26 @@ async fn handle_sessions_patch(
     }
 
     if sidecar_entry.is_empty() {
-        sidecar.entries.remove(key);
+        sidecar.entries.remove(&canonical_key);
+        if canonical_key != raw_key {
+            sidecar.entries.remove(raw_key);
+        }
+        if canonical_key != store_key {
+            sidecar.entries.remove(store_key.as_str());
+        }
     } else {
         sidecar
             .entries
-            .insert(key.to_string(), serde_json::Value::Object(sidecar_entry));
+            .insert(
+                canonical_key.clone(),
+                serde_json::Value::Object(sidecar_entry),
+            );
+        if canonical_key != raw_key {
+            sidecar.entries.remove(raw_key);
+        }
+        if canonical_key != store_key {
+            sidecar.entries.remove(store_key.as_str());
+        }
     }
     if touched {
         session.update_timestamp();
@@ -3021,17 +3472,21 @@ async fn handle_sessions_patch(
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
         // Keep this best-effort: session data is still in sqlite even if the sidecar fails.
-        if let Err(e) = save_openclaw_sessions_sidecar(state, "default", &sidecar) {
+        if let Err(e) = save_openclaw_sessions_sidecar(state, &agent_id, &sidecar) {
             warn!(error = %e.message, "failed to persist OpenClaw sessions sidecar");
         }
     }
 
-    let sidecar_entry = sidecar.entries.get(key);
+    let sidecar_entry = sidecar.entries.get(&canonical_key);
+    let resolved_model = extract_sidecar_string(sidecar_entry, "model")
+        .or(session.model.clone())
+        .or_else(|| state.config().providers.default_model.clone());
 
     Ok(json!({
         "ok": true,
-        "path": resolve_openclaw_sessions_sidecar_path(state, "default"),
-        "key": key,
+        "path": state.config().storage.database_path.to_string_lossy(),
+        "sidecarPath": resolve_openclaw_sessions_sidecar_path(state, &agent_id).to_string_lossy(),
+        "key": canonical_key,
         "entry": {
             "sessionId": session.id.to_string(),
             "updatedAt": session.updated_at.timestamp_millis(),
@@ -3048,7 +3503,12 @@ async fn handle_sessions_patch(
             "sendPolicy": extract_sidecar_literal(sidecar_entry, "sendPolicy"),
             "groupActivation": extract_sidecar_literal(sidecar_entry, "groupActivation"),
             "spawnedBy": extract_sidecar_string(sidecar_entry, "spawnedBy"),
-            "model": extract_sidecar_string(sidecar_entry, "model").or(session.model),
+            "model": resolved_model.clone(),
+            "modelProvider": state.config().providers.default_provider,
+        },
+        "resolved": {
+            "modelProvider": state.config().providers.default_provider,
+            "model": resolved_model,
         }
     }))
 }
@@ -3057,21 +3517,50 @@ async fn handle_sessions_delete(
     state: &GatewayState,
     key: &str,
 ) -> Result<serde_json::Value, ErrorShape> {
+    let raw_key = key.trim();
+    if raw_key.is_empty() {
+        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+    }
+
+    let canonical_key = canonicalize_openclaw_session_key(
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+        raw_key,
+    );
+    let store_key = openclaw_session_key_to_store_key(&canonical_key);
+    let agent_id = openclaw_session_key_agent_id(
+        &canonical_key,
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+    );
+
     let store = state
         .session_store()
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
 
-    // Try "openclaw" first, then fall back to split keys.
-    let mut session = store
-        .get_by_channel("openclaw", key)
-        .await
-        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-    if session.is_none() {
-        let (channel_type, channel_id) = session_key_to_channel(key);
+    let mut session = None;
+    let mut candidates: Vec<&str> = Vec::new();
+    candidates.push(store_key.as_str());
+    if store_key != raw_key {
+        candidates.push(raw_key);
+    }
+
+    for candidate in candidates {
+        // Try "openclaw" first, then fall back to split keys.
+        session = store
+            .get_by_channel("openclaw", candidate)
+            .await
+            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
+
+        let (channel_type, channel_id) = session_key_to_channel(candidate);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
     }
     let session =
         session.ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "unknown session"))?;
@@ -3082,9 +3571,16 @@ async fn handle_sessions_delete(
         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
 
     // Best-effort: keep sessions.json sidecar in sync with sqlite deletes.
-    let mut sidecar = load_openclaw_sessions_sidecar(state, "default");
-    if sidecar.entries.remove(key).is_some() {
-        if let Err(e) = save_openclaw_sessions_sidecar(state, "default", &sidecar) {
+    let mut sidecar = load_openclaw_sessions_sidecar(state, &agent_id);
+    let mut removed = sidecar.entries.remove(&canonical_key).is_some();
+    if canonical_key != raw_key {
+        removed = sidecar.entries.remove(raw_key).is_some() || removed;
+    }
+    if canonical_key != store_key {
+        removed = sidecar.entries.remove(store_key.as_str()).is_some() || removed;
+    }
+    if removed {
+        if let Err(e) = save_openclaw_sessions_sidecar(state, &agent_id, &sidecar) {
             warn!(error = %e.message, "failed to update OpenClaw sessions sidecar");
         }
     }
@@ -3092,9 +3588,9 @@ async fn handle_sessions_delete(
     Ok(json!({ "ok": true }))
 }
 
-fn resolve_voicewake_path() -> PathBuf {
+fn resolve_voicewake_path(state: &GatewayState) -> PathBuf {
     // Match OpenClaw's convention: stateDir/settings/voicewake.json
-    if let Some(dir) = resolve_data_dir() {
+    if let Some(dir) = resolve_openclaw_state_dir(state) {
         return dir.join("settings").join("voicewake.json");
     }
     PathBuf::from("voicewake.json")
@@ -3125,8 +3621,8 @@ fn normalize_voicewake_triggers(input: &[serde_json::Value]) -> Vec<String> {
     }
 }
 
-async fn handle_voicewake_get() -> Result<serde_json::Value, ErrorShape> {
-    let path = resolve_voicewake_path();
+async fn handle_voicewake_get(state: &GatewayState) -> Result<serde_json::Value, ErrorShape> {
+    let path = resolve_voicewake_path(state);
     if !path.exists() {
         return Ok(json!({ "triggers": default_voicewake_triggers() }));
     }
@@ -3146,9 +3642,10 @@ async fn handle_voicewake_get() -> Result<serde_json::Value, ErrorShape> {
 }
 
 async fn handle_voicewake_set(
+    state: &GatewayState,
     triggers: &[serde_json::Value],
 ) -> Result<serde_json::Value, ErrorShape> {
-    let path = resolve_voicewake_path();
+    let path = resolve_voicewake_path(state);
     let triggers = normalize_voicewake_triggers(triggers);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -3829,24 +4326,53 @@ async fn handle_sessions_preview(
     };
 
     for key in keys.iter().take(64) {
-        let key = key.trim();
-        if key.is_empty() {
+        let raw_key = key.trim();
+        if raw_key.is_empty() {
             continue;
         }
 
-        // Try "openclaw" first, then fall back to split keys.
-        let mut session = store.get_by_channel("openclaw", key).await.ok().flatten();
-        if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(key);
-            session = store
-                .get_by_channel(&channel_type, &channel_id)
-                .await
-                .ok()
-                .flatten();
+        let store_key = openclaw_session_key_to_store_key(raw_key);
+        let mut candidates: Vec<&str> = Vec::new();
+        candidates.push(store_key.as_str());
+        if store_key != raw_key {
+            candidates.push(raw_key);
+        }
+
+        let mut session = None;
+        let mut had_error = false;
+
+        'outer: for candidate in candidates {
+            // Try legacy "openclaw" first, then fall back to split keys.
+            match store.get_by_channel("openclaw", candidate).await {
+                Ok(Some(s)) => {
+                    session = Some(s);
+                    break 'outer;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    had_error = true;
+                }
+            }
+
+            let (channel_type, channel_id) = session_key_to_channel(candidate);
+            match store.get_by_channel(&channel_type, &channel_id).await {
+                Ok(Some(s)) => {
+                    session = Some(s);
+                    break 'outer;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    had_error = true;
+                }
+            }
         }
 
         let Some(session) = session else {
-            previews.push(json!({ "key": key, "status": "missing", "items": [] }));
+            previews.push(json!({
+                "key": raw_key,
+                "status": if had_error { "error" } else { "missing" },
+                "items": []
+            }));
             continue;
         };
 
@@ -3889,7 +4415,7 @@ async fn handle_sessions_preview(
         }
 
         let status = if items.is_empty() { "empty" } else { "ok" };
-        previews.push(json!({ "key": key, "status": status, "items": items }));
+        previews.push(json!({ "key": raw_key, "status": status, "items": items }));
     }
 
     json!({ "ts": ts, "previews": previews })
@@ -3899,20 +4425,42 @@ async fn handle_sessions_reset(
     state: &GatewayState,
     key: &str,
 ) -> Result<serde_json::Value, ErrorShape> {
+    let raw_key = key.trim();
+    if raw_key.is_empty() {
+        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+    }
+
+    let canonical_key =
+        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+    let store_key = openclaw_session_key_to_store_key(&canonical_key);
+
     let store = state
         .session_store()
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
 
-    let mut session = store
-        .get_by_channel("openclaw", key)
-        .await
-        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-    if session.is_none() {
-        let (channel_type, channel_id) = session_key_to_channel(key);
+    let mut session = None;
+    let mut candidates: Vec<&str> = Vec::new();
+    candidates.push(store_key.as_str());
+    if store_key != raw_key {
+        candidates.push(raw_key);
+    }
+
+    for candidate in candidates {
+        session = store
+            .get_by_channel("openclaw", candidate)
+            .await
+            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
+        let (channel_type, channel_id) = session_key_to_channel(candidate);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
     }
     let mut session =
         session.ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "unknown session"))?;
@@ -3929,7 +4477,7 @@ async fn handle_sessions_reset(
 
     Ok(json!({
         "ok": true,
-        "key": key,
+        "key": canonical_key,
         "entry": {
             "sessionId": session.id.to_string(),
             "updatedAt": session.updated_at.timestamp_millis(),
@@ -3945,20 +4493,42 @@ async fn handle_sessions_compact(
     key: &str,
     max_lines: usize,
 ) -> Result<serde_json::Value, ErrorShape> {
+    let raw_key = key.trim();
+    if raw_key.is_empty() {
+        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+    }
+
+    let canonical_key =
+        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+    let store_key = openclaw_session_key_to_store_key(&canonical_key);
+
     let store = state
         .session_store()
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
 
-    let mut session = store
-        .get_by_channel("openclaw", key)
-        .await
-        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-    if session.is_none() {
-        let (channel_type, channel_id) = session_key_to_channel(key);
+    let mut session = None;
+    let mut candidates: Vec<&str> = Vec::new();
+    candidates.push(store_key.as_str());
+    if store_key != raw_key {
+        candidates.push(raw_key);
+    }
+
+    for candidate in candidates {
+        session = store
+            .get_by_channel("openclaw", candidate)
+            .await
+            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
+        let (channel_type, channel_id) = session_key_to_channel(candidate);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
     }
     let mut session =
         session.ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "unknown session"))?;
@@ -3966,7 +4536,7 @@ async fn handle_sessions_compact(
     if session.messages.len() <= max_lines {
         return Ok(json!({
             "ok": true,
-            "key": key,
+            "key": canonical_key,
             "compacted": false,
             "kept": session.messages.len(),
         }));
@@ -3984,7 +4554,7 @@ async fn handle_sessions_compact(
 
     Ok(json!({
         "ok": true,
-        "key": key,
+        "key": canonical_key,
         "compacted": true,
         "archived": null,
         "kept": session.messages.len(),
@@ -5459,10 +6029,24 @@ async fn handle_chat_history(
 ) -> serde_json::Value {
     let limit = limit.unwrap_or(200).min(1000) as usize;
     if let Some(store) = state.session_store() {
-        let mut session = store.get_by_channel("openclaw", session_key).await.ok().flatten();
-        if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(session_key);
+        let store_key = openclaw_session_key_to_store_key(session_key);
+        let mut candidates: Vec<&str> = Vec::new();
+        candidates.push(store_key.as_str());
+        if store_key != session_key {
+            candidates.push(session_key);
+        }
+
+        let mut session = None;
+        for candidate in candidates {
+            session = store.get_by_channel("openclaw", candidate).await.ok().flatten();
+            if session.is_some() {
+                break;
+            }
+            let (channel_type, channel_id) = session_key_to_channel(candidate);
             session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
+            if session.is_some() {
+                break;
+            }
         }
         if let Some(session) = session {
             let total = session.messages.len();
@@ -5551,21 +6135,33 @@ async fn spawn_chat_run(
     let mut messages: Vec<Message> = Vec::new();
     let mut persisted_session = None;
     if let Some(store) = ctx.state.session_store() {
+        let store_session_key = openclaw_session_key_to_store_key(&session_key);
         // Stable operator user id.
         let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-        // Prefer a legacy "openclaw" session if it exists, otherwise fall back to
-        // OpenClaw's channel-style `(channel_type, channel_id)` mapping.
         let mut session = store
-            .get_by_channel("openclaw", &session_key)
+            .get_by_channel("openclaw", &store_session_key)
             .await
             .ok()
             .flatten();
         if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(&session_key);
+            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
+            session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
+        }
+        if session.is_none() && store_session_key != session_key {
+            // Fall back to the raw key mapping (legacy).
             session = store
-                .get_or_create(user_id, &channel_type, &channel_id)
+                .get_by_channel("openclaw", &session_key)
                 .await
-                .ok();
+                .ok()
+                .flatten();
+            if session.is_none() {
+                let (channel_type, channel_id) = session_key_to_channel(&session_key);
+                session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
+            }
+        }
+        if session.is_none() {
+            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
+            session = store.get_or_create(user_id, &channel_type, &channel_id).await.ok();
         }
         if let Some(s) = session {
             messages.extend(s.messages.clone());
@@ -5577,7 +6173,8 @@ async fn spawn_chat_run(
     messages.push(stamp_user_message_for_agent(&user_msg));
 
     // Prefix any queued system events for this session (ephemeral queue).
-    let queued_system_events = ctx.state.openclaw_peek_system_events(&session_key).await;
+    let store_session_key = openclaw_session_key_to_store_key(&session_key);
+    let queued_system_events = ctx.state.openclaw_peek_system_events(&store_session_key).await;
     let has_system_events = !queued_system_events.is_empty();
     if has_system_events {
         let mut block = String::new();
@@ -5808,7 +6405,7 @@ async fn spawn_chat_run(
     if has_system_events {
         let _ = ctx
             .state
-            .openclaw_drain_system_event_entries(&session_key)
+            .openclaw_drain_system_event_entries(&openclaw_session_key_to_store_key(&session_key))
             .await;
     }
 
@@ -5873,19 +6470,33 @@ async fn spawn_agent_run(
     let mut messages: Vec<Message> = Vec::new();
     let mut persisted_session = None;
     if let Some(store) = ctx.state.session_store() {
+        let store_session_key = openclaw_session_key_to_store_key(&session_key);
         // Stable operator user id.
         let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
         let mut session = store
-            .get_by_channel("openclaw", &session_key)
+            .get_by_channel("openclaw", &store_session_key)
             .await
             .ok()
             .flatten();
         if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(&session_key);
+            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
+            session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
+        }
+        if session.is_none() && store_session_key != session_key {
+            // Fall back to the raw key mapping (legacy).
             session = store
-                .get_or_create(user_id, &channel_type, &channel_id)
+                .get_by_channel("openclaw", &session_key)
                 .await
-                .ok();
+                .ok()
+                .flatten();
+            if session.is_none() {
+                let (channel_type, channel_id) = session_key_to_channel(&session_key);
+                session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
+            }
+        }
+        if session.is_none() {
+            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
+            session = store.get_or_create(user_id, &channel_type, &channel_id).await.ok();
         }
         if let Some(s) = session {
             messages.extend(s.messages.clone());
@@ -5979,6 +6590,29 @@ async fn spawn_agent_run(
     ));
     agent.register_tool(Arc::new(
         crate::openclaw_agent_tools::MoltbookRequestTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookPostTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(crate::openclaw_agent_tools::MoltbookFeedTool));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookCommentTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookVoteTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookIdentityTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(crate::openclaw_agent_tools::MoltbookSearchTool));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookFollowTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookSubscribeTool::new(ctx.state.clone()),
+    ));
+    agent.register_tool(Arc::new(
+        crate::openclaw_agent_tools::MoltbookDmTool::new(ctx.state.clone()),
     ));
     agent.register_tool(Arc::new(crate::openclaw_agent_tools::SendTool::new(
         ctx.state.clone(),
@@ -6092,7 +6726,10 @@ async fn spawn_agent_run(
     // Inject timestamp for the agent runtime only (do not mutate/persist the transcript message).
     let user_text_raw = user_msg.text_content();
     let user_text = openclaw_inject_timestamp_prefix(&user_text_raw);
-    let queued_system_events = ctx.state.openclaw_peek_system_events(&session_key).await;
+    let queued_system_events = ctx
+        .state
+        .openclaw_peek_system_events(&openclaw_session_key_to_store_key(&session_key))
+        .await;
     let has_system_events = !queued_system_events.is_empty();
     let user_input = if has_system_events {
         let mut block = String::new();
@@ -6155,7 +6792,7 @@ async fn spawn_agent_run(
     if has_system_events {
         let _ = ctx
             .state
-            .openclaw_drain_system_event_entries(&session_key)
+            .openclaw_drain_system_event_entries(&openclaw_session_key_to_store_key(&session_key))
             .await;
     }
 
@@ -8973,6 +9610,283 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }),
             }
         }
+        "moltbook.post" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let submolt = params.get("submolt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if title.is_empty() || content.is_empty() || submolt.is_empty() {
+                return error_response(&req.id, error_codes::INVALID_REQUEST, "title, content, and submolt are required", None);
+            }
+
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if !dry_run && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("moltbook.post in s/{}", submolt),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some(format!("Allow creating a Moltbook post in s/{}?", submolt)),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some("https://www.moltbook.com/api/v1/posts".to_string()),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.post", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_create_post(&title, &content, &submolt, dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.feed" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let sort = params.get("sort").and_then(|v| v.as_str()).unwrap_or("hot").trim().to_string();
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25).max(1).min(50);
+            let submolt = params.get("submolt").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+
+            match crate::moltbook::moltbook_get_feed(&sort, limit, submolt.as_deref()).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.comment" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let post_id = params.get("postId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let parent_id = params.get("parentId").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if post_id.is_empty() || content.is_empty() {
+                return error_response(&req.id, error_codes::INVALID_REQUEST, "postId and content are required", None);
+            }
+
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if !dry_run && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("moltbook.comment on post {}", post_id),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some(format!("Allow commenting on Moltbook post {}?", post_id)),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/posts/{}/comments", post_id)),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.comment", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_create_comment(&post_id, &content, parent_id.as_deref(), dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.vote" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let post_id = params.get("postId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let direction = params.get("direction").and_then(|v| v.as_str()).unwrap_or("up").trim().to_string();
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if post_id.is_empty() {
+                return error_response(&req.id, error_codes::INVALID_REQUEST, "postId is required", None);
+            }
+
+            let suffix = if direction == "down" { "downvote" } else { "upvote" };
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if !dry_run && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("moltbook.vote {} post {}", suffix, post_id),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some(format!("Allow {} Moltbook post {}?", suffix, post_id)),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/posts/{}/{}", post_id, suffix)),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.vote", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_vote(&post_id, &direction, dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.identity" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("profile").trim().to_string();
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            let is_write = action == "token";
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if is_write && !dry_run && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: "moltbook.identity token".to_string(),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some("Allow generating a Moltbook identity token?".to_string()),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some("https://www.moltbook.com/api/v1/agents/me/identity-token".to_string()),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.identity", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_get_identity(&action, dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.search" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let query_str = params.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25).max(1).min(50);
+
+            if query_str.is_empty() {
+                return error_response(&req.id, error_codes::INVALID_REQUEST, "query is required", None);
+            }
+
+            match crate::moltbook::moltbook_search(&query_str, limit).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.follow" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let agent = params.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let unfollow = params.get("unfollow").and_then(|v| v.as_bool()).unwrap_or(false);
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if agent.is_empty() {
+                return error_response(&req.id, error_codes::INVALID_REQUEST, "agent is required", None);
+            }
+
+            let action_label = if unfollow { "unfollow" } else { "follow" };
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if !dry_run && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("moltbook.follow {} {}", action_label, agent),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some(format!("Allow {} Moltbook agent {}?", action_label, agent)),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/agents/{}/follow", agent)),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.follow", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_follow(&agent, unfollow, dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.subscribe" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let submolt = params.get("submolt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let unsubscribe = params.get("unsubscribe").and_then(|v| v.as_bool()).unwrap_or(false);
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if submolt.is_empty() {
+                return error_response(&req.id, error_codes::INVALID_REQUEST, "submolt is required", None);
+            }
+
+            let action_label = if unsubscribe { "unsubscribe" } else { "subscribe" };
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if !dry_run && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("moltbook.subscribe {} s/{}", action_label, submolt),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some(format!("Allow {} Moltbook submolt s/{}?", action_label, submolt)),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/submolts/{}/subscribe", submolt)),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.subscribe", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_subscribe(&submolt, unsubscribe, dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
+        "moltbook.dm" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("check").trim().to_string();
+            let to = params.get("to").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let message = params.get("message").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            let is_write = action == "send";
+            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
+            let mut allow_write = allow_write_by_env;
+            if is_write && !dry_run && !allow_write_by_env {
+                let to_label = to.as_deref().unwrap_or("?");
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("moltbook.dm send to {}", to_label),
+                    cwd: None,
+                    host: Some("moltbook".to_string()),
+                    security: Some("integration-http-write".to_string()),
+                    ask: Some(format!("Allow sending a Moltbook DM to {}?", to_label)),
+                    agent_id: Some("default".to_string()),
+                    resolved_path: Some("https://www.moltbook.com/api/v1/agents/dm/send".to_string()),
+                    session_key: None,
+                };
+                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "moltbook.dm", approval, 120_000,
+                ).await {
+                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                }
+                allow_write = true;
+            }
+
+            match crate::moltbook::moltbook_dm(&action, to.as_deref(), message.as_deref(), dry_run, allow_write).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
+            }
+        }
         "browser.request" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
             let method = params
@@ -10170,11 +11084,22 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     }
                 }
             }
-            let payload = params.get("payload").cloned();
-            let payload_json = params
-                .get("payloadJSON")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let mut payload = params.get("payload").cloned();
+            let mut payload_json = None;
+            if let Some(v) = params.get("payloadJSON") {
+                match v {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(s) => {
+                        payload_json = Some(s.to_string());
+                    }
+                    other => {
+                        // OpenClaw parity: older nodes sometimes send `payloadJSON` as a literal object.
+                        if payload.is_none() {
+                            payload = Some(other.clone());
+                        }
+                    }
+                }
+            }
             let error =
                 params
                     .get("error")
@@ -10224,12 +11149,27 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             }
             if event == "voicewake.changed" {
-                if let Some(triggers) = params
-                    .get("payload")
+                let mut payload = params.get("payload").cloned();
+                if payload.is_none() {
+                    if let Some(v) = params.get("payloadJSON") {
+                        match v {
+                            serde_json::Value::Null => {}
+                            serde_json::Value::String(s) => {
+                                payload = serde_json::from_str::<serde_json::Value>(s).ok();
+                            }
+                            other => {
+                                payload = Some(other.clone());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(triggers) = payload
+                    .as_ref()
                     .and_then(|v| v.get("triggers"))
                     .and_then(|v| v.as_array())
                 {
-                    if let Ok(payload) = handle_voicewake_set(triggers).await {
+                    if let Ok(payload) = handle_voicewake_set(&ctx.state, triggers).await {
                         broadcast_openclaw_event(&ctx.state, "voicewake.changed", payload, None)
                             .await;
                     }
@@ -10634,7 +11574,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             broadcast_openclaw_event(&ctx.state, "talk.mode", payload.clone(), None).await;
             ok_response(&req.id, payload)
         }
-        "voicewake.get" => match handle_voicewake_get().await {
+        "voicewake.get" => match handle_voicewake_get(&ctx.state).await {
             Ok(payload) => ok_response(&req.id, payload),
             Err(err) => GatewayFrame::Res(ResponseFrame {
                 id: req.id,
@@ -10658,7 +11598,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             };
 
-            match handle_voicewake_set(triggers).await {
+            match handle_voicewake_set(&ctx.state, triggers).await {
                 Ok(payload) => {
                     broadcast_openclaw_event(
                         &ctx.state,
@@ -11035,7 +11975,18 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }),
             )
         }
-        "sessions.list" => ok_response(&req.id, handle_sessions_list(&ctx.state).await),
+        "sessions.list" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            match handle_sessions_list(&ctx.state, &params).await {
+                Ok(payload) => ok_response(&req.id, payload),
+                Err(err) => GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                }),
+            }
+        }
         "sessions.preview" => {
             let keys = req
                 .params
@@ -11089,6 +12040,19 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let agent_id_filter = params
+                .get("agentId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| crate::openclaw_paths::normalize_agent_id(s));
+            let spawned_by_filter = params
+                .get("spawnedBy")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let include_global = params.get("includeGlobal").and_then(|v| v.as_bool()).unwrap_or(false);
+            let include_unknown = params.get("includeUnknown").and_then(|v| v.as_bool()).unwrap_or(false);
 
             let has_key = !key.is_empty();
             let has_session_id = !session_id.is_empty();
@@ -11124,43 +12088,213 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             };
 
             if has_key {
-                let (channel_type, channel_id) = session_key_to_channel(&key);
-                let existing = store
-                    .get_by_channel(&channel_type, &channel_id)
-                    .await
-                    .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()));
-                match existing {
-                    Ok(Some(_)) => return ok_response(&req.id, json!({ "ok": true, "key": key })),
-                    Ok(None) => {
+                let canonical_key = canonicalize_openclaw_session_key(
+                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    &key,
+                );
+                let store_key = openclaw_session_key_to_store_key(&canonical_key);
+                let mut candidates: Vec<&str> = Vec::new();
+                candidates.push(store_key.as_str());
+                if store_key != key {
+                    candidates.push(key.as_str());
+                }
+
+                let mut found = false;
+                for candidate in candidates {
+                    // Try legacy "openclaw" first, then fall back to split keys.
+                    match store.get_by_channel("openclaw", candidate).await {
+                        Ok(Some(_)) => {
+                            found = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return error_response(
+                                &req.id,
+                                error_codes::UNAVAILABLE,
+                                "session store unavailable",
+                                Some(json!({ "error": e.to_string() })),
+                            );
+                        }
+                    }
+
+                    let (channel_type, channel_id) = session_key_to_channel(candidate);
+                    match store.get_by_channel(&channel_type, &channel_id).await {
+                        Ok(Some(_)) => {
+                            found = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return error_response(
+                                &req.id,
+                                error_codes::UNAVAILABLE,
+                                "session store unavailable",
+                                Some(json!({ "error": e.to_string() })),
+                            );
+                        }
+                    }
+                }
+
+                if found {
+                    let kind = classify_openclaw_session_kind(&canonical_key);
+                    if (kind == "global" && !include_global)
+                        || (kind == "unknown" && !include_unknown)
+                    {
                         return error_response(
                             &req.id,
                             error_codes::INVALID_REQUEST,
-                            &format!("No session found: {}", key),
+                            &format!("No session found: {}", session_id),
                             None,
                         );
                     }
-                    Err(err) => {
-                        return GatewayFrame::Res(ResponseFrame {
-                            id: req.id,
-                            ok: false,
-                            payload: None,
-                            error: Some(err),
-                        });
+
+                    if let Some(filter) = agent_id_filter.as_deref() {
+                        if kind == "global" || kind == "unknown" {
+                            return error_response(
+                                &req.id,
+                                error_codes::INVALID_REQUEST,
+                                &format!("No session found: {}", session_id),
+                                None,
+                            );
+                        }
+                        let agent_id = openclaw_session_key_agent_id(
+                            &canonical_key,
+                            crate::openclaw_paths::DEFAULT_AGENT_ID,
+                        );
+                        if agent_id != filter {
+                            return error_response(
+                                &req.id,
+                                error_codes::INVALID_REQUEST,
+                                &format!("No session found: {}", session_id),
+                                None,
+                            );
+                        }
                     }
+
+                    if let Some(spawned_by) = spawned_by_filter.as_deref() {
+                        if kind == "global" || kind == "unknown" {
+                            return error_response(
+                                &req.id,
+                                error_codes::INVALID_REQUEST,
+                                &format!("No session found: {}", session_id),
+                                None,
+                            );
+                        }
+                        let agent_id = openclaw_session_key_agent_id(
+                            &canonical_key,
+                            crate::openclaw_paths::DEFAULT_AGENT_ID,
+                        );
+                        let sidecar = load_openclaw_sessions_sidecar(&ctx.state, &agent_id);
+                        let sidecar_entry = sidecar
+                            .entries
+                            .get(&canonical_key)
+                            .or_else(|| sidecar.entries.get(store_key.as_str()))
+                            .or_else(|| sidecar.entries.get(session_id.as_str()));
+                        if extract_sidecar_string(sidecar_entry, "spawnedBy").as_deref()
+                            != Some(spawned_by)
+                        {
+                            return error_response(
+                                &req.id,
+                                error_codes::INVALID_REQUEST,
+                                &format!("No session found: {}", session_id),
+                                None,
+                            );
+                        }
+                    }
+
+                    return ok_response(&req.id, json!({ "ok": true, "key": canonical_key }));
                 }
+
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    &format!("No session found: {}", key),
+                    None,
+                );
             }
 
             if has_session_id {
                 // OpenClaw parity: allow resolving by UUID sessionId or by key string.
                 if let Ok(session_uuid) = Uuid::parse_str(&session_id) {
-                    match store.get(session_uuid).await {
+                    let fetched = store.get(session_uuid).await;
+                    match fetched {
                         Ok(Some(session)) => {
-                            let key = if session.channel_type == "openclaw" {
+                            let raw_key = if session.channel_type == "openclaw" {
                                 session.channel_id
                             } else {
                                 format!("{}:{}", session.channel_type, session.channel_id)
                             };
-                            return ok_response(&req.id, json!({ "ok": true, "key": key }));
+                            let canonical_key = canonicalize_openclaw_session_key(
+                                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                                &raw_key,
+                            );
+                            let kind = classify_openclaw_session_kind(&canonical_key);
+                            if (kind == "global" && !include_global)
+                                || (kind == "unknown" && !include_unknown)
+                            {
+                                return error_response(
+                                    &req.id,
+                                    error_codes::INVALID_REQUEST,
+                                    &format!("No session found: {}", session_id),
+                                    None,
+                                );
+                            }
+
+                            if let Some(filter) = agent_id_filter.as_deref() {
+                                if kind == "global" || kind == "unknown" {
+                                    return error_response(
+                                        &req.id,
+                                        error_codes::INVALID_REQUEST,
+                                        &format!("No session found: {}", session_id),
+                                        None,
+                                    );
+                                }
+                                let agent_id = openclaw_session_key_agent_id(
+                                    &canonical_key,
+                                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                                );
+                                if agent_id != filter {
+                                    return error_response(
+                                        &req.id,
+                                        error_codes::INVALID_REQUEST,
+                                        &format!("No session found: {}", session_id),
+                                        None,
+                                    );
+                                }
+                            }
+
+                            if let Some(spawned_by) = spawned_by_filter.as_deref() {
+                                if kind == "global" || kind == "unknown" {
+                                    return error_response(
+                                        &req.id,
+                                        error_codes::INVALID_REQUEST,
+                                        &format!("No session found: {}", session_id),
+                                        None,
+                                    );
+                                }
+                                let agent_id = openclaw_session_key_agent_id(
+                                    &canonical_key,
+                                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                                );
+                                let sidecar = load_openclaw_sessions_sidecar(&ctx.state, &agent_id);
+                                let sidecar_entry = sidecar
+                                    .entries
+                                    .get(&canonical_key)
+                                    .or_else(|| sidecar.entries.get(raw_key.as_str()));
+                                if extract_sidecar_string(sidecar_entry, "spawnedBy").as_deref()
+                                    != Some(spawned_by)
+                                {
+                                    return error_response(
+                                        &req.id,
+                                        error_codes::INVALID_REQUEST,
+                                        &format!("No session found: {}", session_id),
+                                        None,
+                                    );
+                                }
+                            }
+
+                            return ok_response(&req.id, json!({ "ok": true, "key": canonical_key }));
                         }
                         Ok(None) => {
                             return error_response(
@@ -11181,28 +12315,64 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     }
                 }
 
-                let (channel_type, channel_id) = session_key_to_channel(&session_id);
-                match store.get_by_channel(&channel_type, &channel_id).await {
-                    Ok(Some(_)) => {
-                        return ok_response(&req.id, json!({ "ok": true, "key": session_id }))
+                // Treat sessionId as a key string.
+                let canonical_key = canonicalize_openclaw_session_key(
+                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    &session_id,
+                );
+                let store_key = openclaw_session_key_to_store_key(&canonical_key);
+                let mut candidates: Vec<&str> = Vec::new();
+                candidates.push(store_key.as_str());
+                if store_key != session_id {
+                    candidates.push(session_id.as_str());
+                }
+
+                let mut found = false;
+                for candidate in candidates {
+                    match store.get_by_channel("openclaw", candidate).await {
+                        Ok(Some(_)) => {
+                            found = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return error_response(
+                                &req.id,
+                                error_codes::UNAVAILABLE,
+                                "session store unavailable",
+                                Some(json!({ "error": e.to_string() })),
+                            );
+                        }
                     }
-                    Ok(None) => {
-                        return error_response(
-                            &req.id,
-                            error_codes::INVALID_REQUEST,
-                            &format!("No session found: {}", session_id),
-                            None,
-                        );
-                    }
-                    Err(e) => {
-                        return error_response(
-                            &req.id,
-                            error_codes::UNAVAILABLE,
-                            "session store unavailable",
-                            Some(json!({ "error": e.to_string() })),
-                        );
+
+                    let (channel_type, channel_id) = session_key_to_channel(candidate);
+                    match store.get_by_channel(&channel_type, &channel_id).await {
+                        Ok(Some(_)) => {
+                            found = true;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return error_response(
+                                &req.id,
+                                error_codes::UNAVAILABLE,
+                                "session store unavailable",
+                                Some(json!({ "error": e.to_string() })),
+                            );
+                        }
                     }
                 }
+
+                if found {
+                    return ok_response(&req.id, json!({ "ok": true, "key": canonical_key }));
+                }
+
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    &format!("No session found: {}", session_id),
+                    None,
+                );
             }
 
             // label lookup (OpenClaw parity).
@@ -11222,17 +12392,58 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }
             };
 
-            let matches: Vec<String> = list
-                .into_iter()
-                .filter(|s| s.title.as_deref() == Some(label.as_str()))
-                .map(|s| {
-                    if s.channel_type == "openclaw" {
-                        s.channel_id
-                    } else {
-                        format!("{}:{}", s.channel_type, s.channel_id)
+            let mut matches: Vec<String> = Vec::new();
+            for s in list {
+                if s.title.as_deref() != Some(label.as_str()) {
+                    continue;
+                }
+                let raw_key = if s.channel_type == "openclaw" {
+                    s.channel_id
+                } else {
+                    format!("{}:{}", s.channel_type, s.channel_id)
+                };
+                let canonical_key = canonicalize_openclaw_session_key(
+                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    &raw_key,
+                );
+                let kind = classify_openclaw_session_kind(&canonical_key);
+                if (kind == "global" && !include_global) || (kind == "unknown" && !include_unknown)
+                {
+                    continue;
+                }
+                if let Some(filter) = agent_id_filter.as_deref() {
+                    if kind == "global" || kind == "unknown" {
+                        continue;
                     }
-                })
-                .collect();
+                    let agent_id = openclaw_session_key_agent_id(
+                        &canonical_key,
+                        crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    );
+                    if agent_id != filter {
+                        continue;
+                    }
+                }
+                if let Some(spawned_by) = spawned_by_filter.as_deref() {
+                    if kind == "global" || kind == "unknown" {
+                        continue;
+                    }
+                    let agent_id = openclaw_session_key_agent_id(
+                        &canonical_key,
+                        crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    );
+                    let sidecar = load_openclaw_sessions_sidecar(&ctx.state, &agent_id);
+                    let sidecar_entry = sidecar
+                        .entries
+                        .get(&canonical_key)
+                        .or_else(|| sidecar.entries.get(raw_key.as_str()));
+                    if extract_sidecar_string(sidecar_entry, "spawnedBy").as_deref()
+                        != Some(spawned_by)
+                    {
+                        continue;
+                    }
+                }
+                matches.push(canonical_key);
+            }
 
             if matches.is_empty() {
                 return error_response(
@@ -13059,7 +14270,7 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
 
             // Nodes expect a voicewake snapshot on connect.
             if connected_role.as_deref() == Some("node") {
-                if let Ok(cfg) = handle_voicewake_get().await {
+                if let Ok(cfg) = handle_voicewake_get(&state).await {
                     send_event(
                         &tx,
                         &queued_bytes,

@@ -648,7 +648,7 @@ async fn openclaw_sessions_patch_and_resolve_label() {
     assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
         payload.get("key").and_then(|v| v.as_str()),
-        Some("test-session")
+        Some("agent:default:test-session")
     );
 
     drop(ws);
@@ -791,6 +791,376 @@ async fn openclaw_node_command_allowlist_enforced() {
 
     drop(op_ws);
     drop(node_ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_node_invoke_result_accepts_payloadjson_object() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+
+    // Operator connection.
+    let (mut op_ws, _resp) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+    let _ = recv_frame(&mut op_ws).await; // connect.challenge
+    let _ = send_req(
+        &mut op_ws,
+        "connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "op", "version": "0.0.0-test", "platform": "test", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // Node connection (linux platform => system-only commands allowlisted).
+    let (mut node_ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = recv_frame(&mut node_ws).await; // connect.challenge
+    let _ = send_req(
+        &mut node_ws,
+        "node_connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "role": "node",
+            "commands": ["system.run"],
+            "client": { "id": "node", "version": "0.0.0-test", "platform": "linux", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // Operator discovers nodeId.
+    let res = send_req(&mut op_ws, "node_list_1", "node.list", json!({})).await;
+    assert!(res.ok, "node.list failed: {:?}", res.error);
+    let payload = res.payload.expect("missing node.list payload");
+    let nodes = payload
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first = nodes
+        .iter()
+        .find(|n| n.get("connected").and_then(|v| v.as_bool()) == Some(true))
+        .expect("expected a connected node");
+    let node_id = first
+        .get("nodeId")
+        .and_then(|v| v.as_str())
+        .expect("nodeId missing")
+        .to_string();
+
+    let invoke_node_id = node_id.clone();
+    let invoke_handle = tokio::spawn(async move {
+        send_req(
+            &mut op_ws,
+            "node_invoke_ok",
+            "node.invoke",
+            json!({
+                "nodeId": invoke_node_id,
+                "command": "system.run",
+                "params": { "cmd": "echo ok" },
+                "idempotencyKey": "idem-ok",
+                "timeoutMs": 2_000
+            }),
+        )
+        .await
+    });
+
+    // Node receives invoke request event.
+    let invoke_id = loop {
+        let frame = recv_frame(&mut node_ws).await;
+        match frame {
+            GatewayFrame::Event(evt) if evt.event == "node.invoke.request" => {
+                let payload = evt.payload.unwrap_or_else(|| json!({}));
+                let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let node = payload
+                    .get("nodeId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                assert_eq!(node, node_id, "node.invoke.request nodeId mismatch");
+                assert!(!id.is_empty(), "node.invoke.request missing id");
+                break id;
+            }
+            _ => {}
+        }
+    };
+
+    // Respond with payloadJSON as a literal object (older node quirk).
+    let res = send_req(
+        &mut node_ws,
+        "invoke_result",
+        "node.invoke.result",
+        json!({
+            "id": invoke_id,
+            "nodeId": node_id,
+            "ok": true,
+            "payloadJSON": { "answer": 42 }
+        }),
+    )
+    .await;
+    assert!(res.ok, "node.invoke.result failed: {:?}", res.error);
+
+    let invoke_res = invoke_handle.await.unwrap();
+    assert!(invoke_res.ok, "node.invoke failed: {:?}", invoke_res.error);
+    let payload = invoke_res.payload.expect("missing node.invoke payload");
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        payload
+            .get("payload")
+            .and_then(|v| v.get("answer"))
+            .and_then(|v| v.as_i64()),
+        Some(42)
+    );
+    assert_eq!(
+        payload.get("payloadJSON").and_then(|v| v.as_str()),
+        None,
+        "expected payloadJSON to be omitted or null"
+    );
+
+    drop(node_ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_node_event_parses_payloadjson_for_voicewake() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+
+    // Operator connection.
+    let (mut op_ws, _resp) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+    let _ = recv_frame(&mut op_ws).await; // connect.challenge
+    let _ = send_req(
+        &mut op_ws,
+        "connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "op", "version": "0.0.0-test", "platform": "test", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // Node connection.
+    let (mut node_ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = recv_frame(&mut node_ws).await; // connect.challenge
+    let _ = send_req(
+        &mut node_ws,
+        "node_connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "role": "node",
+            "commands": ["system.run"],
+            "client": { "id": "node", "version": "0.0.0-test", "platform": "linux", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // Emit voicewake.changed with payloadJSON only.
+    let res = send_req(
+        &mut node_ws,
+        "node_event_1",
+        "node.event",
+        json!({
+            "event": "voicewake.changed",
+            "payloadJSON": "{\"triggers\":[\"alpha\",\"beta\"]}"
+        }),
+    )
+    .await;
+    assert!(res.ok, "node.event failed: {:?}", res.error);
+
+    // Operator reads back triggers.
+    let res = send_req(&mut op_ws, "vw_get", "voicewake.get", json!({})).await;
+    assert!(res.ok, "voicewake.get failed: {:?}", res.error);
+    let payload = res.payload.expect("missing voicewake.get payload");
+    let triggers = payload
+        .get("triggers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let got = triggers
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(got, vec!["alpha".to_string(), "beta".to_string()]);
+
+    drop(op_ws);
+    drop(node_ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_agents_files_list_and_skills_bins_shapes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = recv_frame(&mut ws).await; // connect.challenge
+    let _ = send_req(
+        &mut ws,
+        "connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "op", "version": "0.0.0-test", "platform": "test", "mode": "test" }
+        }),
+    )
+    .await;
+
+    let res = send_req(
+        &mut ws,
+        "agents_files_list",
+        "agents.files.list",
+        json!({ "agentId": "default" }),
+    )
+    .await;
+    assert!(res.ok, "agents.files.list failed: {:?}", res.error);
+    let payload = res.payload.expect("missing agents.files.list payload");
+    let files = payload
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let names: Vec<String> = files
+        .iter()
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    for required in [
+        "AGENTS.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "HEARTBEAT.md",
+        "BOOTSTRAP.md",
+    ] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "agents.files.list missing {}",
+            required
+        );
+    }
+    assert!(
+        names.iter().any(|n| n == "MEMORY.md" || n == "memory.md"),
+        "agents.files.list missing MEMORY.md/memory.md"
+    );
+    for entry in &files {
+        assert!(
+            entry.get("missing").and_then(|v| v.as_bool()).is_some(),
+            "agents.files.list entry missing boolean: {:?}",
+            entry
+        );
+    }
+
+    let res = send_req(&mut ws, "skills_bins", "skills.bins", json!({})).await;
+    assert!(res.ok, "skills.bins failed: {:?}", res.error);
+    let payload = res.payload.expect("missing skills.bins payload");
+    assert!(
+        payload.get("bins").and_then(|v| v.as_array()).is_some(),
+        "skills.bins bins should be array"
+    );
+
+    drop(ws);
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
         .await
