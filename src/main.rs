@@ -64,7 +64,7 @@ enum Commands {
 
     /// Interactive chat with AI
     Chat {
-        /// Provider to use (anthropic, openai, ollama, auto)
+        /// Provider to use (auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli)
         #[arg(short, long)]
         provider: Option<String>,
 
@@ -575,7 +575,7 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
         "claude-cli" | "claude-code" => Ok(Arc::new(CliProvider::claude_cli())),
         "codex-cli" | "codex" => Ok(Arc::new(CliProvider::codex_cli())),
         _ => Err(anyhow::anyhow!(
-            "Unknown provider: {}. Supported: anthropic, openai, ollama, claude-cli, codex-cli, auto",
+            "Unknown provider: {}. Supported: auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli",
             provider_name
         )),
     }
@@ -2804,7 +2804,19 @@ async fn run_chat(
                 }
             } else {
                 // Disambiguate: known provider name vs model name
-                let known_providers = ["anthropic", "claude", "openai", "gpt", "ollama", "local", "claude-cli", "claude-code", "codex-cli", "codex"];
+                let known_providers = [
+                    "auto",
+                    "anthropic",
+                    "claude",
+                    "openai",
+                    "gpt",
+                    "ollama",
+                    "local",
+                    "claude-cli",
+                    "claude-code",
+                    "codex-cli",
+                    "codex",
+                ];
                 if known_providers.contains(&arg.to_lowercase().as_str()) {
                     match create_provider(config, arg) {
                         Ok(new_provider) => {
