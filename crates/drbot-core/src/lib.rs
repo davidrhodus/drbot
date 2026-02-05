@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod error;
+pub mod markdown;
 pub mod message;
 pub mod session;
 pub mod user;

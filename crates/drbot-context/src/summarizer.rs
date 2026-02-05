@@ -105,6 +105,7 @@ impl Summarizer {
                 "You are a helpful assistant that creates concise conversation summaries."
                     .to_string(),
             ),
+            tools: None,
         };
 
         let response = self
@@ -178,6 +179,7 @@ impl Summarizer {
                 "You are a helpful assistant that creates concise conversation summaries."
                     .to_string(),
             ),
+            tools: None,
         };
 
         let response = self

@@ -124,16 +124,6 @@ fn resolve_state_key(state: &GatewayState) -> PathBuf {
     crate::openclaw_paths::resolve_openclaw_state_dir(state.config()).unwrap_or_else(|| PathBuf::from(""))
 }
 
-fn resolve_agent_workspace_dir(agent_id: &str) -> PathBuf {
-    let safe = agent_id.trim();
-    let safe = if safe.is_empty() { "default" } else { safe };
-
-    if let Some(dir) = drbot_core::Config::config_dir() {
-        return dir.join("agents").join(safe);
-    }
-    PathBuf::from("agents").join(safe)
-}
-
 fn resolve_indicator_type(status: &str) -> Option<&'static str> {
     match status {
         "ok-empty" | "ok-token" => Some("ok"),
@@ -515,7 +505,7 @@ async fn run_heartbeat_once_impl(
     let started_at = now_ms();
     let _lane = OpenclawMainLaneGuard::new(state.clone());
 
-    let workspace_dir = resolve_agent_workspace_dir("default");
+    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir("default");
     let mut heartbeat_sections: Vec<(String, String)> = Vec::new();
     let remote = crate::openclaw::resolve_remote_skill_eligibility(state).await;
 
@@ -694,7 +684,14 @@ async fn run_heartbeat_once_impl(
         let mut agent = DrbotAgent::new(provider.clone(), agent_cfg);
 
         // Conservative baseline: do not expose generic HTTP, shell, or write tools in heartbeats.
-        for tool in BuiltinTools::all() {
+        let builtin = match BuiltinTools::all(workspace_dir.clone()) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, "heartbeat: failed to initialize builtin tools");
+                Vec::new()
+            }
+        };
+        for tool in builtin {
             if matches!(tool.name(), "http" | "bash" | "write_file") {
                 continue;
             }
@@ -762,6 +759,7 @@ async fn run_heartbeat_once_impl(
             top_p: None,
             stop_sequences: None,
             system_prompt: system_prompt_opt,
+            tools: None,
         };
 
         let mut full = String::new();

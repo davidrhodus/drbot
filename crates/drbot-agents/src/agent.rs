@@ -5,6 +5,7 @@ use crate::planner::Planner;
 use crate::tools::AgentTool;
 use crate::{AgentError, AgentEvent, AgentMessage, AgentRole, Result, ToolCall, ToolResult};
 use drbot_providers::Provider;
+use drbot_providers::ToolDefinition;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -142,8 +143,11 @@ impl Agent {
             let response = self.call_llm().await?;
 
             // Check for tool calls
-            if let Some(tool_calls) = &response.tool_calls {
-                for tool_call in tool_calls {
+            if let Some(tool_calls) = response.tool_calls.clone() {
+                // Assistant tool-use message must precede tool results.
+                self.messages.push(response);
+
+                for tool_call in &tool_calls {
                     self.state = AgentState::ExecutingTool(tool_call.name.clone());
                     let _ = events
                         .send(AgentEvent::ToolCall {
@@ -171,9 +175,6 @@ impl Agent {
                         tool_result: Some(result),
                     });
                 }
-
-                // Add assistant message with tool calls
-                self.messages.push(response);
             } else {
                 // No tool calls - agent is done
                 final_output = response.content.clone();
@@ -203,7 +204,10 @@ impl Agent {
     /// Call the LLM.
     async fn call_llm(&self) -> Result<AgentMessage> {
         use drbot_core::message::Message;
+        use drbot_core::message::{Content, Role};
         use drbot_providers::ChatOptions;
+        use serde_json::Map;
+        use chrono::Utc;
 
         // Convert agent messages to provider messages
         let messages: Vec<Message> = self
@@ -212,13 +216,55 @@ impl Agent {
             .filter_map(|m| match m.role {
                 AgentRole::System => Some(Message::system(&m.content)),
                 AgentRole::User => Some(Message::user(&m.content)),
-                AgentRole::Assistant => Some(Message::assistant(&m.content)),
-                AgentRole::Tool => Some(Message::user(&format!("Tool result: {}", m.content))),
+                AgentRole::Assistant => {
+                    if let Some(calls) = m.tool_calls.as_ref().filter(|v| !v.is_empty()) {
+                        let mut blocks: Vec<Content> = Vec::new();
+                        if !m.content.trim().is_empty() {
+                            blocks.push(Content::Text {
+                                text: m.content.clone(),
+                            });
+                        }
+                        for call in calls {
+                            blocks.push(Content::ToolUse {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                                input: call.arguments.clone(),
+                            });
+                        }
+                        Some(Message {
+                            id: Uuid::new_v4(),
+                            role: Role::Assistant,
+                            content: blocks,
+                            created_at: Utc::now(),
+                            metadata: Map::new(),
+                        })
+                    } else {
+                        Some(Message::assistant(&m.content))
+                    }
+                }
+                AgentRole::Tool => {
+                    if let Some(result) = m.tool_result.as_ref() {
+                        Some(Message {
+                            id: Uuid::new_v4(),
+                            role: Role::User,
+                            content: vec![Content::ToolResult {
+                                tool_use_id: result.tool_call_id.clone(),
+                                content: result.content.clone(),
+                                is_error: result.is_error,
+                            }],
+                            created_at: Utc::now(),
+                            metadata: Map::new(),
+                        })
+                    } else {
+                        Some(Message::user(&format!("Tool result: {}", m.content)))
+                    }
+                }
             })
             .collect();
 
         // Build tool definitions for the prompt
         let tools_desc = self.get_tools_description();
+        let tool_defs = self.get_tool_definitions();
         let system_with_tools = format!(
             "{}\n\nYou have access to the following tools:\n{}\n\n\
              To use a tool, respond with a JSON object like: {{\"tool\": \"tool_name\", \"args\": {{...}}}}\n\
@@ -235,6 +281,7 @@ impl Agent {
             top_p: None,
             stop_sequences: None,
             system_prompt: Some(system_with_tools),
+            tools: Some(tool_defs),
         };
 
         let response = self
@@ -244,7 +291,21 @@ impl Agent {
             .map_err(|e| AgentError::ExecutionFailed(e.to_string()))?;
 
         // Parse response for tool calls
-        let tool_calls = self.parse_tool_calls(&response.content);
+        let tool_calls = if !response.tool_uses.is_empty() {
+            Some(
+                response
+                    .tool_uses
+                    .into_iter()
+                    .map(|t| ToolCall {
+                        id: t.id,
+                        name: t.name,
+                        arguments: t.input,
+                    })
+                    .collect(),
+            )
+        } else {
+            self.parse_tool_calls(&response.content)
+        };
 
         Ok(AgentMessage {
             role: AgentRole::Assistant,
@@ -268,6 +329,17 @@ impl Agent {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn get_tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .values()
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            })
+            .collect()
     }
 
     /// Parse tool calls from response.
@@ -359,6 +431,7 @@ impl Agent {
         }
 
         let bytes = content.as_bytes();
+        let mut calls: Vec<ToolCall> = Vec::new();
         let mut i = 0usize;
         while i < bytes.len() {
             if bytes[i] != b'{' {
@@ -373,12 +446,12 @@ impl Agent {
             let json_str = &content[start..end];
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
                 if let Some(call) = parse_tool_call(&value) {
-                    return Some(vec![call]);
+                    calls.push(call);
                 }
                 if let Some(arr) = value.as_array() {
                     for item in arr {
                         if let Some(call) = parse_tool_call(item) {
-                            return Some(vec![call]);
+                            calls.push(call);
                         }
                     }
                 }
@@ -387,7 +460,7 @@ impl Agent {
             i = end;
         }
 
-        None
+        if calls.is_empty() { None } else { Some(calls) }
     }
 
     /// Execute a tool.
@@ -401,7 +474,7 @@ impl Agent {
                 },
                 Err(e) => ToolResult {
                     tool_call_id: call.id.clone(),
-                    content: format!("Error: {}", e),
+                    content: e.to_string(),
                     is_error: true,
                 },
             },

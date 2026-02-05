@@ -12,7 +12,7 @@ use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -564,86 +564,6 @@ async fn sync_remote_markdown(
     Ok(true)
 }
 
-fn is_markdown_doc_path(path: &str) -> bool {
-    let lower = path.trim().to_ascii_lowercase();
-    lower.ends_with(".md") || lower.ends_with(".markdown")
-}
-
-fn extract_markdown_inline_link_targets(markdown: &str) -> Vec<String> {
-    let bytes = markdown.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b']' && bytes[i + 1] == b'(' {
-            let start = i + 2;
-            let mut end = start;
-            while end < bytes.len() && bytes[end] != b')' {
-                end += 1;
-            }
-            if end >= bytes.len() {
-                break;
-            }
-            if let Some(target) = markdown.get(start..end) {
-                out.push(target.to_string());
-            }
-            i = end + 1;
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
-fn normalize_relative_doc_path_from_target(target: &str) -> Option<PathBuf> {
-    let trimmed = target.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let token = trimmed.split_whitespace().next().unwrap_or("");
-    let token = token.trim();
-    if token.is_empty() || token.starts_with('#') {
-        return None;
-    }
-    let token = token.trim_start_matches('<').trim_end_matches('>');
-    if token.contains("://")
-        || token.starts_with("mailto:")
-        || token.starts_with("data:")
-        || token.starts_with("javascript:")
-    {
-        return None;
-    }
-    let path_part = token
-        .split(|c| c == '#' || c == '?')
-        .next()
-        .unwrap_or(token)
-        .trim();
-    if path_part.is_empty() || !is_markdown_doc_path(path_part) {
-        return None;
-    }
-
-    let mut raw = path_part;
-    while raw.starts_with("./") {
-        raw = &raw[2..];
-    }
-    if raw.starts_with('/') || raw.starts_with('\\') {
-        return None;
-    }
-
-    let mut out = PathBuf::new();
-    for comp in Path::new(raw).components() {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(seg) => out.push(seg),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if out.as_os_str().is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
 fn resolve_remote_skill_dir(cfg: &Config, skill_key: &str) -> PathBuf {
     resolve_managed_skills_dir(cfg).join(skill_key)
 }
@@ -711,8 +631,13 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
         let mut doc_targets: Vec<String> = Vec::new();
         if fetch_relative {
             if let Ok(raw) = std::fs::read_to_string(&skill_path) {
-                let body = strip_frontmatter(&raw);
-                doc_targets.extend(extract_markdown_inline_link_targets(&body));
+                let body = drbot_core::markdown::strip_frontmatter(&raw);
+                doc_targets.extend(drbot_core::markdown::extract_markdown_inline_link_targets(
+                    &body,
+                ));
+                doc_targets.extend(
+                    drbot_core::markdown::extract_markdown_reference_definition_targets(&body),
+                );
             }
         }
         if !entry.extra_docs.is_empty() {
@@ -732,7 +657,9 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
                         let token = target.trim();
                         let token = token.split_whitespace().next().unwrap_or("").trim();
                         let token = token.trim_start_matches('<').trim_end_matches('>');
-                        let Some(rel_path) = normalize_relative_doc_path_from_target(token) else {
+                        let Some(rel_path) =
+                            drbot_core::markdown::normalize_relative_doc_path_from_target(token)
+                        else {
                             continue;
                         };
                         let leaf = rel_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -987,7 +914,7 @@ pub fn build_workspace_skills_prompt_with_remote(
         let Ok(raw) = std::fs::read_to_string(&entry.skill.file_path) else {
             continue;
         };
-        let body = strip_frontmatter(&raw);
+        let body = drbot_core::markdown::strip_frontmatter(&raw);
         let body = body.trim();
         if body.is_empty() {
             continue;
@@ -1023,15 +950,21 @@ pub fn build_workspace_skills_prompt_with_remote(
             push_extra(PathBuf::from("MESSAGING.md"));
         }
 
-        for target in extract_markdown_inline_link_targets(body) {
-            if let Some(rel) = normalize_relative_doc_path_from_target(&target) {
+        for target in drbot_core::markdown::extract_markdown_inline_link_targets(body)
+            .into_iter()
+            .chain(drbot_core::markdown::extract_markdown_reference_definition_targets(body))
+        {
+            if let Some(rel) = drbot_core::markdown::normalize_relative_doc_path_from_target(&target)
+            {
                 push_extra(rel);
             }
         }
 
         if let Some(cfg_entry) = skill_config.entries.get(&status.skill_key) {
             for target in &cfg_entry.extra_docs {
-                if let Some(rel) = normalize_relative_doc_path_from_target(target) {
+                if let Some(rel) =
+                    drbot_core::markdown::normalize_relative_doc_path_from_target(target)
+                {
                     push_extra(rel);
                 }
             }
@@ -1055,7 +988,7 @@ pub fn build_workspace_skills_prompt_with_remote(
                 used_extra_bytes = used_extra_bytes.saturating_add(meta.len());
             }
             if let Ok(raw) = std::fs::read_to_string(&extra) {
-                let body = strip_frontmatter(&raw);
+                let body = drbot_core::markdown::strip_frontmatter(&raw);
                 let body = body.trim();
                 if !body.is_empty() {
                     combined.push_str("\n\n---\n\n");
@@ -1723,18 +1656,6 @@ fn parse_frontmatter_block(content: &str) -> HashMap<String, String> {
     };
     let block = &normalized[4..end_index];
     parse_line_frontmatter(block)
-}
-
-fn strip_frontmatter(content: &str) -> String {
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-    if !normalized.starts_with("---\n") {
-        return normalized;
-    }
-    let Some(end_index) = normalized[3..].find("\n---").map(|i| i + 3) else {
-        return normalized;
-    };
-    let start = (end_index + 4).min(normalized.len());
-    normalized[start..].to_string()
 }
 
 fn parse_line_frontmatter(block: &str) -> HashMap<String, String> {

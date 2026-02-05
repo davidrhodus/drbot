@@ -251,6 +251,7 @@ impl Provider for OllamaProvider {
                 input_tokens: chat_response.prompt_eval_count.unwrap_or(0) as usize,
                 output_tokens: eval as usize,
             }),
+            tool_uses: Vec::new(),
         })
     }
 

@@ -84,3 +84,12 @@ pub fn resolve_managed_skills_dir(cfg: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("skills"))
 }
 
+pub fn resolve_agent_workspace_dir(agent_id: &str) -> PathBuf {
+    let safe = agent_id.trim();
+    let safe = if safe.is_empty() { "default" } else { safe };
+
+    if let Some(dir) = drbot_core::Config::config_dir() {
+        return dir.join("agents").join(safe);
+    }
+    PathBuf::from("agents").join(safe)
+}

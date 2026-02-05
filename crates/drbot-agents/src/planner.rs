@@ -162,6 +162,7 @@ Keep the plan concise and actionable. Only use the available tools listed above.
             system_prompt: Some(
                 "You are a planning assistant that creates structured execution plans.".to_string(),
             ),
+            tools: None,
         };
 
         let response = self
@@ -282,6 +283,7 @@ Respond with JSON in the same format as before."#,
             system_prompt: Some(
                 "You are a planning assistant that adapts plans when steps fail.".to_string(),
             ),
+            tools: None,
         };
 
         let response = self

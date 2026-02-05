@@ -335,6 +335,7 @@ impl App {
             top_p: None,
             stop_sequences: None,
             system_prompt: self.config.system_prompt.clone(),
+            tools: None,
         };
 
         // Create channel for streaming

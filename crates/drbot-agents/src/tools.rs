@@ -1,14 +1,19 @@
 //! Tool system for agent capabilities.
 
 use crate::{AgentError, Result};
+use crate::tool_root::{
+    ensure_root_dir, resolve_existing_dir, resolve_existing_file, resolve_write_file_path,
+};
+use crate::unified_diff::{apply_unified_diff_to_text, parse_unified_diff};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 /// A tool that an agent can use.
 #[async_trait]
@@ -26,26 +31,115 @@ pub trait AgentTool: Send + Sync {
     async fn execute(&self, args: Value) -> Result<String>;
 }
 
+struct AliasTool {
+    alias: String,
+    inner: Arc<dyn AgentTool>,
+}
+
+impl AliasTool {
+    fn new(alias: impl Into<String>, inner: Arc<dyn AgentTool>) -> Self {
+        Self {
+            alias: alias.into(),
+            inner,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTool for AliasTool {
+    fn name(&self) -> &str {
+        self.alias.as_str()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        self.inner.execute(args).await
+    }
+}
+
+fn truncate_for_context(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars).collect();
+    format!("{}...\n[truncated]", truncated)
+}
+
+async fn maybe_spool_tool_output(root: &PathBuf, tool: &str, output: String) -> Result<String> {
+    const INLINE_LIMIT_CHARS: usize = 80_000;
+
+    let char_count = output.chars().count();
+    if char_count <= INLINE_LIMIT_CHARS {
+        return Ok(output);
+    }
+
+    let dir = root.join(".drbot").join("tool-output");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AgentError::ToolError(format!("failed to create tool-output dir: {}", e)))?;
+
+    let mut slug = tool
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        slug = "tool".to_string();
+    }
+
+    let path = dir.join(format!("{}-{}.txt", slug, Uuid::new_v4()));
+    tokio::fs::write(&path, output.as_bytes())
+        .await
+        .map_err(|e| AgentError::ToolError(format!("failed to write tool output: {}", e)))?;
+
+    let rel = path
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    let truncated = truncate_for_context(&output, INLINE_LIMIT_CHARS);
+
+    Ok(format!(
+        "[output truncated: {} chars; full output saved to {}]\n{}",
+        char_count, rel, truncated
+    ))
+}
+
 /// Collection of built-in tools.
 pub struct BuiltinTools;
 
 impl BuiltinTools {
     /// Get all built-in tools.
-    pub fn all() -> Vec<Arc<dyn AgentTool>> {
-        vec![
-            Arc::new(BashTool::new()),
-            Arc::new(ReadFileTool),
-            Arc::new(WriteFileTool),
-            Arc::new(ListDirectoryTool),
-            Arc::new(SearchTool),
+    pub fn all(root: impl Into<PathBuf>) -> Result<Vec<Arc<dyn AgentTool>>> {
+        let root = ensure_root_dir(&root.into()).map_err(AgentError::ToolError)?;
+
+        let list_directory = Arc::new(ListDirectoryTool::new(root.clone()));
+        let list_dir_alias = Arc::new(AliasTool::new("list_dir", list_directory.clone()));
+
+        Ok(vec![
+            Arc::new(BashTool::new(root.clone())),
+            Arc::new(ReadFileTool::new(root.clone())),
+            Arc::new(WriteFileTool::new(root.clone())),
+            list_directory,
+            list_dir_alias,
+            Arc::new(SearchTool::new(root.clone())),
+            Arc::new(ApplyPatchTool::new(root)),
             Arc::new(HttpTool),
             Arc::new(CalculatorTool),
-        ]
+        ])
     }
 }
 
 /// Tool for executing bash commands.
 pub struct BashTool {
+    root: PathBuf,
     /// Allowed command prefixes (for sandboxing).
     allowed_prefixes: Vec<String>,
     /// Timeout in seconds.
@@ -53,7 +147,7 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    pub fn new() -> Self {
+    pub fn new(root: PathBuf) -> Self {
         fn truthy(value: &str) -> bool {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -116,8 +210,9 @@ impl BashTool {
             ]
         };
         Self {
+            root,
             allowed_prefixes,
-            timeout_secs: 30,
+            timeout_secs: 300,
         }
     }
 
@@ -126,20 +221,150 @@ impl BashTool {
         self
     }
 
+    fn looks_like_env_assignment(token: &str) -> bool {
+        let mut it = token.splitn(2, '=');
+        let key = it.next().unwrap_or("");
+        let value = it.next();
+        if value.is_none() {
+            return false;
+        }
+        if key.is_empty() || key.starts_with('-') {
+            return false;
+        }
+        if !key
+            .chars()
+            .all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            return false;
+        }
+        // POSIX env var name must not start with a digit.
+        if key
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn first_executable_token(part: &str) -> Option<String> {
+        let tokens: Vec<&str> = part.split_whitespace().collect();
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut i = 0usize;
+        while i < tokens.len() && Self::looks_like_env_assignment(tokens[i]) {
+            i += 1;
+        }
+
+        while i < tokens.len() {
+            let tok = tokens[i].trim();
+            if tok.is_empty() {
+                i += 1;
+                continue;
+            }
+            let tok = tok.trim_start_matches('\\');
+            let base = tok.rsplit('/').next().unwrap_or(tok);
+            match base {
+                // Treat common wrappers as transparent so allow/deny checks
+                // cannot be bypassed with `env rm ...` / `command rm ...`.
+                "env" => {
+                    i += 1;
+                    while i < tokens.len()
+                        && (tokens[i].starts_with('-') || Self::looks_like_env_assignment(tokens[i]))
+                    {
+                        i += 1;
+                    }
+                    continue;
+                }
+                "command" | "builtin" => {
+                    i += 1;
+                    while i < tokens.len() && tokens[i].starts_with('-') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                "nice" | "nohup" | "time" => {
+                    i += 1;
+                    while i < tokens.len() && tokens[i].starts_with('-') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => return Some(base.to_string()),
+            }
+        }
+
+        None
+    }
+
+    fn command_is_forbidden(command: &str) -> bool {
+        const FORBIDDEN_COMMANDS: &[&str] = &["sudo", "rm", "mkfs", "dd", "shutdown", "reboot"];
+
+        let cmd = command.trim();
+        if cmd.is_empty() {
+            return true;
+        }
+
+        let normalized = cmd.replace("&&", ";").replace("||", ";").replace('\n', ";");
+        for segment in normalized.split(';') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            for part in segment.split('|') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some(first) = Self::first_executable_token(part) {
+                    if FORBIDDEN_COMMANDS.contains(&first.as_str()) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn is_allowed(&self, command: &str) -> bool {
         if self.allowed_prefixes.is_empty() {
             return true; // No restrictions
         }
-        let cmd = command.trim().split_whitespace().next().unwrap_or("");
-        self.allowed_prefixes
-            .iter()
-            .any(|p| cmd == p || cmd.ends_with(&format!("/{}", p)))
-    }
-}
 
-impl Default for BashTool {
-    fn default() -> Self {
-        Self::new()
+        let cmd = command.trim();
+        if cmd.is_empty() {
+            return false;
+        }
+
+        let normalized = cmd.replace("&&", ";").replace("||", ";").replace('\n', ";");
+        for segment in normalized.split(';') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            for part in segment.split('|') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let Some(exec) = Self::first_executable_token(part) else {
+                    return false;
+                };
+                if !self
+                    .allowed_prefixes
+                    .iter()
+                    .any(|p| exec == *p || exec.ends_with(&format!("/{}", p)))
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -160,6 +385,10 @@ impl AgentTool for BashTool {
                 "command": {
                     "type": "string",
                     "description": "The bash command to execute"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory under the tool root"
                 }
             },
             "required": ["command"]
@@ -171,20 +400,32 @@ impl AgentTool for BashTool {
             .as_str()
             .ok_or_else(|| AgentError::ToolError("Missing 'command' argument".to_string()))?;
 
-        if !self.is_allowed(command) {
+        if Self::command_is_forbidden(command) {
             return Err(AgentError::ToolError(format!(
-                "Command not allowed: {}",
+                "Refusing to run forbidden command: {}",
                 command
             )));
         }
+
+        if !self.is_allowed(command) {
+            return Err(AgentError::ToolError(format!("Command not allowed: {}", command)));
+        }
+
+        let cwd_arg = args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let cwd = if cwd_arg.is_empty() {
+            self.root.clone()
+        } else {
+            resolve_existing_dir(&self.root, cwd_arg).map_err(AgentError::ToolError)?
+        };
 
         debug!("Executing bash command: {}", command);
 
         let output = tokio::time::timeout(
             tokio::time::Duration::from_secs(self.timeout_secs),
             Command::new("bash")
-                .arg("-c")
+                .arg("-lc")
                 .arg(command)
+                .current_dir(&cwd)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output(),
@@ -193,24 +434,46 @@ impl AgentTool for BashTool {
         .map_err(|_| AgentError::Timeout)?
         .map_err(|e| AgentError::ToolError(e.to_string()))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        if output.status.success() {
-            Ok(stdout.to_string())
+        let mut out = String::new();
+        out.push_str(&format!("exit_code: {}\n", code));
+        if !stdout.trim().is_empty() {
+            out.push_str("stdout:\n");
+            out.push_str(&stdout);
+            if !stdout.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !stderr.trim().is_empty() {
+            out.push_str("stderr:\n");
+            out.push_str(&stderr);
+            if !stderr.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+
+        let out = maybe_spool_tool_output(&self.root, "bash", out).await?;
+        if code == 0 {
+            Ok(out.trim_end().to_string())
         } else {
-            Ok(format!(
-                "Error (exit code {}): {}\n{}",
-                output.status.code().unwrap_or(-1),
-                stdout,
-                stderr
-            ))
+            Err(AgentError::ToolError(out.trim_end().to_string()))
         }
     }
 }
 
 /// Tool for reading files.
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    root: PathBuf,
+}
+
+impl ReadFileTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ReadFileTool {
@@ -240,14 +503,25 @@ impl AgentTool for ReadFileTool {
             .as_str()
             .ok_or_else(|| AgentError::ToolError("Missing 'path' argument".to_string()))?;
 
-        tokio::fs::read_to_string(path)
+        let file = resolve_existing_file(&self.root, path).map_err(AgentError::ToolError)?;
+        let bytes = tokio::fs::read(&file)
             .await
-            .map_err(|e| AgentError::ToolError(format!("Failed to read file: {}", e)))
+            .map_err(|e| AgentError::ToolError(format!("Failed to read file: {}", e)))?;
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        Ok(truncate_for_context(&text, 120_000))
     }
 }
 
 /// Tool for writing files.
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    root: PathBuf,
+}
+
+impl WriteFileTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
 
 #[async_trait]
 impl AgentTool for WriteFileTool {
@@ -284,20 +558,29 @@ impl AgentTool for WriteFileTool {
             .as_str()
             .ok_or_else(|| AgentError::ToolError("Missing 'content' argument".to_string()))?;
 
-        tokio::fs::write(path, content)
+        let file = resolve_write_file_path(&self.root, path).map_err(AgentError::ToolError)?;
+        tokio::fs::write(&file, content)
             .await
             .map_err(|e| AgentError::ToolError(format!("Failed to write file: {}", e)))?;
 
         Ok(format!(
             "Successfully wrote {} bytes to {}",
             content.len(),
-            path
+            file.display()
         ))
     }
 }
 
 /// Tool for listing directory contents.
-pub struct ListDirectoryTool;
+pub struct ListDirectoryTool {
+    root: PathBuf,
+}
+
+impl ListDirectoryTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ListDirectoryTool {
@@ -315,19 +598,17 @@ impl AgentTool for ListDirectoryTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path to list"
+                    "description": "Directory path to list (defaults to '.')"
                 }
-            },
-            "required": ["path"]
+            }
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let path = args["path"]
-            .as_str()
-            .ok_or_else(|| AgentError::ToolError("Missing 'path' argument".to_string()))?;
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let dir = resolve_existing_dir(&self.root, path).map_err(AgentError::ToolError)?;
 
-        let mut entries = tokio::fs::read_dir(path)
+        let mut entries = tokio::fs::read_dir(&dir)
             .await
             .map_err(|e| AgentError::ToolError(format!("Failed to read directory: {}", e)))?;
 
@@ -356,7 +637,19 @@ impl AgentTool for ListDirectoryTool {
 }
 
 /// Tool for searching text in files.
-pub struct SearchTool;
+pub struct SearchTool {
+    root: PathBuf,
+    timeout_secs: u64,
+}
+
+impl SearchTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            timeout_secs: 120,
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for SearchTool {
@@ -378,10 +671,10 @@ impl AgentTool for SearchTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search in"
+                    "description": "Directory or file to search in (defaults to '.')"
                 }
             },
-            "required": ["pattern", "path"]
+            "required": ["pattern"]
         })
     }
 
@@ -389,24 +682,199 @@ impl AgentTool for SearchTool {
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| AgentError::ToolError("Missing 'pattern' argument".to_string()))?;
-        let path = args["path"]
-            .as_str()
-            .ok_or_else(|| AgentError::ToolError("Missing 'path' argument".to_string()))?;
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        let output = Command::new("grep")
-            .args(["-r", "-n", "--include=*", pattern, path])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| AgentError::ToolError(format!("Search failed: {}", e)))?;
+        let target =
+            crate::tool_root::resolve_existing_path(&self.root, path).map_err(AgentError::ToolError)?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.is_empty() {
-            Ok("No matches found".to_string())
-        } else {
-            Ok(stdout.to_string())
+        // Prefer ripgrep; fall back to grep.
+        let rg_output = tokio::time::timeout(
+            tokio::time::Duration::from_secs(self.timeout_secs),
+            Command::new("rg")
+                .args([
+                    "-n",
+                    "--hidden",
+                    "--no-heading",
+                    pattern,
+                    target.to_string_lossy().as_ref(),
+                ])
+                .current_dir(&self.root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await;
+
+        let output = match rg_output {
+            Ok(Ok(out)) => out,
+            _ => {
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(self.timeout_secs),
+                    Command::new("grep")
+                        .args(["-R", "-n", pattern, target.to_string_lossy().as_ref()])
+                        .current_dir(&self.root)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output(),
+                )
+                .await
+                .map_err(|_| AgentError::Timeout)?
+                .map_err(|e| AgentError::ToolError(format!("Search failed: {}", e)))?
+            }
+        };
+
+        let code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if code == 1 && stdout.trim().is_empty() && stderr.trim().is_empty() {
+            return Ok("No matches found".to_string());
         }
+
+        let mut out = String::new();
+        out.push_str(&format!("exit_code: {}\n", code));
+        if !stdout.trim().is_empty() {
+            out.push_str("stdout:\n");
+            out.push_str(&stdout);
+            if !stdout.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !stderr.trim().is_empty() {
+            out.push_str("stderr:\n");
+            out.push_str(&stderr);
+            if !stderr.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+
+        let out = maybe_spool_tool_output(&self.root, "search", out).await?;
+        if code == 0 || code == 1 {
+            Ok(out.trim_end().to_string())
+        } else {
+            Err(AgentError::ToolError(out.trim_end().to_string()))
+        }
+    }
+}
+
+/// Tool for applying unified diff patches under the tool root.
+pub struct ApplyPatchTool {
+    root: PathBuf,
+}
+
+impl ApplyPatchTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl AgentTool for ApplyPatchTool {
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &str {
+        "Apply a unified diff patch to files under the tool root"
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "Unified diff patch to apply"
+                }
+            },
+            "required": ["patch"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let patch = args["patch"]
+            .as_str()
+            .ok_or_else(|| AgentError::ToolError("Missing 'patch' argument".to_string()))?;
+
+        let files = parse_unified_diff(patch).map_err(AgentError::ToolError)?;
+        if files.is_empty() {
+            return Err(AgentError::ToolError(
+                "apply_patch: no file patches found".to_string(),
+            ));
+        }
+
+        let mut out_lines: Vec<String> = Vec::new();
+        for fp in files {
+            let old_path = fp.old_path.clone();
+            let new_path = fp.new_path.clone();
+
+            if old_path != "/dev/null" && new_path != "/dev/null" && old_path != new_path {
+                return Err(AgentError::ToolError(format!(
+                    "apply_patch: renames are not supported ({} -> {})",
+                    old_path, new_path
+                )));
+            }
+
+            if new_path == "/dev/null" {
+                // Delete file.
+                let canon = crate::tool_root::resolve_existing_path(&self.root, &old_path)
+                    .map_err(AgentError::ToolError)?;
+                if !canon.is_file() {
+                    return Err(AgentError::ToolError(format!(
+                        "apply_patch: not a file: {}",
+                        old_path
+                    )));
+                }
+
+                let joined = crate::tool_root::join_relative(&self.root, &old_path)
+                    .map_err(AgentError::ToolError)?;
+                tokio::fs::remove_file(&joined)
+                    .await
+                    .map_err(|e| AgentError::ToolError(format!("Failed to delete '{}': {}", joined.display(), e)))?;
+                out_lines.push(format!("deleted {}", old_path));
+                continue;
+            }
+
+            let target_path = new_path.clone();
+
+            // For existing files, refuse to patch symlinks (safety).
+            if old_path != "/dev/null" {
+                let joined = crate::tool_root::join_relative(&self.root, &target_path)
+                    .map_err(AgentError::ToolError)?;
+                if let Ok(meta) = std::fs::symlink_metadata(&joined) {
+                    if meta.file_type().is_symlink() {
+                        return Err(AgentError::ToolError(format!(
+                            "apply_patch: refusing to patch symlink '{}'",
+                            target_path
+                        )));
+                    }
+                }
+            }
+
+            let original = if old_path == "/dev/null" {
+                String::new()
+            } else {
+                let file = resolve_existing_file(&self.root, &target_path).map_err(AgentError::ToolError)?;
+                let bytes = tokio::fs::read(&file)
+                    .await
+                    .map_err(|e| AgentError::ToolError(format!("Failed to read '{}': {}", file.display(), e)))?;
+                String::from_utf8_lossy(&bytes).to_string()
+            };
+
+            let mut updated =
+                apply_unified_diff_to_text(&original, &fp.hunks).map_err(AgentError::ToolError)?;
+            if old_path == "/dev/null" && !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+
+            let file = resolve_write_file_path(&self.root, &target_path).map_err(AgentError::ToolError)?;
+            tokio::fs::write(&file, updated)
+                .await
+                .map_err(|e| AgentError::ToolError(format!("Failed to write '{}': {}", file.display(), e)))?;
+            out_lines.push(format!("patched {}", target_path));
+        }
+
+        Ok(out_lines.join("\n"))
     }
 }
 
@@ -577,12 +1045,12 @@ impl ToolRegistry {
     }
 
     /// Create a registry with builtin tools.
-    pub fn with_builtins() -> Self {
+    pub fn with_builtins(root: impl Into<PathBuf>) -> Result<Self> {
         let mut registry = Self::new();
-        for tool in BuiltinTools::all() {
+        for tool in BuiltinTools::all(root)? {
             registry.register(tool);
         }
-        registry
+        Ok(registry)
     }
 
     /// Register a tool.
@@ -610,6 +1078,15 @@ impl ToolRegistry {
 mod tests {
     use super::*;
 
+    fn temp_root() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "drbot-agents-tools-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        ensure_root_dir(&dir).unwrap()
+    }
+
     #[test]
     fn test_calculator() {
         assert_eq!(evaluate_simple_expr("2 + 2").unwrap(), 4.0);
@@ -619,10 +1096,16 @@ mod tests {
 
     #[test]
     fn test_bash_tool_allowed() {
-        let tool = BashTool::new();
+        let tool = BashTool::new(temp_root());
         assert!(tool.is_allowed("ls -la"));
         assert!(tool.is_allowed("cat file.txt"));
         assert!(!tool.is_allowed("rm -rf /"));
+        assert!(BashTool::command_is_forbidden("env rm -rf /"));
+        assert!(BashTool::command_is_forbidden("command rm -rf /"));
+        assert!(BashTool::command_is_forbidden("sudo ls"));
+
+        let tool = BashTool::new(temp_root()).with_allowed_commands(vec!["git".to_string()]);
+        assert!(tool.is_allowed("env git status"));
     }
 
     #[test]
@@ -632,5 +1115,81 @@ mod tests {
 
         assert!(registry.get("calculator").is_some());
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_tool_patches_creates_and_deletes() {
+        let root = temp_root();
+        let tool = ApplyPatchTool::new(root.clone());
+
+        // Patch existing file.
+        let file = root.join("foo.txt");
+        std::fs::write(&file, "a\nb\n").unwrap();
+        let patch = "\
+--- a/foo.txt
++++ b/foo.txt
+@@ -1,2 +1,2 @@
+ a
+-b
++c
+";
+        let out = tool
+            .execute(serde_json::json!({ "patch": patch }))
+            .await
+            .unwrap();
+        assert!(out.contains("patched foo.txt"), "out={}", out);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nc\n");
+
+        // Create new file.
+        let patch = "\
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++hello
++world
+";
+        tool.execute(serde_json::json!({ "patch": patch }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "hello\nworld\n"
+        );
+
+        // Delete file.
+        let patch = "\
+--- a/new.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-hello
+-world
+";
+        tool.execute(serde_json::json!({ "patch": patch }))
+            .await
+            .unwrap();
+        assert!(!root.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_tool_rejects_rename() {
+        let root = temp_root();
+        std::fs::write(root.join("a.txt"), "x\n").unwrap();
+        let tool = ApplyPatchTool::new(root.clone());
+
+        let patch = "\
+--- a/a.txt
++++ b/b.txt
+@@ -1,1 +1,1 @@
+-x
++y
+";
+        let err = tool
+            .execute(serde_json::json!({ "patch": patch }))
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::ToolError(msg) => assert!(msg.contains("renames"), "msg={}", msg),
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }

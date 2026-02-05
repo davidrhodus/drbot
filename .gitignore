@@ -25,6 +25,7 @@ config.toml
 *.db
 *.db-shm
 *.db-wal
+.drbot/
 .whatsapp/
 .sessions/
 media/

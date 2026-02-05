@@ -1,6 +1,7 @@
 //! OpenAI API types.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Role in a chat message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +81,24 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Tool definition for function calling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    /// Tool type (always "function").
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ToolFunction,
+}
+
+/// Function definition inside a tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: Value,
+}
+
 /// Chat completion request.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
@@ -105,6 +124,9 @@ pub struct ChatCompletionRequest {
     /// Stream options (for streaming).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Optional tool definitions for native tool calling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
 }
 
 /// Stream options for chat completion.

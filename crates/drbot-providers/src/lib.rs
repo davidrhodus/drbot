@@ -9,6 +9,23 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use tokio_stream::Stream;
 
+/// Tool definition for providers that support function/tool calling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool input.
+    pub parameters: serde_json::Value,
+}
+
+/// A tool-use request returned by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
 /// Information about an AI model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -28,6 +45,9 @@ pub struct ChatOptions {
     pub top_p: Option<f32>,
     pub stop_sequences: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+    /// Optional tool definitions to enable native tool calling (provider-dependent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
 }
 
 /// Response from a chat completion.
@@ -37,6 +57,9 @@ pub struct ChatResponse {
     pub model: String,
     pub usage: Option<Usage>,
     pub stop_reason: Option<String>,
+    /// Native tool calls requested by the model (if supported).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_uses: Vec<ToolUse>,
 }
 
 /// Token usage information.

@@ -35,7 +35,9 @@ mod background;
 mod executor;
 mod planner;
 mod sandbox;
+mod tool_root;
 mod tools;
+mod unified_diff;
 
 pub use agent::{Agent, AgentConfig, AgentState};
 pub use background::{

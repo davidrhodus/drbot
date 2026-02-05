@@ -300,6 +300,7 @@ impl Provider for BedrockProvider {
                 input_tokens: u.input_tokens as usize,
                 output_tokens: u.output_tokens as usize,
             }),
+            tool_uses: Vec::new(),
         })
     }
 

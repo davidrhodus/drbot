@@ -2,11 +2,13 @@
 
 use crate::api::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ErrorResponse,
-    StreamOptions,
+    StreamOptions, Tool as ApiTool, ToolFunction as ApiToolFunction,
 };
 use async_trait::async_trait;
-use drbot_core::message::{Message, Role};
-use drbot_providers::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, Usage};
+use drbot_core::message::{Content, Message, Role};
+use drbot_providers::{
+    ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, ToolUse, Usage,
+};
 use futures::stream::Stream;
 use reqwest::Client;
 use std::pin::Pin;
@@ -64,17 +66,81 @@ impl OpenAIProvider {
 
     /// Convert our Message type to OpenAI's format.
     fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
-        messages
-            .iter()
-            .map(|msg| {
-                let content = msg.text_content();
-                match msg.role {
-                    Role::System => ChatMessage::system(content),
-                    Role::User => ChatMessage::user(content),
-                    Role::Assistant => ChatMessage::assistant(content),
+        let mut out: Vec<ChatMessage> = Vec::new();
+
+        for msg in messages {
+            // Tool results must be sent back as role=tool messages.
+            for block in &msg.content {
+                if let Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                {
+                    out.push(ChatMessage {
+                        role: crate::api::Role::Tool,
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                        tool_call_id: Some(tool_use_id.clone()),
+                    });
                 }
-            })
-            .collect()
+            }
+
+            // Build assistant tool calls (if any).
+            let mut tool_calls: Vec<crate::api::ToolCall> = Vec::new();
+            let mut text = String::new();
+            for block in &msg.content {
+                match block {
+                    Content::Text { text: t } => text.push_str(t),
+                    Content::ToolUse { id, name, input } => {
+                        let args = serde_json::to_string(input)
+                            .unwrap_or_else(|_| "null".to_string());
+                        tool_calls.push(crate::api::ToolCall {
+                            id: id.clone(),
+                            tool_type: "function".to_string(),
+                            function: crate::api::FunctionCall {
+                                name: name.clone(),
+                                arguments: args,
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            match msg.role {
+                Role::System => {
+                    if !text.trim().is_empty() {
+                        out.push(ChatMessage::system(text));
+                    }
+                }
+                Role::User => {
+                    if !text.trim().is_empty() {
+                        out.push(ChatMessage::user(text));
+                    }
+                }
+                Role::Assistant => {
+                    if tool_calls.is_empty() {
+                        if !text.trim().is_empty() {
+                            out.push(ChatMessage::assistant(text));
+                        }
+                    } else {
+                        out.push(ChatMessage {
+                            role: crate::api::Role::Assistant,
+                            content: if text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(text)
+                            },
+                            tool_calls: Some(tool_calls),
+                            tool_call_id: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        out
     }
 
     /// Build the request.
@@ -107,6 +173,19 @@ impl OpenAIProvider {
             .or(Some(self.default_max_tokens))
             .map(|t| t as u32);
 
+        let tools = options.tools.as_ref().map(|defs| {
+            defs.iter()
+                .map(|d| ApiTool {
+                    tool_type: "function".to_string(),
+                    function: ApiToolFunction {
+                        name: d.name.clone(),
+                        description: Some(d.description.clone()),
+                        parameters: d.parameters.clone(),
+                    },
+                })
+                .collect::<Vec<_>>()
+        });
+
         ChatCompletionRequest {
             model: options
                 .model
@@ -125,6 +204,7 @@ impl OpenAIProvider {
             } else {
                 None
             },
+            tools,
         }
     }
 }
@@ -210,6 +290,25 @@ impl Provider for OpenAIProvider {
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
 
+        let tool_uses: Vec<ToolUse> = completion
+            .choices
+            .first()
+            .and_then(|c| c.message.as_ref())
+            .and_then(|m| m.tool_calls.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| {
+                let input =
+                    serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                        .unwrap_or(serde_json::Value::Null);
+                ToolUse {
+                    id: tc.id,
+                    name: tc.function.name,
+                    input,
+                }
+            })
+            .collect();
+
         let stop_reason = completion
             .choices
             .first()
@@ -223,6 +322,7 @@ impl Provider for OpenAIProvider {
                 input_tokens: u.prompt_tokens as usize,
                 output_tokens: u.completion_tokens as usize,
             }),
+            tool_uses,
         })
     }
 

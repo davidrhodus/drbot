@@ -517,16 +517,6 @@ fn resolve_openclaw_state_dir(state: &GatewayState) -> Option<PathBuf> {
     crate::openclaw_paths::resolve_openclaw_state_dir(state.config())
 }
 
-fn resolve_agent_workspace_dir(agent_id: &str) -> PathBuf {
-    let safe = agent_id.trim();
-    let safe = if safe.is_empty() { "default" } else { safe };
-
-    if let Some(dir) = drbot_core::Config::config_dir() {
-        return dir.join("agents").join(safe);
-    }
-    PathBuf::from("agents").join(safe)
-}
-
 fn read_json_file<T: DeserializeOwned>(path: &PathBuf) -> Option<T> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -1397,7 +1387,7 @@ async fn refresh_remote_node_bins_best_effort(state: GatewayState, node_id: Stri
         return;
     }
 
-    let workspace_dirs = vec![resolve_agent_workspace_dir("default")];
+    let workspace_dirs = vec![crate::openclaw_paths::resolve_agent_workspace_dir("default")];
     let required_bins = crate::openclaw_skills::collect_required_skill_bins_for_platform(
         &workspace_dirs,
         state.config(),
@@ -5261,7 +5251,7 @@ fn is_safe_agent_filename(name: &str) -> bool {
 }
 
 async fn handle_agents_files_list(agent_id: &str) -> serde_json::Value {
-    let workspace = resolve_agent_workspace_dir(agent_id);
+    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
     let mut files: Vec<serde_json::Value> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&workspace) {
@@ -5308,7 +5298,7 @@ async fn handle_agents_files_get(
             "invalid file name",
         ));
     }
-    let workspace = resolve_agent_workspace_dir(agent_id);
+    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
     let path = workspace.join(name);
     let missing = !path.exists();
     let content = if missing {
@@ -5349,7 +5339,7 @@ async fn handle_agents_files_set(
             "invalid file name",
         ));
     }
-    let workspace = resolve_agent_workspace_dir(agent_id);
+    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
     if let Err(e) = std::fs::create_dir_all(&workspace) {
         return Err(ErrorShape::new(
             error_codes::UNAVAILABLE,
@@ -5567,8 +5557,9 @@ async fn spawn_chat_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
+    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir("default");
     let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
-        &resolve_agent_workspace_dir("default"),
+        &workspace_dir,
         ctx.state.config(),
         remote.as_ref(),
     );
@@ -5589,6 +5580,7 @@ async fn spawn_chat_run(
         top_p: None,
         stop_sequences: None,
         system_prompt,
+        tools: None,
     };
 
     let mut full = String::new();
@@ -5861,8 +5853,9 @@ async fn spawn_agent_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
+    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir("default");
     let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
-        &resolve_agent_workspace_dir("default"),
+        &workspace_dir,
         ctx.state.config(),
         remote.as_ref(),
     );
@@ -5897,7 +5890,35 @@ async fn spawn_agent_run(
     let mut agent = DrbotAgent::new(provider.clone(), agent_cfg);
 
     // Register a conservative baseline toolset (avoid generic HTTP; prefer allowlisted API tools).
-    for tool in BuiltinTools::all() {
+    let builtin = match BuiltinTools::all(workspace_dir) {
+        Ok(v) => v,
+        Err(err) => {
+            let ended_at = now_ms();
+            let message = format!("failed to initialize agent tools: {}", err);
+            let _ = finish_agent_run(&run_id, "error", Some(message.clone())).await;
+            emit_agent_event(
+                &ctx,
+                &run_id,
+                "lifecycle",
+                json!({ "phase": "error", "startedAt": started_at, "endedAt": ended_at, "error": message }),
+            )
+            .await;
+            let payload = json!({
+                "runId": run_id,
+                "status": "error",
+                "summary": "tool initialization failed",
+            });
+            let frame = GatewayFrame::Res(ResponseFrame {
+                id: req_id,
+                ok: false,
+                payload: Some(payload),
+                error: Some(ErrorShape::new(error_codes::UNAVAILABLE, "tool initialization failed")),
+            });
+            send_frame(&ctx.tx, &ctx.queued_bytes, &ctx.closing, &frame).await;
+            return;
+        }
+    };
+    for tool in builtin {
         if tool.name() == "http" {
             continue;
         }
@@ -7401,6 +7422,7 @@ async fn execute_cron_job(
                             top_p: None,
                             stop_sequences: None,
                             system_prompt: None,
+                            tools: None,
                         };
 
                         let mut full = String::new();
@@ -8425,7 +8447,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             } else {
                 agent_id
             };
-            let workspace = resolve_agent_workspace_dir(agent_id);
+            let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
 
             // Best-effort: if remote skills were enabled via skills.update/env, fetch them so
             // they appear in the Skills UI without waiting for a heartbeat.
@@ -8450,7 +8472,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             ok_response(&req.id, payload)
         }
         "skills.bins" => {
-            let workspace_dirs = vec![resolve_agent_workspace_dir("default")];
+            let workspace_dirs = vec![crate::openclaw_paths::resolve_agent_workspace_dir("default")];
             let bins = crate::openclaw_skills::collect_skill_bins(&workspace_dirs, ctx.state.config());
             ok_response(&req.id, json!({ "bins": bins }))
         }
@@ -8487,7 +8509,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            let workspace = resolve_agent_workspace_dir("default");
+            let workspace = crate::openclaw_paths::resolve_agent_workspace_dir("default");
 
             let plan = match crate::openclaw_skills::resolve_skill_install_plan(
                 ctx.state.config(),

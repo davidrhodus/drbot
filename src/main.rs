@@ -16,7 +16,7 @@ use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
 use drbot_tui::AppConfig;
 use futures::StreamExt;
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -172,6 +172,20 @@ enum Commands {
         action: ChannelsAction,
     },
 
+    /// Manage OpenClaw-style skills (local + configured remote skills)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+
+        /// Workspace directory to evaluate skills against (defaults to the OpenClaw agent workspace "default")
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Output compact JSON (status only)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Interactive setup wizard
     Wizard,
 
@@ -205,6 +219,22 @@ enum ChannelsAction {
         /// Channel name
         name: String,
     },
+}
+
+/// Skills subcommands.
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// Show skill status for a workspace
+    Status,
+
+    /// Sync configured remote skills (and Colosseum docs) into the managed skills dir
+    Sync,
+
+    /// Print the skills prompt injected into agent runs (best-effort)
+    Prompt,
+
+    /// List required bins across eligible skills for a workspace
+    Bins,
 }
 
 #[tokio::main]
@@ -305,6 +335,11 @@ async fn main() -> Result<()> {
         Some(Commands::Channels { action }) => {
             run_channels(&config, action, cli.config.as_deref()).await
         }
+        Some(Commands::Skills {
+            action,
+            workspace,
+            json,
+        }) => run_skills(&config, action, workspace, json).await,
         Some(Commands::Wizard) => run_wizard().await,
         Some(Commands::Config) => {
             show_config(&config);
@@ -393,6 +428,55 @@ async fn run_gateway(config: Config) -> Result<()> {
         .run_with_shutdown(shutdown)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    Ok(())
+}
+
+async fn run_skills(
+    config: &Config,
+    action: SkillsAction,
+    workspace: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let workspace_dir = workspace
+        .as_deref()
+        .map(|p| PathBuf::from(expand_tilde(p)))
+        .unwrap_or_else(|| drbot_gateway::openclaw_paths::resolve_agent_workspace_dir("default"));
+
+    match action {
+        SkillsAction::Status => {
+            let report =
+                drbot_gateway::openclaw_skills::build_skills_status_report(&workspace_dir, config);
+            let raw = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{}", raw);
+        }
+        SkillsAction::Sync => {
+            drbot_gateway::openclaw_skills::sync_configured_remote_skills_best_effort(config)
+                .await;
+            drbot_gateway::colosseum::sync_colosseum_docs_best_effort(config).await;
+            println!("ok");
+        }
+        SkillsAction::Prompt => {
+            let prompt = drbot_gateway::openclaw_skills::build_workspace_skills_prompt(
+                &workspace_dir,
+                config,
+            );
+            print!("{}", prompt);
+        }
+        SkillsAction::Bins => {
+            let bins = drbot_gateway::openclaw_skills::collect_skill_bins(
+                &[workspace_dir.clone()],
+                config,
+            );
+            for bin in bins {
+                println!("{}", bin);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -704,7 +788,7 @@ fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
     s.push_str("  args: { \"path\": string }\n");
     s.push_str("- write_file: Write/replace a UTF-8 text file under the tool root.\n");
     s.push_str("  args: { \"path\": string, \"content\": string }\n");
-    s.push_str("- list_dir: List a directory under the tool root.\n");
+    s.push_str("- list_dir / list_directory: List a directory under the tool root.\n");
     s.push_str("  args: { \"path\": string }\n");
     s.push_str("- search: Search for a pattern under a path (uses ripgrep when available).\n");
     s.push_str("  args: { \"pattern\": string, \"path\": string }\n");
@@ -718,117 +802,6 @@ fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
     s.push_str("- After a tool runs, you will receive a message starting with [Tool Result] or [Tool Denied]. Use it to continue.\n");
     s.push_str(&format!("\nTool root: {}\n", tool_root.display()));
     s
-}
-
-fn strip_frontmatter(content: &str) -> String {
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-    if !normalized.starts_with("---\n") {
-        return normalized;
-    }
-    let Some(end_index) = normalized[3..].find("\n---").map(|i| i + 3) else {
-        return normalized;
-    };
-    let start = (end_index + 4).min(normalized.len());
-    normalized[start..].to_string()
-}
-
-fn is_markdown_doc_path(path: &str) -> bool {
-    let lower = path.trim().to_ascii_lowercase();
-    lower.ends_with(".md") || lower.ends_with(".markdown")
-}
-
-fn extract_markdown_inline_link_targets(markdown: &str) -> Vec<String> {
-    let bytes = markdown.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b']' && bytes[i + 1] == b'(' {
-            let start = i + 2;
-            let mut end = start;
-            while end < bytes.len() && bytes[end] != b')' {
-                end += 1;
-            }
-            if end >= bytes.len() {
-                break;
-            }
-            if let Some(target) = markdown.get(start..end) {
-                out.push(target.to_string());
-            }
-            i = end + 1;
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
-fn extract_markdown_reference_definition_targets(markdown: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('[') {
-            continue;
-        }
-        let Some(end) = trimmed.find("]:") else {
-            continue;
-        };
-        let rest = trimmed[end + 2..].trim();
-        let token = rest.split_whitespace().next().unwrap_or("").trim();
-        if token.is_empty() {
-            continue;
-        }
-        out.push(token.to_string());
-    }
-    out
-}
-
-fn normalize_relative_doc_path_from_target(target: &str) -> Option<PathBuf> {
-    let trimmed = target.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let token = trimmed.split_whitespace().next().unwrap_or("").trim();
-    if token.is_empty() || token.starts_with('#') {
-        return None;
-    }
-    let token = token.trim_start_matches('<').trim_end_matches('>');
-    if token.contains("://")
-        || token.starts_with("mailto:")
-        || token.starts_with("data:")
-        || token.starts_with("javascript:")
-    {
-        return None;
-    }
-    let path_part = token
-        .split(|c| c == '#' || c == '?')
-        .next()
-        .unwrap_or(token)
-        .trim();
-    if path_part.is_empty() || !is_markdown_doc_path(path_part) {
-        return None;
-    }
-
-    let mut raw = path_part;
-    while raw.starts_with("./") {
-        raw = &raw[2..];
-    }
-    if raw.starts_with('/') || raw.starts_with('\\') {
-        return None;
-    }
-
-    let mut out = PathBuf::new();
-    for comp in Path::new(raw).components() {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(seg) => out.push(seg),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if out.as_os_str().is_empty() {
-        None
-    } else {
-        Some(out)
-    }
 }
 
 fn resolve_skill_url_timeout_secs() -> u64 {
@@ -1032,7 +1005,7 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
     let dir_prefix = dir_url.path().to_string();
 
     let main_raw = fetch_url_text(&client, base.as_str(), max_file_bytes).await?;
-    let main_body = strip_frontmatter(&main_raw);
+    let main_body = drbot_core::markdown::strip_frontmatter(&main_raw);
     let main_body = main_body.trim();
     if main_body.is_empty() {
         return Err(anyhow::anyhow!("empty skill document: {}", url));
@@ -1053,15 +1026,20 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
     let mut seen = std::collections::HashSet::<PathBuf>::new();
     let mut docs_added = 0usize;
     let mut targets = Vec::new();
-    targets.extend(extract_markdown_inline_link_targets(main_body));
-    targets.extend(extract_markdown_reference_definition_targets(main_body));
+    targets.extend(drbot_core::markdown::extract_markdown_inline_link_targets(
+        main_body,
+    ));
+    targets.extend(drbot_core::markdown::extract_markdown_reference_definition_targets(
+        main_body,
+    ));
     for target in targets {
         if docs_added >= max_relative_docs || used_bytes >= max_total_bytes {
             break;
         }
         let token = target.trim().split_whitespace().next().unwrap_or("").trim();
         let token = token.trim_start_matches('<').trim_end_matches('>');
-        let Some(rel_path) = normalize_relative_doc_path_from_target(token) else {
+        let Some(rel_path) = drbot_core::markdown::normalize_relative_doc_path_from_target(token)
+        else {
             continue;
         };
         let leaf = rel_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -1091,7 +1069,7 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
                 continue;
             }
         };
-        let body = strip_frontmatter(&raw);
+        let body = drbot_core::markdown::strip_frontmatter(&raw);
         let body = body.trim();
         if body.is_empty() {
             continue;
@@ -1354,6 +1332,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ToolCallSpec> {
         "read_file",
         "write_file",
         "list_dir",
+        "list_directory",
         "search",
         "apply_patch",
     ];
@@ -1458,7 +1437,50 @@ fn truncate_for_context(text: &str, max_chars: usize) -> String {
     format!("{}...\n[truncated]", truncated)
 }
 
-async fn run_bash_tool(cwd: &Path, command: &str) -> Result<(String, bool)> {
+async fn maybe_spool_tool_output(
+    root: &Path,
+    tool: &str,
+    output: &str,
+    max_chars: usize,
+) -> Result<String> {
+    let char_count = output.chars().count();
+    if char_count <= max_chars {
+        return Ok(output.to_string());
+    }
+
+    let dir = root.join(".drbot").join("tool-output");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to create tool-output dir: {}", e))?;
+
+    let mut slug = tool
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        slug = "tool".to_string();
+    }
+
+    let path = dir.join(format!("{}-{}.txt", slug, Uuid::new_v4()));
+    tokio::fs::write(&path, output.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to write tool output: {}", e))?;
+
+    let rel = path
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    let truncated = truncate_for_context(output, max_chars);
+
+    Ok(format!(
+        "[output truncated: {} chars; full output saved to {}]\n{}",
+        char_count, rel, truncated
+    ))
+}
+
+async fn run_bash_tool(root: &Path, cwd: &Path, command: &str) -> Result<(String, bool)> {
     use tokio::process::Command;
 
     let output = tokio::time::timeout(
@@ -1495,7 +1517,9 @@ async fn run_bash_tool(cwd: &Path, command: &str) -> Result<(String, bool)> {
         }
     }
 
-    Ok((truncate_for_context(out.trim_end(), 40_000), is_error))
+    let rendered = out.trim_end().to_string();
+    let rendered = maybe_spool_tool_output(root, "bash", &rendered, 40_000).await?;
+    Ok((rendered, is_error))
 }
 
 async fn run_read_file_tool(root: &Path, path: &str) -> Result<String> {
@@ -1539,7 +1563,9 @@ async fn run_list_dir_tool(root: &Path, path: &str) -> Result<String> {
         items.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
     }
     items.sort();
-    Ok(items.join("\n"))
+    let rendered = items.join("\n");
+    let rendered = maybe_spool_tool_output(root, "list_dir", &rendered, 40_000).await?;
+    Ok(rendered)
 }
 
 async fn run_search_tool(root: &Path, pattern: &str, path: &str) -> Result<(String, bool)> {
@@ -1607,7 +1633,9 @@ async fn run_search_tool(root: &Path, pattern: &str, path: &str) -> Result<(Stri
         }
     }
 
-    Ok((truncate_for_context(out.trim_end(), 40_000), is_error))
+    let rendered = out.trim_end().to_string();
+    let rendered = maybe_spool_tool_output(root, "search", &rendered, 40_000).await?;
+    Ok((rendered, is_error))
 }
 
 #[derive(Debug, Clone)]
@@ -1908,7 +1936,7 @@ async fn execute_tool_call(
             } else {
                 tool_cfg.root.clone()
             };
-            let (output, is_error) = run_bash_tool(&cwd_path, command).await?;
+            let (output, is_error) = run_bash_tool(&tool_cfg.root, &cwd_path, command).await?;
             Ok((output, is_error))
         }
         "read_file" => {
@@ -1934,7 +1962,7 @@ async fn execute_tool_call(
             let output = run_write_file_tool(&tool_cfg.root, path, content).await?;
             Ok((output, false))
         }
-        "list_dir" => {
+        "list_dir" | "list_directory" => {
             let path = call
                 .args
                 .get("path")
@@ -2298,6 +2326,7 @@ async fn run_chat(
         top_p: None,
         stop_sequences: None,
         system_prompt: system_prompt.clone(),
+        tools: None,
     };
 
     // Initialize context manager
@@ -2541,7 +2570,7 @@ async fn run_chat(
             println!("bash       - run a shell command (args: command, cwd?)");
             println!("read_file  - read a file under root");
             println!("write_file - write a file under root");
-            println!("list_dir   - list a directory under root");
+            println!("list_dir / list_directory - list a directory under root");
             println!("search     - search for a pattern under root");
             println!("apply_patch - apply a unified diff patch under root");
             println!();
@@ -2782,7 +2811,7 @@ async fn run_chat(
                                 .unwrap_or(0);
                             println!("[Tool] write_file\n  path: {}\n  bytes: {}", path, bytes);
                         }
-                        "list_dir" => {
+                        "list_dir" | "list_directory" => {
                             let path = call
                                 .args
                                 .get("path")

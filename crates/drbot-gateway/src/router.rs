@@ -178,7 +178,21 @@ async fn tools_invoke_handler(
     // Minimal tool registry (OpenClaw parity enough for interop + hackathon skills).
     let mut tools: std::collections::HashMap<String, std::sync::Arc<dyn drbot_agents::AgentTool>> =
         std::collections::HashMap::new();
-    for tool in drbot_agents::BuiltinTools::all() {
+    let workspace_root = crate::openclaw_paths::resolve_agent_workspace_dir("default");
+    let builtin = match drbot_agents::BuiltinTools::all(workspace_root) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": { "type": "unavailable", "message": format!("failed to initialize tools: {}", err) }
+                })),
+            )
+                .into_response();
+        }
+    };
+    for tool in builtin {
         if tool.name() == "http" {
             continue;
         }
@@ -498,6 +512,7 @@ async fn handle_request(
                     .options
                     .as_ref()
                     .and_then(|o| o.system_prompt.clone()),
+                tools: None,
             };
 
             // Load existing session messages if we have a session store.

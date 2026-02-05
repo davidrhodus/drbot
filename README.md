@@ -80,6 +80,7 @@ drbot wizard               # Interactive setup wizard
 drbot gateway              # Start WebSocket gateway server
 drbot chat                 # Interactive chat with AI
 drbot tui                  # Terminal UI chat interface
+drbot skills               # Manage OpenClaw-style skills (status/sync/prompt)
 drbot config               # Show current configuration
 drbot doctor               # Run health checks
 ```
@@ -227,6 +228,8 @@ for interoperability with OpenClaw clients (Control UI, nodes).
 ### OpenClaw Notes
 
 - Heartbeats (`set-heartbeats`, `wake`) follow OpenClaw semantics (they run `HEARTBEAT.md`, not WS keepalives).
+- Remote skill syncing (fetching `SKILL.md` / linked docs / `HEARTBEAT.md` via ETag/Last-Modified) is a separate feature from heartbeats; drbot runs it opportunistically (e.g., during heartbeats and Skills UI/status requests) when configured in `openclaw_skills.json`.
+- `drbot skills status` prints the current skills status report for a workspace (default: OpenClaw agent workspace "default"). `drbot skills sync` fetches any configured remote skills into the managed skills dir.
 - Outbound `send` / `poll` are approval-gated by default via `exec.approval.*`; set `DRBOT_OPENCLAW_SEND_WRITE=1`
   to bypass approvals.
 - OpenClaw agent runs include a restricted `bash` tool by default; set `DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST`

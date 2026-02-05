@@ -8,7 +8,7 @@ use crate::{API_VERSION, DEFAULT_BASE_URL};
 use async_trait::async_trait;
 use drbot_core::message::{Content, Message, Role};
 use drbot_core::{Error, Result};
-use drbot_providers::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, Usage};
+use drbot_providers::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, ToolUse, Usage};
 use futures::StreamExt;
 use reqwest::Client;
 use std::pin::Pin;
@@ -141,6 +141,20 @@ impl AnthropicProvider {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn extract_tool_uses(content: &[ContentBlock]) -> Vec<ToolUse> {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => Some(ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Make a request to the Messages API.
@@ -281,6 +295,16 @@ impl Provider for AnthropicProvider {
     async fn chat(&self, messages: &[Message], options: ChatOptions) -> Result<ChatResponse> {
         let (system, api_messages) = self.convert_messages(messages);
 
+        let tools = options.tools.clone().map(|defs| {
+            defs.into_iter()
+                .map(|d| crate::api::Tool {
+                    name: d.name,
+                    description: d.description,
+                    input_schema: d.parameters,
+                })
+                .collect::<Vec<_>>()
+        });
+
         let request = MessagesRequest {
             model: options.model.unwrap_or_else(|| self.default_model.clone()),
             messages: api_messages,
@@ -290,7 +314,7 @@ impl Provider for AnthropicProvider {
             top_p: options.top_p,
             stop_sequences: options.stop_sequences,
             stream: None,
-            tools: None,
+            tools,
         };
 
         let response = self.make_request(&request).await?;
@@ -303,6 +327,7 @@ impl Provider for AnthropicProvider {
                 output_tokens: response.usage.output_tokens,
             }),
             stop_reason: response.stop_reason,
+            tool_uses: Self::extract_tool_uses(&response.content),
         })
     }
 
@@ -312,6 +337,16 @@ impl Provider for AnthropicProvider {
         options: ChatOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamEvent> + Send>>> {
         let (system, api_messages) = self.convert_messages(messages);
+
+        let tools = options.tools.clone().map(|defs| {
+            defs.into_iter()
+                .map(|d| crate::api::Tool {
+                    name: d.name,
+                    description: d.description,
+                    input_schema: d.parameters,
+                })
+                .collect::<Vec<_>>()
+        });
 
         let request = MessagesRequest {
             model: options
@@ -325,7 +360,7 @@ impl Provider for AnthropicProvider {
             top_p: options.top_p,
             stop_sequences: options.stop_sequences,
             stream: Some(true),
-            tools: None,
+            tools,
         };
 
         let model = request.model.clone();

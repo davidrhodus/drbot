@@ -24,6 +24,7 @@ pub const COLOSSEUM_HEARTBEAT_URL: &str = "https://colosseum.com/heartbeat.md";
 
 const COLOSSEUM_API_BASE: &str = "https://agents.colosseum.com/api";
 const DEFAULT_SYNC_MIN_INTERVAL_MS: u64 = 10 * 60 * 1000;
+const DEFAULT_SYNC_MAX_RELATIVE_DOCS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -233,6 +234,13 @@ fn colosseum_skill_enabled() -> bool {
     let file = load_skills_config_file();
     let entry = file.entries.get(COLOSSEUM_SKILL_KEY);
     entry.and_then(|e| e.enabled).unwrap_or(true)
+}
+
+fn resolve_colosseum_sync_max_relative_docs() -> usize {
+    std::env::var("DRBOT_OPENCLAW_COLOSSEUM_SYNC_MAX_RELATIVE_DOCS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SYNC_MAX_RELATIVE_DOCS)
 }
 
 fn colosseum_api_key() -> Option<String> {
@@ -459,6 +467,14 @@ pub async fn sync_colosseum_docs_best_effort(cfg: &Config) {
         .filter(|v| *v >= 1_000)
         .unwrap_or(DEFAULT_SYNC_MIN_INTERVAL_MS);
 
+    let base_url = reqwest::Url::parse(COLOSSEUM_SKILL_URL).ok();
+    let dir_url = base_url.as_ref().and_then(|u| u.join(".").ok());
+    let dir_prefix = dir_url
+        .as_ref()
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let max_relative_docs = resolve_colosseum_sync_max_relative_docs();
+
     match sync_remote_markdown(&client, COLOSSEUM_SKILL_URL, &skill_path, min_interval_ms).await {
         Ok(updated) => {
             debug!(
@@ -468,6 +484,83 @@ pub async fn sync_colosseum_docs_best_effort(cfg: &Config) {
             );
         }
         Err(err) => warn!(error = %err, "colosseum: skill.md sync failed"),
+    }
+
+    // Best-effort: sync relative markdown docs referenced by the Colosseum skill pack.
+    if max_relative_docs > 0 {
+        if let (Some(base_url), Some(dir_url)) = (base_url.as_ref(), dir_url.as_ref()) {
+            if let Ok(raw) = std::fs::read_to_string(&skill_path) {
+                let body = drbot_core::markdown::strip_frontmatter(&raw);
+                let mut targets: Vec<String> = Vec::new();
+                targets.extend(drbot_core::markdown::extract_markdown_inline_link_targets(
+                    &body,
+                ));
+                targets.extend(
+                    drbot_core::markdown::extract_markdown_reference_definition_targets(&body),
+                );
+
+                let mut seen: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                let mut fetched = 0usize;
+                for target in targets {
+                    if fetched >= max_relative_docs {
+                        break;
+                    }
+                    let token = target.trim();
+                    let token = token.split_whitespace().next().unwrap_or("").trim();
+                    let token = token.trim_start_matches('<').trim_end_matches('>');
+                    let Some(rel_path) =
+                        drbot_core::markdown::normalize_relative_doc_path_from_target(token)
+                    else {
+                        continue;
+                    };
+                    let leaf = rel_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if leaf.eq_ignore_ascii_case("SKILL.md")
+                        || leaf.eq_ignore_ascii_case("HEARTBEAT.md")
+                    {
+                        continue;
+                    }
+                    if seen.contains(&rel_path) {
+                        continue;
+                    }
+                    seen.insert(rel_path.clone());
+                    fetched = fetched.saturating_add(1);
+
+                    let resolved = match dir_url.join(token) {
+                        Ok(u) => u,
+                        Err(_) => continue,
+                    };
+                    if resolved.scheme() != base_url.scheme()
+                        || resolved.host_str() != base_url.host_str()
+                        || !resolved.path().starts_with(&dir_prefix)
+                    {
+                        continue;
+                    }
+
+                    let dest = resolve_colosseum_skill_dir(cfg).join(&rel_path);
+                    match sync_remote_markdown(
+                        &client,
+                        resolved.as_str(),
+                        &dest,
+                        min_interval_ms,
+                    )
+                    .await
+                    {
+                        Ok(updated) => debug!(
+                            updated,
+                            path = %dest.to_string_lossy(),
+                            url = %resolved.as_str(),
+                            "colosseum: relative doc sync"
+                        ),
+                        Err(err) => warn!(
+                            error = %err,
+                            url = %resolved.as_str(),
+                            "colosseum: relative doc sync failed"
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     match sync_remote_markdown(
