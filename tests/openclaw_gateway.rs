@@ -1193,3 +1193,342 @@ async fn openclaw_agents_files_list_and_skills_bins_shapes() {
         .expect("server did not shut down")
         .unwrap();
 }
+
+#[tokio::test]
+async fn openclaw_moltbook_tools() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    // connect.challenge
+    let _ = recv_frame(&mut ws).await;
+
+    // connect handshake
+    let _ = send_req(
+        &mut ws,
+        "connect",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": { "id": "test", "version": "0.0.0-test", "platform": "test", "mode": "test" }
+        }),
+    )
+    .await;
+
+    // ---------------------------------------------------------------
+    // 1. dryRun works without API key (validates the reordering fix).
+    // ---------------------------------------------------------------
+
+    // moltbook.post dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_post_dry",
+        "moltbook.post",
+        json!({ "title": "Hello", "content": "World", "submolt": "test", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.post dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.post dryRun payload");
+    assert_eq!(p.get("dryRun").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("POST"));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/posts"),
+        "expected url to contain /posts"
+    );
+
+    // moltbook.comment dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_comment_dry",
+        "moltbook.comment",
+        json!({ "postId": "abc123", "content": "Nice post!", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.comment dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.comment dryRun payload");
+    assert_eq!(p.get("dryRun").and_then(|v| v.as_bool()), Some(true));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/posts/abc123/comments"),
+        "expected url to contain /posts/abc123/comments"
+    );
+
+    // moltbook.vote dryRun (down)
+    let res = send_req(
+        &mut ws,
+        "mb_vote_dry",
+        "moltbook.vote",
+        json!({ "postId": "abc123", "direction": "down", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.vote dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.vote dryRun payload");
+    assert_eq!(p.get("dryRun").and_then(|v| v.as_bool()), Some(true));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/posts/abc123/downvote"),
+        "expected url to contain downvote"
+    );
+
+    // moltbook.vote dryRun default direction (up)
+    let res = send_req(
+        &mut ws,
+        "mb_vote_dry_up",
+        "moltbook.vote",
+        json!({ "postId": "xyz", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.vote dryRun (up) failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.vote dryRun (up) payload");
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/posts/xyz/upvote"),
+        "expected url to contain upvote"
+    );
+
+    // moltbook.follow dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_follow_dry",
+        "moltbook.follow",
+        json!({ "agent": "coolbot", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.follow dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.follow dryRun payload");
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("POST"));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/agents/coolbot/follow"),
+    );
+
+    // moltbook.follow unfollow dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_unfollow_dry",
+        "moltbook.follow",
+        json!({ "agent": "coolbot", "unfollow": true, "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.follow unfollow dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.follow unfollow payload");
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("DELETE"));
+
+    // moltbook.subscribe dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_sub_dry",
+        "moltbook.subscribe",
+        json!({ "submolt": "agents", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.subscribe dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.subscribe dryRun payload");
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("POST"));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/submolts/agents/subscribe"),
+    );
+
+    // moltbook.subscribe unsubscribe dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_unsub_dry",
+        "moltbook.subscribe",
+        json!({ "submolt": "agents", "unsubscribe": true, "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.subscribe unsub dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.subscribe unsub payload");
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("DELETE"));
+
+    // moltbook.dm send dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_dm_dry",
+        "moltbook.dm",
+        json!({ "action": "send", "to": "friendbot", "message": "hey!", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.dm send dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.dm send dryRun payload");
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("POST"));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/agents/dm/send"),
+    );
+
+    // moltbook.identity token dryRun
+    let res = send_req(
+        &mut ws,
+        "mb_identity_dry",
+        "moltbook.identity",
+        json!({ "action": "token", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.identity token dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.identity dryRun payload");
+    assert_eq!(p.get("method").and_then(|v| v.as_str()), Some("POST"));
+    assert!(
+        p.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("/agents/me/identity-token"),
+    );
+
+    // moltbook.request dryRun (generic tool also benefits from reorder)
+    let res = send_req(
+        &mut ws,
+        "mb_req_dry",
+        "moltbook.request",
+        json!({ "method": "GET", "path": "/feed", "dryRun": true }),
+    )
+    .await;
+    assert!(res.ok, "moltbook.request dryRun failed: {:?}", res.error);
+    let p = res.payload.expect("missing moltbook.request dryRun payload");
+    assert_eq!(p.get("dryRun").and_then(|v| v.as_bool()), Some(true));
+
+    // ---------------------------------------------------------------
+    // 2. Validation errors (before API key / write checks).
+    // ---------------------------------------------------------------
+
+    // moltbook.post missing required fields
+    let res = send_req(
+        &mut ws,
+        "mb_post_bad",
+        "moltbook.post",
+        json!({ "title": "", "content": "x", "submolt": "s" }),
+    )
+    .await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+
+    // moltbook.comment missing postId
+    let res = send_req(
+        &mut ws,
+        "mb_comment_bad",
+        "moltbook.comment",
+        json!({ "content": "hello" }),
+    )
+    .await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+
+    // moltbook.vote missing postId
+    let res = send_req(&mut ws, "mb_vote_bad", "moltbook.vote", json!({})).await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+
+    // moltbook.search missing query
+    let res = send_req(&mut ws, "mb_search_bad", "moltbook.search", json!({})).await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+
+    // moltbook.follow missing agent
+    let res = send_req(&mut ws, "mb_follow_bad", "moltbook.follow", json!({})).await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+
+    // moltbook.subscribe missing submolt
+    let res = send_req(&mut ws, "mb_sub_bad", "moltbook.subscribe", json!({})).await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("INVALID_REQUEST"));
+
+    // ---------------------------------------------------------------
+    // 3. Read-only tools return NOT_LINKED without API key.
+    //    (Proves dispatch wiring works end-to-end.)
+    // ---------------------------------------------------------------
+
+    // moltbook.feed
+    let res = send_req(
+        &mut ws,
+        "mb_feed_nokey",
+        "moltbook.feed",
+        json!({ "sort": "new", "limit": 5 }),
+    )
+    .await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("NOT_LINKED"));
+
+    // moltbook.search
+    let res = send_req(
+        &mut ws,
+        "mb_search_nokey",
+        "moltbook.search",
+        json!({ "query": "hello" }),
+    )
+    .await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("NOT_LINKED"));
+
+    // moltbook.identity profile
+    let res = send_req(
+        &mut ws,
+        "mb_identity_nokey",
+        "moltbook.identity",
+        json!({ "action": "profile" }),
+    )
+    .await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("NOT_LINKED"));
+
+    // moltbook.dm check
+    let res = send_req(
+        &mut ws,
+        "mb_dm_nokey",
+        "moltbook.dm",
+        json!({ "action": "check" }),
+    )
+    .await;
+    assert!(!res.ok);
+    assert_eq!(res.error.as_ref().map(|e| e.code.as_str()), Some("NOT_LINKED"));
+
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}

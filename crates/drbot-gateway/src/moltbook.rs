@@ -270,12 +270,6 @@ pub async fn moltbook_request(
             "moltbook skill disabled",
         ));
     }
-    let api_key = moltbook_api_key().ok_or_else(|| {
-        ErrorShape::new(
-            error_codes::NOT_LINKED,
-            "moltbook apiKey not configured (use skills.update for moltbook or set MOLTBOOK_API_KEY)",
-        )
-    })?;
 
     let method = method.trim().to_uppercase();
     let path = path.trim();
@@ -292,6 +286,34 @@ pub async fn moltbook_request(
         ));
     }
 
+    let mut url = MOLTBOOK_API_BASE.trim_end_matches('/').to_string();
+    if path.starts_with('/') {
+        url.push_str(path);
+    } else {
+        url.push('/');
+        url.push_str(path);
+    }
+
+    // dryRun returns a request preview without needing credentials or write
+    // permission, so check it before gating on apiKey / write-allow.
+    if dry_run {
+        return Ok(json!({
+            "ok": true,
+            "dryRun": true,
+            "method": method,
+            "url": url,
+            "query": query.cloned().unwrap_or(serde_json::Value::Null),
+            "body": body.cloned().unwrap_or(serde_json::Value::Null),
+        }));
+    }
+
+    let api_key = moltbook_api_key().ok_or_else(|| {
+        ErrorShape::new(
+            error_codes::NOT_LINKED,
+            "moltbook apiKey not configured (use skills.update for moltbook or set MOLTBOOK_API_KEY)",
+        )
+    })?;
+
     let allow_write = allow_write
         || std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE")
         .ok()
@@ -303,25 +325,6 @@ pub async fn moltbook_request(
             error_codes::UNAVAILABLE,
             "moltbook write requests disabled (set DRBOT_OPENCLAW_MOLTBOOK_WRITE=1)",
         ));
-    }
-
-    let mut url = MOLTBOOK_API_BASE.trim_end_matches('/').to_string();
-    if path.starts_with('/') {
-        url.push_str(path);
-    } else {
-        url.push('/');
-        url.push_str(path);
-    }
-
-    if dry_run {
-        return Ok(json!({
-            "ok": true,
-            "dryRun": true,
-            "method": method,
-            "url": url,
-            "query": query.cloned().unwrap_or(serde_json::Value::Null),
-            "body": body.cloned().unwrap_or(serde_json::Value::Null),
-        }));
     }
 
     let timeout = timeout_ms
