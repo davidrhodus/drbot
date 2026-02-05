@@ -667,6 +667,134 @@ fn classify_openclaw_session_kind(key: &str) -> &'static str {
     "direct"
 }
 
+#[derive(Debug, Clone)]
+struct ParsedGroupKey {
+    channel: String,
+    kind: String, // "group" | "channel"
+    id: String,
+}
+
+fn parse_openclaw_group_key(key: &str) -> Option<ParsedGroupKey> {
+    let raw = key.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = raw.split(':').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let channel = parts[0].trim();
+    let kind = parts[1].trim().to_ascii_lowercase();
+    if kind != "group" && kind != "channel" {
+        return None;
+    }
+    let id = parts[2..].join(":").trim().to_string();
+    if channel.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(ParsedGroupKey {
+        channel: channel.to_string(),
+        kind,
+        id,
+    })
+}
+
+fn normalize_openclaw_group_label(raw: &str) -> String {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in trimmed.chars() {
+        let mapped = if ch.is_ascii_whitespace() {
+            '-'
+        } else if ch.is_ascii_lowercase()
+            || ch.is_ascii_digit()
+            || matches!(ch, '#' | '@' | '.' | '_' | '+' | '-')
+        {
+            ch
+        } else {
+            '-'
+        };
+
+        if mapped == '-' {
+            if prev_dash {
+                continue;
+            }
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+        }
+        out.push(mapped);
+    }
+
+    out.trim_matches(|c: char| c == '-' || c == '.')
+        .to_string()
+}
+
+fn shorten_openclaw_group_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= 14 {
+        return trimmed.to_string();
+    }
+    let head = trimmed.chars().take(6).collect::<String>();
+    let tail = trimmed
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{}...{}", head, tail)
+}
+
+fn build_openclaw_group_display_name(provider: &str, group_id: &str, key: &str) -> String {
+    let provider_key = provider.trim().to_ascii_lowercase();
+    let provider_key = if provider_key.is_empty() {
+        "group".to_string()
+    } else {
+        provider_key
+    };
+
+    let raw_label = if !group_id.trim().is_empty() {
+        group_id.trim()
+    } else {
+        key.trim()
+    };
+
+    let mut token = normalize_openclaw_group_label(raw_label);
+    if token.is_empty() {
+        let shortened = shorten_openclaw_group_id(raw_label);
+        token = normalize_openclaw_group_label(&shortened);
+    }
+
+    // In OpenClaw, groupChannel metadata drives whether '#' is kept. drbot does
+    // not currently store groupChannel, so treat '#' as cosmetic.
+    if token.starts_with('#') {
+        token = token.trim_start_matches('#').to_string();
+    }
+
+    if token.is_empty() {
+        return provider_key;
+    }
+
+    if !token.starts_with('@')
+        && !token.starts_with('#')
+        && !token.starts_with("g-")
+        && !token.contains('#')
+    {
+        token = format!("g-{}", token);
+    }
+
+    format!("{}:{}", provider_key, token)
+}
+
 const WS_CLOSE_CODE_POLICY_VIOLATION: u16 = 1008;
 const WS_CLOSE_CODE_MESSAGE_TOO_BIG: u16 = 1009;
 
@@ -3144,6 +3272,9 @@ async fn handle_sessions_list(
             .or(s.model.clone())
             .or_else(|| state.config().providers.default_model.clone());
 
+        let store_key = openclaw_session_key_to_store_key(&canonical_key);
+        let parsed_group = parse_openclaw_group_key(&store_key);
+
         let mut row = serde_json::Map::new();
         row.insert("key".to_string(), json!(canonical_key.clone()));
         row.insert("kind".to_string(), json!(kind));
@@ -3151,8 +3282,36 @@ async fn handle_sessions_list(
         row.insert("sessionId".to_string(), json!(s.id.to_string()));
 
         if let Some(label) = s.title.clone() {
-            row.insert("label".to_string(), json!(label.clone()));
-            row.insert("displayName".to_string(), json!(label));
+            row.insert("label".to_string(), json!(label));
+        }
+
+        // Extra metadata used by OpenClaw Control UI when rendering sessions.
+        if let Some(group) = parsed_group.as_ref() {
+            row.insert("channel".to_string(), json!(group.channel.clone()));
+            row.insert("chatType".to_string(), json!(group.kind.clone()));
+        } else if let Some((channel, subject)) = store_key.split_once(':') {
+            if !channel.trim().is_empty() {
+                row.insert("channel".to_string(), json!(channel.trim()));
+            }
+            let subject = subject.trim();
+            if !subject.is_empty() {
+                row.insert("subject".to_string(), json!(subject));
+            }
+        }
+
+        if !row.contains_key("displayName") {
+            let display = row
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    if let Some(group) = parsed_group.as_ref() {
+                        build_openclaw_group_display_name(&group.channel, &group.id, &store_key)
+                    } else {
+                        store_key.clone()
+                    }
+                });
+            row.insert("displayName".to_string(), json!(display));
         }
 
         if let Some(v) = extract_sidecar_string(sidecar_entry, "thinkingLevel") {
