@@ -9,6 +9,8 @@
 use drbot_core::Config;
 use std::path::PathBuf;
 
+pub const DEFAULT_AGENT_ID: &str = "default";
+
 pub fn resolve_home_dir() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
         let trimmed = home.trim();
@@ -85,11 +87,117 @@ pub fn resolve_managed_skills_dir(cfg: &Config) -> PathBuf {
 }
 
 pub fn resolve_agent_workspace_dir(agent_id: &str) -> PathBuf {
-    let safe = agent_id.trim();
-    let safe = if safe.is_empty() { "default" } else { safe };
+    let safe = normalize_agent_id(agent_id);
 
     if let Some(dir) = drbot_core::Config::config_dir() {
         return dir.join("agents").join(safe);
     }
     PathBuf::from("agents").join(safe)
+}
+
+pub fn normalize_agent_id(value: &str) -> String {
+    const MAX_LEN: usize = 64;
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_AGENT_ID.to_string();
+    }
+
+    fn is_valid(token: &str) -> bool {
+        const MAX_LEN: usize = 64;
+        if token.is_empty() || token.len() > MAX_LEN {
+            return false;
+        }
+        let bytes = token.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() {
+            return false;
+        }
+        bytes.iter().all(|b| {
+            b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-'
+        })
+    }
+
+    if is_valid(trimmed) {
+        return trimmed.to_ascii_lowercase();
+    }
+
+    // Best-effort fallback (OpenClaw parity): collapse invalid chars into "-", then strip leading/trailing dashes.
+    let mut out = String::with_capacity(trimmed.len().min(MAX_LEN));
+    let mut last_dash = false;
+    for ch in trimmed.chars() {
+        if out.len() >= MAX_LEN {
+            break;
+        }
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+            last_dash = false;
+            continue;
+        }
+        if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        DEFAULT_AGENT_ID.to_string()
+    } else {
+        out
+    }
+}
+
+pub fn resolve_agents_base_dir() -> PathBuf {
+    if let Some(dir) = drbot_core::Config::config_dir() {
+        return dir.join("agents");
+    }
+    PathBuf::from("agents")
+}
+
+pub fn list_agent_ids() -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let base = resolve_agents_base_dir();
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    ids.insert(DEFAULT_AGENT_ID.to_string());
+
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            ids.insert(normalize_agent_id(&name));
+        }
+    }
+
+    ids.into_iter().collect()
+}
+
+pub fn list_agent_workspace_dirs() -> Vec<PathBuf> {
+    list_agent_ids()
+        .into_iter()
+        .map(|id| resolve_agent_workspace_dir(&id))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_agent_id_matches_openclaw_style_rules() {
+        assert_eq!(normalize_agent_id(""), DEFAULT_AGENT_ID);
+        assert_eq!(normalize_agent_id("  "), DEFAULT_AGENT_ID);
+        assert_eq!(normalize_agent_id("Main"), "main");
+        assert_eq!(normalize_agent_id("foo_bar"), "foo_bar");
+        assert_eq!(normalize_agent_id("foo/bar"), "foo-bar");
+        assert_eq!(normalize_agent_id("../evil"), "evil");
+        assert_eq!(normalize_agent_id("a".repeat(200).as_str()).len(), 64);
+    }
 }

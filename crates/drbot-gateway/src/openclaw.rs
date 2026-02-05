@@ -5237,46 +5237,91 @@ async fn handle_exec_approvals_set(
     Ok(json!({ "ok": true }))
 }
 
-fn is_safe_agent_filename(name: &str) -> bool {
+const AGENT_BOOTSTRAP_FILE_NAMES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+];
+const AGENT_MEMORY_FILENAME: &str = "MEMORY.md";
+const AGENT_MEMORY_ALT_FILENAME: &str = "memory.md";
+
+fn is_allowed_agent_workspace_filename(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    if name.contains('/') || name.contains('\\') {
-        return false;
+    if AGENT_BOOTSTRAP_FILE_NAMES.iter().any(|v| *v == name) {
+        return true;
     }
-    if name == "." || name == ".." || name.contains("..") {
-        return false;
+    name == AGENT_MEMORY_FILENAME || name == AGENT_MEMORY_ALT_FILENAME
+}
+
+fn stat_agent_workspace_file(path: &PathBuf) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
     }
-    true
+    let updated_at_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((meta.len(), updated_at_ms))
 }
 
 async fn handle_agents_files_list(agent_id: &str) -> serde_json::Value {
-    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
+    // OpenClaw parity: agent IDs are normalized to be path-safe + shell-friendly.
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
     let mut files: Vec<serde_json::Value> = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&workspace) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = match path.file_name().and_then(|s| s.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if !path.is_file() {
-                continue;
-            }
-            let meta = entry.metadata().ok();
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let updated_at_ms = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64);
+    for name in AGENT_BOOTSTRAP_FILE_NAMES {
+        let path = workspace.join(name);
+        if let Some((size, updated_at_ms)) = stat_agent_workspace_file(&path) {
             files.push(json!({
                 "name": name,
                 "path": path.to_string_lossy(),
                 "missing": false,
                 "size": size,
                 "updatedAtMs": updated_at_ms,
+            }));
+        } else {
+            files.push(json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "missing": true,
+            }));
+        }
+    }
+
+    let primary = workspace.join(AGENT_MEMORY_FILENAME);
+    if let Some((size, updated_at_ms)) = stat_agent_workspace_file(&primary) {
+        files.push(json!({
+            "name": AGENT_MEMORY_FILENAME,
+            "path": primary.to_string_lossy(),
+            "missing": false,
+            "size": size,
+            "updatedAtMs": updated_at_ms,
+        }));
+    } else {
+        let alt = workspace.join(AGENT_MEMORY_ALT_FILENAME);
+        if let Some((size, updated_at_ms)) = stat_agent_workspace_file(&alt) {
+            files.push(json!({
+                "name": AGENT_MEMORY_ALT_FILENAME,
+                "path": alt.to_string_lossy(),
+                "missing": false,
+                "size": size,
+                "updatedAtMs": updated_at_ms,
+            }));
+        } else {
+            files.push(json!({
+                "name": AGENT_MEMORY_FILENAME,
+                "path": primary.to_string_lossy(),
+                "missing": true,
             }));
         }
     }
@@ -5292,13 +5337,15 @@ async fn handle_agents_files_get(
     agent_id: &str,
     name: &str,
 ) -> Result<serde_json::Value, ErrorShape> {
-    if !is_safe_agent_filename(name) {
+    let name = name.trim();
+    if !is_allowed_agent_workspace_filename(name) {
         return Err(ErrorShape::new(
             error_codes::INVALID_REQUEST,
-            "invalid file name",
+            format!("unsupported file \"{}\"", name),
         ));
     }
-    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
     let path = workspace.join(name);
     let missing = !path.exists();
     let content = if missing {
@@ -5333,13 +5380,15 @@ async fn handle_agents_files_set(
     name: &str,
     content: &str,
 ) -> Result<serde_json::Value, ErrorShape> {
-    if !is_safe_agent_filename(name) {
+    let name = name.trim();
+    if !is_allowed_agent_workspace_filename(name) {
         return Err(ErrorShape::new(
             error_codes::INVALID_REQUEST,
-            "invalid file name",
+            format!("unsupported file \"{}\"", name),
         ));
     }
-    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
     if let Err(e) = std::fs::create_dir_all(&workspace) {
         return Err(ErrorShape::new(
             error_codes::UNAVAILABLE,
@@ -8294,31 +8343,51 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 ),
             }
         }
-        "agents.list" => ok_response(
-            &req.id,
-            json!({
-                "defaultId": "default",
-                "mainKey": "main",
-                "scope": "global",
-                "agents": [{
-                    "id": "default",
-                    "name": "drbot",
-                    "identity": { "name": "drbot" }
-                }]
-            }),
-        ),
+        "agents.list" => {
+            let ids = crate::openclaw_paths::list_agent_ids();
+            let agents = ids
+                .iter()
+                .map(|id| {
+                    let name = if id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                        Some("drbot".to_string())
+                    } else {
+                        Some(id.clone())
+                    };
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "identity": { "name": name },
+                    })
+                })
+                .collect::<Vec<_>>();
+            ok_response(
+                &req.id,
+                json!({
+                    "defaultId": crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    "mainKey": "main",
+                    "scope": "global",
+                    "agents": agents,
+                }),
+            )
+        }
         "agent.identity.get" => ok_response(&req.id, {
-            let agent_id = req
+            let agent_id_raw = req
                 .params
                 .as_ref()
                 .and_then(|v| v.get("agentId"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("default")
-                .trim();
+                .unwrap_or(crate::openclaw_paths::DEFAULT_AGENT_ID);
+            let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id_raw);
+            let name = if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                "drbot".to_string()
+            } else {
+                agent_id.clone()
+            };
+            let avatar = name.chars().next().map(|c| c.to_string());
             json!({
-                "agentId": if agent_id.is_empty() { "default" } else { agent_id },
-                "name": "drbot",
-                "avatar": "D"
+                "agentId": agent_id,
+                "name": name,
+                "avatar": avatar,
             })
         }),
         "agents.files.list" => {
@@ -8472,7 +8541,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             ok_response(&req.id, payload)
         }
         "skills.bins" => {
-            let workspace_dirs = vec![crate::openclaw_paths::resolve_agent_workspace_dir("default")];
+            let workspace_dirs = crate::openclaw_paths::list_agent_workspace_dirs();
             let bins = crate::openclaw_skills::collect_skill_bins(&workspace_dirs, ctx.state.config());
             ok_response(&req.id, json!({ "bins": bins }))
         }
