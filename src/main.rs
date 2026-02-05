@@ -3,21 +3,24 @@
 //! This is the main entry point for the drbot binary.
 
 use anyhow::Result;
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use drbot_anthropic::AnthropicProvider;
 use drbot_context::{ContextConfig, ContextManager};
-use drbot_core::message::Message;
+use drbot_core::message::{Message, Role};
 use drbot_core::session::Session;
 use drbot_core::Config;
 use drbot_gateway::Gateway;
 use drbot_personas::{Persona, PersonaRegistry, PersonaStyle, PersonaTrait};
-use drbot_providers::{ChatOptions, Provider, StreamEvent};
+use drbot_providers::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent};
 use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
 use drbot_tui::AppConfig;
 use futures::StreamExt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio_stream::Stream;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -364,7 +367,7 @@ async fn run_tui(
     // Determine provider type
     let provider_name = provider_name
         .or_else(|| config.providers.default_provider.clone())
-        .unwrap_or_else(|| "anthropic".to_string());
+        .unwrap_or_else(|| "auto".to_string());
 
     let provider_type = ProviderType::from_str(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", provider_name))?;
@@ -488,7 +491,15 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
 
     match provider_name {
         "auto" => {
-            // Auto-select: prefer Anthropic > OpenAI > Ollama based on availability
+            // Auto-select: prefer Ollama > Anthropic > OpenAI (local-first)
+            if let Some(ollama_config) = &config.providers.ollama {
+                let mut p = OllamaProvider::new().with_base_url(&ollama_config.url);
+                if let Some(default_model) = &ollama_config.default_model {
+                    p = p.with_default_model(default_model);
+                }
+                info!("Auto-selected provider: ollama");
+                return Ok(Arc::new(p));
+            }
             if let Some(anthropic_config) = &config.providers.anthropic {
                 let mut p = AnthropicProvider::new(&anthropic_config.api_key);
                 if let Some(base_url) = &anthropic_config.base_url {
@@ -512,14 +523,6 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
                     p = p.with_default_model(default_model);
                 }
                 info!("Auto-selected provider: openai");
-                return Ok(Arc::new(p));
-            }
-            if let Some(ollama_config) = &config.providers.ollama {
-                let mut p = OllamaProvider::new().with_base_url(&ollama_config.url);
-                if let Some(default_model) = &ollama_config.default_model {
-                    p = p.with_default_model(default_model);
-                }
-                info!("Auto-selected provider: ollama");
                 return Ok(Arc::new(p));
             }
             Err(anyhow::anyhow!(
@@ -569,10 +572,137 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
             }
             Ok(Arc::new(p))
         }
+        "claude-cli" | "claude-code" => Ok(Arc::new(CliProvider::claude_cli())),
+        "codex-cli" | "codex" => Ok(Arc::new(CliProvider::codex_cli())),
         _ => Err(anyhow::anyhow!(
-            "Unknown provider: {}. Supported: anthropic, openai, ollama, auto",
+            "Unknown provider: {}. Supported: anthropic, openai, ollama, claude-cli, codex-cli, auto",
             provider_name
         )),
+    }
+}
+
+/// CLI-wrapping provider that shells out to external AI CLI tools.
+struct CliProvider {
+    command: String,
+    args: Vec<String>,
+    model_flag: String,
+    default_model: String,
+    system_flag: Option<String>,
+    provider_name: String,
+}
+
+impl CliProvider {
+    /// Create a provider that wraps `claude -p`.
+    fn claude_cli() -> Self {
+        Self {
+            command: "claude".into(),
+            args: vec!["-p".into()],
+            model_flag: "--model".into(),
+            default_model: "sonnet".into(),
+            system_flag: Some("--system-prompt".into()),
+            provider_name: "claude-cli".into(),
+        }
+    }
+
+    /// Create a provider that wraps `codex exec`.
+    fn codex_cli() -> Self {
+        Self {
+            command: "codex".into(),
+            args: vec!["exec".into(), "--full-auto".into(), "-".into()],
+            model_flag: "-m".into(),
+            default_model: "gpt-5.2-codex".into(),
+            system_flag: None,
+            provider_name: "codex-cli".into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for CliProvider {
+    async fn chat(&self, messages: &[Message], options: ChatOptions) -> drbot_core::Result<ChatResponse> {
+        let model = options.model.clone().unwrap_or_else(|| self.default_model.clone());
+
+        let mut cmd = tokio::process::Command::new(&self.command);
+        for arg in &self.args {
+            cmd.arg(arg);
+        }
+        cmd.arg(&self.model_flag).arg(&model);
+
+        if let Some(ref flag) = self.system_flag {
+            if let Some(ref system) = options.system_prompt {
+                cmd.arg(flag).arg(system);
+            }
+        }
+
+        // Extract the last user message as the prompt
+        let prompt = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.text_content())
+            .unwrap_or_default();
+        cmd.arg(&prompt);
+
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let output = cmd.output().await.map_err(|e| {
+            drbot_core::Error::Provider(format!("Failed to run {}: {}", self.command, e))
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(drbot_core::Error::Provider(format!(
+                "{} exited with {}: {}",
+                self.command,
+                output.status,
+                stderr.trim()
+            )));
+        }
+
+        let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        Ok(ChatResponse {
+            content,
+            model,
+            usage: None,
+            stop_reason: Some("end_turn".into()),
+            tool_uses: vec![],
+        })
+    }
+
+    async fn stream(
+        &self,
+        messages: &[Message],
+        options: ChatOptions,
+    ) -> drbot_core::Result<Pin<Box<dyn Stream<Item = StreamEvent> + Send>>> {
+        let response = self.chat(messages, options).await?;
+        let model = response.model.clone();
+        let content = response.content.clone();
+
+        Ok(Box::pin(async_stream::stream! {
+            yield StreamEvent::Start { model };
+            yield StreamEvent::Delta { content };
+            yield StreamEvent::Stop {
+                reason: "end_turn".into(),
+                usage: None,
+            };
+        }))
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.default_model.clone(),
+            name: self.default_model.clone(),
+            provider: self.provider_name.clone(),
+            context_window: 200_000,
+            max_output_tokens: None,
+        }]
+    }
+
+    fn name(&self) -> &str {
+        &self.provider_name
     }
 }
 
@@ -2138,10 +2268,11 @@ async fn run_chat(
     // Determine which provider to use
     let provider_name = provider_name
         .or_else(|| config.providers.default_provider.clone())
-        .unwrap_or_else(|| "anthropic".to_string());
+        .unwrap_or_else(|| "auto".to_string());
 
     // Create the provider
-    let provider = create_provider(config, &provider_name)?;
+    let mut provider = create_provider(config, &provider_name)?;
+    let mut current_provider_name = provider.name().to_string();
 
     // Get or create session
     let user_id = Uuid::nil(); // CLI user - could be configurable
@@ -2459,7 +2590,7 @@ async fn run_chat(
         session_info,
         persona_info
     );
-    println!("Commands: /quit, /clear, /save, /info, /sessions, /new, /context, /tools, /approve, /agent");
+    println!("Commands: /quit, /clear, /save, /info, /sessions, /new, /context, /tools, /approve, /agent, /model");
     if tool_cfg.enabled {
         println!(
             "Tool mode: ON (auto-approve: {})  Root: {}",
@@ -2536,6 +2667,11 @@ async fn run_chat(
             println!();
             println!("Session ID: {}", session.id);
             println!("Title: {}", session.title.as_deref().unwrap_or("Untitled"));
+            println!("Provider: {}", current_provider_name);
+            println!(
+                "Model: {}",
+                options.model.as_deref().unwrap_or("(provider default)")
+            );
             println!("Messages: {}", session.messages.len());
             println!(
                 "Context: {} tokens used, {} available",
@@ -2635,6 +2771,67 @@ async fn run_chat(
             continue;
         }
 
+        if input == "/model" || input.starts_with("/model ") {
+            let arg = input.strip_prefix("/model").unwrap().trim();
+            if arg.is_empty() {
+                // Show current provider/model
+                let model_display = options
+                    .model
+                    .as_deref()
+                    .unwrap_or("(provider default)");
+                println!(
+                    "\nProvider: {}\nModel: {}\n",
+                    current_provider_name, model_display
+                );
+            } else if arg.contains('/') {
+                // provider/model syntax
+                let parts: Vec<&str> = arg.splitn(2, '/').collect();
+                let prov = parts[0];
+                let mdl = parts[1];
+                match create_provider(config, prov) {
+                    Ok(new_provider) => {
+                        current_provider_name = new_provider.name().to_string();
+                        provider = new_provider;
+                        options.model = Some(mdl.to_string());
+                        println!(
+                            "\nSwitched to provider: {}, model: {}\n",
+                            current_provider_name, mdl
+                        );
+                    }
+                    Err(e) => {
+                        println!("\nFailed to switch provider: {}\n", e);
+                    }
+                }
+            } else {
+                // Disambiguate: known provider name vs model name
+                let known_providers = ["anthropic", "claude", "openai", "gpt", "ollama", "local", "claude-cli", "claude-code", "codex-cli", "codex"];
+                if known_providers.contains(&arg.to_lowercase().as_str()) {
+                    match create_provider(config, arg) {
+                        Ok(new_provider) => {
+                            current_provider_name = new_provider.name().to_string();
+                            provider = new_provider;
+                            options.model = None; // use provider default
+                            println!(
+                                "\nSwitched to provider: {} (default model)\n",
+                                current_provider_name
+                            );
+                        }
+                        Err(e) => {
+                            println!("\nFailed to switch provider: {}\n", e);
+                        }
+                    }
+                } else {
+                    // Treat as model name on current provider
+                    options.model = Some(arg.to_string());
+                    println!(
+                        "\nModel set to: {} (provider: {})\n",
+                        arg, current_provider_name
+                    );
+                }
+            }
+            continue;
+        }
+
         if input == "/sessions" {
             let sessions = store
                 .list(ListOptions {
@@ -2672,7 +2869,7 @@ async fn run_chat(
             session = Session::new(user_id, "cli", "terminal");
             session.channel_id = format!("terminal:{}", session.id);
             session.title = Some("CLI Chat".to_string());
-            session.model = model.clone();
+            session.model = options.model.clone();
             session.system_prompt = base_system.clone();
             store
                 .create(&session)
