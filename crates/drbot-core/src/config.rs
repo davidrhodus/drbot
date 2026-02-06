@@ -153,6 +153,38 @@ pub struct ProvidersConfig {
     pub ollama: Option<OllamaConfig>,
     /// AWS Bedrock configuration.
     pub bedrock: Option<BedrockConfig>,
+    /// Custom CLI provider configurations.
+    #[serde(default)]
+    pub cli: Vec<CliProviderConfig>,
+}
+
+/// Configuration for a custom CLI provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliProviderConfig {
+    /// Provider name used in --provider and /model.
+    pub name: String,
+    /// CLI command to run (e.g. "claude", "codex", "my-local-llm").
+    pub command: String,
+    /// Base arguments (e.g. ["-p"] or ["exec", "--full-auto", "-"]).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Flag for specifying the model (e.g. "--model" or "-m").
+    #[serde(default = "default_model_flag")]
+    pub model_flag: String,
+    /// Default model name.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Flag for passing system prompt (e.g. "--system-prompt"). None if unsupported.
+    pub system_flag: Option<String>,
+    /// If true, send full conversation history via stdin instead of just last user message.
+    #[serde(default)]
+    pub send_history: bool,
+    /// Timeout in seconds for CLI execution. Default: 120.
+    pub timeout_secs: Option<u64>,
+}
+
+fn default_model_flag() -> String {
+    "--model".to_string()
 }
 
 /// Anthropic provider configuration.
