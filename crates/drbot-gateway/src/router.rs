@@ -4,13 +4,12 @@ use crate::state::GatewayState;
 use axum::{
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
-        ConnectInfo, State,
+        ConnectInfo, DefaultBodyLimit, State,
     },
     http::{HeaderMap, StatusCode},
-    Json,
     response::{Html, IntoResponse},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use drbot_core::message::Message;
 use drbot_core::session::Session;
@@ -26,12 +25,29 @@ pub fn create_router(state: GatewayState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let hooks_base = state.config().hooks.path.trim();
+    let hooks_base = if hooks_base.is_empty() { "/hooks" } else { hooks_base };
+    let hooks_base = hooks_base.trim_end_matches('/');
+    let hooks_base = if hooks_base == "/" { "/hooks" } else { hooks_base };
+    let hooks_base = hooks_base.to_string();
+    let hooks_max_body = state
+        .config()
+        .hooks
+        .max_body_bytes
+        .unwrap_or(256_000)
+        .clamp(1, 5_000_000) as usize;
+    let hooks_router = Router::new()
+        .route("/wake", post(crate::openclaw_webhooks::hooks_wake_handler))
+        .route("/agent", post(crate::openclaw_webhooks::hooks_agent_handler))
+        .layer(DefaultBodyLimit::max(hooks_max_body));
+
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/ws", get(websocket_handler))
         .route("/openclaw/ws", get(openclaw_websocket_handler))
         .route("/tools/invoke", post(tools_invoke_handler))
+        .nest(hooks_base.as_str(), hooks_router)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
@@ -167,7 +183,12 @@ async fn tools_invoke_handler(
     if !args.is_object() {
         args = serde_json::json!({});
     }
-    if let Some(action) = body.action.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(action) = body
+        .action
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         if let Some(map) = args.as_object_mut() {
             if !map.contains_key("action") {
                 map.insert("action".to_string(), serde_json::json!(action));
@@ -178,8 +199,49 @@ async fn tools_invoke_handler(
     // Minimal tool registry (OpenClaw parity enough for interop + hackathon skills).
     let mut tools: std::collections::HashMap<String, std::sync::Arc<dyn drbot_agents::AgentTool>> =
         std::collections::HashMap::new();
-    let workspace_root = crate::openclaw_paths::resolve_agent_workspace_dir("default");
-    let builtin = match drbot_agents::BuiltinTools::all(workspace_root) {
+    let raw_session_key = body
+        .session_key
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main");
+    let canonical_session_key = crate::openclaw::canonicalize_openclaw_session_key(
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+        raw_session_key,
+    );
+    let session_key = canonical_session_key.trim();
+    let session_key_opt = if session_key.is_empty() {
+        None
+    } else {
+        Some(session_key)
+    };
+    let agent_id = crate::openclaw::openclaw_session_key_agent_id(
+        session_key,
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+    );
+    let tool_filter = crate::openclaw::resolve_openclaw_effective_tool_filter(
+        &state,
+        session_key,
+        None,
+        &agent_id,
+    );
+
+    let workspace_root = crate::openclaw::resolve_agent_workspace_dir_for_state(&state, &agent_id);
+    let mut builtin_options = drbot_agents::BuiltinToolsOptions::default();
+    if crate::openclaw_exec_approvals::exec_approvals_auto_allow_skills(Some(&agent_id)) {
+        let platform = crate::openclaw_skills::resolve_runtime_platform();
+        let dirs = [workspace_root.clone()];
+        let bins = crate::openclaw_skills::collect_required_skill_bins_for_platform(
+            &dirs,
+            state.config(),
+            platform,
+        );
+        builtin_options.bash_extra_allowed_prefixes = bins;
+    }
+    let builtin = match drbot_agents::BuiltinTools::all_with_options(
+        workspace_root.clone(),
+        builtin_options,
+    ) {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -192,36 +254,297 @@ async fn tools_invoke_handler(
                 .into_response();
         }
     };
+
+    let exec_ask = crate::openclaw::resolve_openclaw_session_exec_ask_mode(&state, session_key);
+    let tool_mode = |tool_name: &str, baseline: crate::openclaw::OpenclawExecAskMode| {
+        let tool_policy = crate::openclaw::resolve_openclaw_session_tool_policy_mode(
+            &state,
+            session_key,
+            tool_name,
+        )
+        .unwrap_or(crate::openclaw::OpenclawExecAskMode::Allow);
+        crate::openclaw::merge_openclaw_exec_ask_modes(tool_policy, baseline)
+    };
     for tool in builtin {
-        if tool.name() == "http" {
+        if tool.name() == "http" || tool.name() == "exec" {
             continue;
         }
+        if !tool_filter.is_allowed(tool.name()) {
+            continue;
+        }
+        let baseline = if matches!(
+            tool.name(),
+            "bash" | "exec" | "write_file" | "write" | "edit" | "apply_patch" | "http"
+        ) {
+            exec_ask
+        } else {
+            crate::openclaw::OpenclawExecAskMode::Allow
+        };
+        let mode = tool_mode(tool.name(), baseline);
+        let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            mode,
+            tool,
+        ) else {
+            continue;
+        };
         tools.insert(tool.name().to_string(), tool);
     }
-    tools.insert(
-        "agents_list".to_string(),
-        std::sync::Arc::new(crate::openclaw_agent_tools::AgentsListTool),
-    );
-    tools.insert(
-        "colosseum.request".to_string(),
+    for tool in [
+        std::sync::Arc::new(crate::openclaw_agent_tools::AgentsListTool)
+            as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::WebFetchTool::new())
+            as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::WebSearchTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::McpTool::new(state.clone()))
+            as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::BrowserTool::new(state.clone()))
+            as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::CanvasTool::new(
+            state.clone(),
+            workspace_root.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::NodesTool::new_with_context(
+            state.clone(),
+            workspace_root.clone(),
+            &agent_id,
+            session_key_opt,
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::ImageTool::new_with_context(
+            state.clone(),
+            workspace_root.clone(),
+            &agent_id,
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
         std::sync::Arc::new(crate::openclaw_agent_tools::ColosseumRequestTool::new(
             state.clone(),
-        )),
-    );
-    tools.insert(
-        "moltbook.request".to_string(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
         std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookRequestTool::new(
             state.clone(),
-        )),
-    );
-    tools.insert(
-        "send".to_string(),
-        std::sync::Arc::new(crate::openclaw_agent_tools::SendTool::new(state.clone())),
-    );
-    tools.insert(
-        "poll".to_string(),
-        std::sync::Arc::new(crate::openclaw_agent_tools::PollTool::new(state.clone())),
-    );
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookPostTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookFeedTool)
+            as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookCommentTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookVoteTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookIdentityTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookSearchTool)
+            as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookFollowTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookSubscribeTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MoltbookDmTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::SessionsListTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::SessionsHistoryTool::new(
+            state.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(
+            crate::openclaw_agent_tools::SessionsSendTool::new_with_context(
+                state.clone(),
+                &agent_id,
+                session_key,
+            ),
+        ) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(
+            crate::openclaw_agent_tools::SessionsSpawnTool::new_with_context(
+                state.clone(),
+                &agent_id,
+                session_key,
+            ),
+        ) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(
+            crate::openclaw_agent_tools::SessionStatusTool::new_with_context(
+                state.clone(),
+                &agent_id,
+                session_key,
+            ),
+        ) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MemorySearchTool::new(
+            state.clone(),
+            &agent_id,
+            workspace_root.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+        std::sync::Arc::new(crate::openclaw_agent_tools::MemoryGetTool::new(
+            state.clone(),
+            &agent_id,
+            workspace_root.clone(),
+        )) as std::sync::Arc<dyn drbot_agents::AgentTool>,
+    ] {
+        if !tool_filter.is_allowed(tool.name()) {
+            continue;
+        }
+        let mode = tool_mode(tool.name(), crate::openclaw::OpenclawExecAskMode::Allow);
+        let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            mode,
+            tool,
+        ) else {
+            continue;
+        };
+        tools.insert(tool.name().to_string(), tool);
+    }
+
+    if tool_filter.is_allowed("exec") {
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            tool_mode("exec", exec_ask),
+            std::sync::Arc::new(crate::openclaw_agent_tools::ExecTool::new(
+                state.clone(),
+                Some(agent_id.clone()),
+                workspace_root.clone(),
+                Some(canonical_session_key.clone()),
+            )),
+        ) {
+            tools.insert("exec".to_string(), tool);
+        }
+    }
+
+    if tool_filter.is_allowed("process") {
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            tool_mode("process", exec_ask),
+            std::sync::Arc::new(crate::openclaw_agent_tools::ProcessTool::new(
+                workspace_root.clone(),
+                Some(canonical_session_key.clone()),
+            )),
+        ) {
+            tools.insert("process".to_string(), tool);
+        }
+    }
+
+    let send_policy =
+        crate::openclaw::resolve_openclaw_session_send_policy_mode(&state, session_key);
+
+    let message_tool_mode = tool_mode("message", crate::openclaw::OpenclawExecAskMode::Allow);
+    if tool_filter.is_allowed("message")
+        && !matches!(send_policy, crate::openclaw::OpenclawSendPolicyMode::Deny)
+        && !matches!(
+            message_tool_mode,
+            crate::openclaw::OpenclawExecAskMode::Deny
+        )
+    {
+        let wrapper_mode = if matches!(send_policy, crate::openclaw::OpenclawSendPolicyMode::Ask) {
+            crate::openclaw::OpenclawExecAskMode::Allow
+        } else {
+            message_tool_mode
+        };
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            wrapper_mode,
+            std::sync::Arc::new(
+                crate::openclaw_agent_tools::MessageTool::new_with_session_key(
+                    state.clone(),
+                    Some(canonical_session_key.clone()),
+                ),
+            ),
+        ) {
+            tools.insert("message".to_string(), tool);
+        }
+    }
+
+    let send_tool_mode = tool_mode("send", crate::openclaw::OpenclawExecAskMode::Allow);
+    if tool_filter.is_allowed("send")
+        && !matches!(send_policy, crate::openclaw::OpenclawSendPolicyMode::Deny)
+        && !matches!(send_tool_mode, crate::openclaw::OpenclawExecAskMode::Deny)
+    {
+        let wrapper_mode = if matches!(send_policy, crate::openclaw::OpenclawSendPolicyMode::Ask) {
+            crate::openclaw::OpenclawExecAskMode::Allow
+        } else {
+            send_tool_mode
+        };
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            wrapper_mode,
+            std::sync::Arc::new(crate::openclaw_agent_tools::SendTool::new_with_session_key(
+                state.clone(),
+                Some(canonical_session_key.clone()),
+            )),
+        ) {
+            tools.insert("send".to_string(), tool);
+        }
+    }
+
+    let poll_tool_mode = tool_mode("poll", crate::openclaw::OpenclawExecAskMode::Allow);
+    if tool_filter.is_allowed("poll")
+        && !matches!(send_policy, crate::openclaw::OpenclawSendPolicyMode::Deny)
+        && !matches!(poll_tool_mode, crate::openclaw::OpenclawExecAskMode::Deny)
+    {
+        let wrapper_mode = if matches!(send_policy, crate::openclaw::OpenclawSendPolicyMode::Ask) {
+            crate::openclaw::OpenclawExecAskMode::Allow
+        } else {
+            poll_tool_mode
+        };
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            wrapper_mode,
+            std::sync::Arc::new(crate::openclaw_agent_tools::PollTool::new_with_session_key(
+                state.clone(),
+                Some(canonical_session_key.clone()),
+            )),
+        ) {
+            tools.insert("poll".to_string(), tool);
+        }
+    }
+    if tool_filter.is_allowed("cron") {
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            tool_mode("cron", crate::openclaw::OpenclawExecAskMode::Allow),
+            std::sync::Arc::new(crate::openclaw_agent_tools::CronTool::new_with_session_key(
+                state.clone(),
+                Some(canonical_session_key.clone()),
+            )),
+        ) {
+            tools.insert("cron".to_string(), tool);
+        }
+    }
+    if tool_filter.is_allowed("gateway") {
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            &agent_id,
+            session_key_opt,
+            tool_mode("gateway", crate::openclaw::OpenclawExecAskMode::Allow),
+            std::sync::Arc::new(
+                crate::openclaw_agent_tools::GatewayTool::new_with_session_key(
+                    state.clone(),
+                    Some(canonical_session_key.clone()),
+                ),
+            ),
+        ) {
+            tools.insert("gateway".to_string(), tool);
+        }
+    }
 
     let Some(tool) = tools.get(&tool_name) else {
         return (
@@ -481,7 +804,7 @@ async fn handle_request(
 
             // Check if provider is configured
             let provider = match state.provider() {
-                Some(p) => p.clone(),
+                Some(p) => p,
                 None => {
                     return WsMessage::error(
                         request.id,
@@ -1049,11 +1372,14 @@ mod tests {
             openai: Some(OpenAIConfig {
                 api_key: "test-key".to_string(),
                 base_url: Some(format!("{}/v1", base_url)),
+                headers: Default::default(),
                 organization: None,
                 default_model: Some("gpt-4o".to_string()),
             }),
             ollama: None,
             bedrock: None,
+            cli: vec![],
+            openai_compatible: vec![],
         };
 
         let state = GatewayState::new(config);
@@ -1150,11 +1476,14 @@ mod tests {
             openai: Some(OpenAIConfig {
                 api_key: "test-key".to_string(),
                 base_url: Some(format!("{}/v1", base_url)),
+                headers: Default::default(),
                 organization: None,
                 default_model: Some("gpt-4o".to_string()),
             }),
             ollama: None,
             bedrock: None,
+            cli: vec![],
+            openai_compatible: vec![],
         };
 
         let state = GatewayState::new(config);

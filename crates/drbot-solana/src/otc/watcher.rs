@@ -17,9 +17,9 @@ use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -332,7 +332,11 @@ pub fn spawn_otc_auto_cancel_watcher(
                             .cancel_with_fee_payer(fee_payer, &caller_keypair, w.escrow_address)
                             .await
                     }
-                    None => escrow_manager.cancel(&caller_keypair, w.escrow_address).await,
+                    None => {
+                        escrow_manager
+                            .cancel(&caller_keypair, w.escrow_address)
+                            .await
+                    }
                 };
 
                 match cancel {
@@ -396,4 +400,3 @@ mod tests {
         Ok(())
     }
 }
-

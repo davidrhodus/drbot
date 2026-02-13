@@ -5,17 +5,20 @@
 //!
 //! Endpoint: `/openclaw/ws`
 
-use crate::state::{GatewayState, OpenclawClient, OpenclawOutbound};
 use crate::openclaw_exec_approvals::ExecApprovalRequestPayload;
 use crate::openclaw_system::SystemPresencePayload;
+use crate::state::{GatewayState, OpenclawClient, OpenclawOutbound};
 use axum::extract::ws::WebSocket;
 use chrono::{Datelike, Timelike};
 use drbot_agents::{
     Agent as DrbotAgent, AgentConfig as DrbotAgentConfig, AgentEvent as DrbotAgentEvent,
     AgentMessage as DrbotAgentMessage, AgentRole as DrbotAgentRole, BuiltinTools,
+    BuiltinToolsOptions,
 };
 use drbot_base64_util::Base64Config;
-use drbot_browser::BrowserAutomation;
+use drbot_browser::{
+    Browser, BrowserAutomation, BrowserOptions, Page, ScreenshotFormat, ScreenshotOptions, Viewport,
+};
 use drbot_core::message::{Content, ImageSource, Message, OutgoingMessage, Role};
 use drbot_protocol::openclaw::{
     error_codes, ConnectParams, ErrorShape, EventFrame, GatewayFrame, HelloFeatures, HelloOk,
@@ -29,6 +32,7 @@ use ring::{digest, signature};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -38,14 +42,16 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_TICK_INTERVAL_MS: u64 = 30_000;
 const OPENCLAW_CHAT_DELTA_THROTTLE_MS: u64 = 150;
-const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 512 * 1024;
-const DEFAULT_MAX_BUFFERED_BYTES: u64 = 1_572_864; // 1.5 MiB
+// OpenClaw v2026.2.12 raised these so ~5,000,000-byte image attachments work reliably.
+const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 5_000_000;
+const DEFAULT_MAX_BUFFERED_BYTES: u64 = 15_000_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAX_CHAT_HISTORY_BYTES: usize = 6 * 1024 * 1024;
 
@@ -148,6 +154,9 @@ const METHODS: &[&str] = &[
     "agent",
     "agent.wait",
     "agents.list",
+    "agents.create",
+    "agents.update",
+    "agents.delete",
     "agent.identity.get",
     "agents.files.list",
     "agents.files.get",
@@ -241,9 +250,1831 @@ struct AgentDeliveryTarget {
     to: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardSessionStatus {
+    Running,
+    Done,
+    Cancelled,
+    Error,
+}
+
+impl WizardSessionStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WizardSessionStatus::Running => "running",
+            WizardSessionStatus::Done => "done",
+            WizardSessionStatus::Cancelled => "cancelled",
+            WizardSessionStatus::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardStepKey {
+    Intro,
+    RiskNotice,
+    RiskConfirm,
+    GatewayAuthMode,
+    GatewayAuthToken,
+    GatewayBindHost,
+    GatewayBindHostCustom,
+    GatewayPort,
+    ProviderSelect,
+    ProviderApiKey,
+    ProviderDefaultModel,
+    ChannelsPrompt,
+    ChannelsSelect,
+    ChannelTelegramBotToken,
+    ChannelDiscordBotToken,
+    ChannelDiscordApplicationId,
+    ChannelSlackBotToken,
+    ChannelSlackAppToken,
+    ChannelSlackSigningSecret,
+    ChannelMatrixHomeserverUrl,
+    ChannelMatrixUserId,
+    ChannelMatrixAccessToken,
+    ChannelSignalPhoneNumber,
+    ChannelSignalSocketPath,
+    ChannelWhatsAppBridgeUrl,
+    ChannelWhatsAppSessionPath,
+    ChannelWebChatHost,
+    ChannelWebChatPort,
+    ChannelWebChatRequireAuth,
+    ChannelWebChatAuthToken,
+    ConfirmWrite,
+    Outro,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardAuthChoice {
+    Keep,
+    New,
+    Disable,
+}
+
+impl WizardAuthChoice {
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "keep" => Some(WizardAuthChoice::Keep),
+            "new" => Some(WizardAuthChoice::New),
+            "disable" => Some(WizardAuthChoice::Disable),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardBindChoice {
+    Loopback,
+    Lan,
+    Custom,
+}
+
 #[derive(Debug, Clone)]
 struct WizardSessionState {
-    step: u8,
+    status: WizardSessionStatus,
+    error: Option<String>,
+    step: WizardStepKey,
+    current_step_id: String,
+    current_step: serde_json::Value,
+
+    config_path: String,
+    config_exists: bool,
+    base_hash: Option<String>,
+    existing_has_token: bool,
+
+    auth_choice: WizardAuthChoice,
+    auth_token: Option<String>,
+    bind_choice: WizardBindChoice,
+    host: String,
+    port: u16,
+
+    provider_configured: bool,
+    provider_suggestion: Option<String>,
+    provider_choice: Option<String>,
+    provider_api_key: Option<String>,
+    provider_default_model: Option<String>,
+
+    configure_channels: bool,
+    channels_enabled: Vec<String>,
+    channel_steps: Vec<WizardStepKey>,
+    channel_step_index: usize,
+    existing_telegram: bool,
+    existing_discord: bool,
+    existing_slack: bool,
+    existing_matrix: bool,
+    existing_signal: bool,
+    existing_whatsapp: bool,
+    existing_imessage: bool,
+    existing_webchat: bool,
+    telegram_bot_token: Option<String>,
+    discord_bot_token: Option<String>,
+    discord_application_id: Option<String>,
+    slack_bot_token: Option<String>,
+    slack_app_token: Option<String>,
+    slack_signing_secret: Option<String>,
+    matrix_homeserver_url: Option<String>,
+    matrix_user_id: Option<String>,
+    matrix_access_token: Option<String>,
+    signal_phone_number: Option<String>,
+    signal_socket_path: Option<String>,
+    whatsapp_bridge_url: String,
+    whatsapp_session_path: String,
+    webchat_host: String,
+    webchat_port: u16,
+    webchat_require_auth: bool,
+    webchat_auth_token: Option<String>,
+
+    wrote: bool,
+}
+
+fn wizard_step_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn wizard_value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn wizard_value_to_bool(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        serde_json::Value::String(s) => {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        }
+        _ => false,
+    }
+}
+
+fn wizard_value_to_string_vec(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(wizard_value_to_string)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn wizard_note_step(title: &str, message: &str) -> (String, serde_json::Value) {
+    let id = wizard_step_id();
+    let step = json!({
+        "id": id,
+        "type": "note",
+        "title": title,
+        "message": message,
+        "executor": "client",
+    });
+    (
+        step.get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        step,
+    )
+}
+
+fn wizard_confirm_step(message: &str, initial_value: bool) -> (String, serde_json::Value) {
+    let id = wizard_step_id();
+    let step = json!({
+        "id": id,
+        "type": "confirm",
+        "message": message,
+        "initialValue": initial_value,
+        "executor": "client",
+    });
+    (
+        step.get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        step,
+    )
+}
+
+fn wizard_text_step(
+    message: &str,
+    initial_value: Option<serde_json::Value>,
+    placeholder: Option<&str>,
+    sensitive: bool,
+) -> (String, serde_json::Value) {
+    let id = wizard_step_id();
+    let mut step = json!({
+        "id": id,
+        "type": "text",
+        "message": message,
+        "executor": "client",
+        "sensitive": sensitive,
+    });
+    if let Some(v) = initial_value {
+        if let Some(obj) = step.as_object_mut() {
+            obj.insert("initialValue".to_string(), v);
+        }
+    }
+    if let Some(ph) = placeholder {
+        if let Some(obj) = step.as_object_mut() {
+            obj.insert("placeholder".to_string(), json!(ph));
+        }
+    }
+    (
+        step.get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        step,
+    )
+}
+
+fn wizard_select_step(
+    message: &str,
+    options: Vec<serde_json::Value>,
+    initial_value: Option<serde_json::Value>,
+) -> (String, serde_json::Value) {
+    let id = wizard_step_id();
+    let mut step = json!({
+        "id": id,
+        "type": "select",
+        "message": message,
+        "options": options,
+        "executor": "client",
+    });
+    if let Some(v) = initial_value {
+        if let Some(obj) = step.as_object_mut() {
+            obj.insert("initialValue".to_string(), v);
+        }
+    }
+    (
+        step.get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        step,
+    )
+}
+
+fn wizard_multiselect_step(
+    message: &str,
+    options: Vec<serde_json::Value>,
+    initial_value: Option<serde_json::Value>,
+) -> (String, serde_json::Value) {
+    let id = wizard_step_id();
+    let mut step = json!({
+        "id": id,
+        "type": "multiselect",
+        "message": message,
+        "options": options,
+        "executor": "client",
+    });
+    if let Some(v) = initial_value {
+        if let Some(obj) = step.as_object_mut() {
+            obj.insert("initialValue".to_string(), v);
+        }
+    }
+    (
+        step.get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        step,
+    )
+}
+
+fn wizard_generate_token() -> String {
+    // UUIDv4 is sufficient entropy for a bearer token, and easy to copy/paste.
+    Uuid::new_v4().to_string()
+}
+
+fn wizard_is_loopback_host(host: &str) -> bool {
+    matches!(host.trim(), "127.0.0.1" | "::1" | "localhost")
+}
+
+fn wizard_bind_choice_for_host(host: &str) -> WizardBindChoice {
+    let trimmed = host.trim();
+    if trimmed == "0.0.0.0" {
+        WizardBindChoice::Lan
+    } else if wizard_is_loopback_host(trimmed) {
+        WizardBindChoice::Loopback
+    } else {
+        WizardBindChoice::Custom
+    }
+}
+
+fn wizard_format_internal_error(err: ErrorShape) -> String {
+    let mut msg = format!("{}: {}", err.code, err.message);
+    if let Some(details) = err.details {
+        if let Ok(pretty) = serde_json::to_string_pretty(&details) {
+            msg.push('\n');
+            msg.push_str(&pretty);
+        }
+    }
+    msg
+}
+
+fn wizard_enabled_has(enabled: &[String], name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    enabled.iter().any(|c| c.trim().eq_ignore_ascii_case(name))
+}
+
+fn wizard_build_channel_steps(enabled: &[String]) -> Vec<WizardStepKey> {
+    let mut out: Vec<WizardStepKey> = Vec::new();
+
+    if wizard_enabled_has(enabled, "telegram") {
+        out.push(WizardStepKey::ChannelTelegramBotToken);
+    }
+    if wizard_enabled_has(enabled, "discord") {
+        out.push(WizardStepKey::ChannelDiscordBotToken);
+        out.push(WizardStepKey::ChannelDiscordApplicationId);
+    }
+    if wizard_enabled_has(enabled, "slack") {
+        out.push(WizardStepKey::ChannelSlackBotToken);
+        out.push(WizardStepKey::ChannelSlackAppToken);
+        out.push(WizardStepKey::ChannelSlackSigningSecret);
+    }
+    if wizard_enabled_has(enabled, "matrix") {
+        out.push(WizardStepKey::ChannelMatrixHomeserverUrl);
+        out.push(WizardStepKey::ChannelMatrixUserId);
+        out.push(WizardStepKey::ChannelMatrixAccessToken);
+    }
+    if wizard_enabled_has(enabled, "signal") {
+        out.push(WizardStepKey::ChannelSignalPhoneNumber);
+        out.push(WizardStepKey::ChannelSignalSocketPath);
+    }
+    if wizard_enabled_has(enabled, "whatsapp") {
+        out.push(WizardStepKey::ChannelWhatsAppBridgeUrl);
+        out.push(WizardStepKey::ChannelWhatsAppSessionPath);
+    }
+    if wizard_enabled_has(enabled, "webchat") {
+        out.push(WizardStepKey::ChannelWebChatHost);
+        out.push(WizardStepKey::ChannelWebChatPort);
+        out.push(WizardStepKey::ChannelWebChatRequireAuth);
+        out.push(WizardStepKey::ChannelWebChatAuthToken);
+    }
+
+    out
+}
+
+fn wizard_advance_channel_steps(session: &mut WizardSessionState, steps: usize) {
+    if session.channel_steps.is_empty() {
+        session.channel_step_index = 0;
+        session.step = WizardStepKey::ConfirmWrite;
+        return;
+    }
+
+    let next_index = session.channel_step_index.saturating_add(steps);
+    if next_index >= session.channel_steps.len() {
+        session.channel_steps.clear();
+        session.channel_step_index = 0;
+        session.step = WizardStepKey::ConfirmWrite;
+        return;
+    }
+
+    session.channel_step_index = next_index;
+    session.step = session.channel_steps[next_index];
+}
+
+fn wizard_make_step_for_session(session: &mut WizardSessionState) {
+    let (id, step) = match session.step {
+        WizardStepKey::Intro => wizard_note_step(
+            "drbot setup",
+            "This wizard can configure basic Gateway settings (auth token + host/port), optionally configure a default AI provider, and optionally enable channels.\n\nFor advanced settings, use the Config tab (config.get/config.patch).",
+        ),
+        WizardStepKey::RiskNotice => wizard_note_step(
+            "Security",
+            "Security warning — please read.\n\nThis bot can read files and run actions if tools are enabled.\nA bad prompt can trick it into doing unsafe things.\n\nRecommended baseline:\n- Keep the gateway bound to 127.0.0.1 when possible.\n- Use a gateway token for anything beyond localhost.\n- Enable tools sparingly (least privilege).\n- Keep secrets out of the agent’s reachable filesystem.\n\nIf you are not comfortable with basic security and access control, do not expose this bot to the internet.",
+        ),
+        WizardStepKey::RiskConfirm => wizard_confirm_step(
+            "I understand this is powerful and inherently risky. Continue?",
+            false,
+        ),
+        WizardStepKey::GatewayAuthMode => {
+            let mut options = Vec::new();
+            if session.existing_has_token {
+                options.push(json!({
+                    "value": "keep",
+                    "label": "Keep existing token",
+                    "hint": "Leave the current gateway.auth_token unchanged.",
+                }));
+            }
+            options.push(json!({
+                "value": "new",
+                "label": "Set a new token (recommended)",
+                "hint": "Generate a new token for connecting clients (Control UI, apps, etc).",
+            }));
+            options.push(json!({
+                "value": "disable",
+                "label": "Disable auth (loopback only)",
+                "hint": "Only safe for 127.0.0.1/localhost binds. Non-loopback binds will fail without auth.",
+            }));
+            let initial = if session.existing_has_token {
+                Some(json!("keep"))
+            } else {
+                Some(json!("new"))
+            };
+            wizard_select_step("Gateway authentication", options, initial)
+        }
+        WizardStepKey::GatewayAuthToken => {
+            if session.auth_token.as_deref().unwrap_or("").trim().is_empty() {
+                session.auth_token = Some(wizard_generate_token());
+            }
+            wizard_text_step(
+                "Gateway auth token (copy this; you'll need it to connect).",
+                session.auth_token.as_deref().map(|s| json!(s)),
+                Some("paste or edit token"),
+                true,
+            )
+        }
+        WizardStepKey::GatewayBindHost => {
+            let mut options = Vec::new();
+            options.push(json!({
+                "value": "loopback",
+                "label": "Loopback (127.0.0.1)",
+                "hint": "Local-only access (recommended).",
+            }));
+            if session.auth_choice != WizardAuthChoice::Disable {
+                options.push(json!({
+                    "value": "lan",
+                    "label": "LAN (0.0.0.0)",
+                    "hint": "Listen on all interfaces (requires auth token).",
+                }));
+                options.push(json!({
+                    "value": "custom",
+                    "label": "Custom",
+                    "hint": "Bind to a specific host/IP (requires auth token).",
+                }));
+            }
+            let initial = match session.bind_choice {
+                WizardBindChoice::Loopback => Some(json!("loopback")),
+                WizardBindChoice::Lan => Some(json!("lan")),
+                WizardBindChoice::Custom => Some(json!("custom")),
+            };
+            wizard_select_step("Gateway bind host", options, initial)
+        }
+        WizardStepKey::GatewayBindHostCustom => wizard_text_step(
+            "Custom bind host (IP or hostname).",
+            Some(json!(session.host.clone())),
+            Some("e.g. 192.168.1.10"),
+            false,
+        ),
+        WizardStepKey::GatewayPort => wizard_text_step(
+            "Gateway port",
+            Some(json!(session.port)),
+            Some("1-65535"),
+            false,
+        ),
+        WizardStepKey::ProviderSelect => {
+            let options = vec![
+                json!({
+                    "value": "skip",
+                    "label": "Skip for now",
+                    "hint": "You can configure providers later in the Config tab.",
+                }),
+                json!({
+                    "value": "anthropic",
+                    "label": "Anthropic (Claude)",
+                    "hint": "Use ANTHROPIC_API_KEY / providers.anthropic.api_key.",
+                }),
+                json!({
+                    "value": "openai",
+                    "label": "OpenAI",
+                    "hint": "Use OPENAI_API_KEY / providers.openai.api_key.",
+                }),
+            ];
+
+            let initial = if let Some(choice) = session.provider_choice.as_deref() {
+                choice
+            } else if !session.provider_configured {
+                session
+                    .provider_suggestion
+                    .as_deref()
+                    .unwrap_or("anthropic")
+            } else {
+                "skip"
+            };
+            wizard_select_step("Default AI provider (optional)", options, Some(json!(initial)))
+        }
+        WizardStepKey::ProviderApiKey => {
+            let provider = session.provider_choice.as_deref().unwrap_or("");
+            let message = match provider {
+                "openai" => "OpenAI API key (leave blank to use OPENAI_API_KEY env var if set).",
+                _ => "Anthropic API key (leave blank to use ANTHROPIC_API_KEY env var if set).",
+            };
+            wizard_text_step(message, None, Some("paste API key"), true)
+        }
+        WizardStepKey::ProviderDefaultModel => wizard_text_step(
+            "Default model (optional)",
+            session.provider_default_model.as_deref().map(|s| json!(s)),
+            Some("e.g. gpt-4o / claude-sonnet-4-20250514"),
+            false,
+        ),
+        WizardStepKey::ConfirmWrite => wizard_confirm_step(
+            &format!(
+                "Write these settings to {} now? (Restart drbot after applying.)",
+                session.config_path
+            ),
+            true,
+        ),
+        WizardStepKey::Outro => {
+            let mut message = String::new();
+            if session.wrote {
+                message.push_str("Config updated.\n\n");
+                if session.auth_choice == WizardAuthChoice::New {
+                    if let Some(token) = session.auth_token.as_deref() {
+                        message.push_str("Gateway token:\n");
+                        message.push_str(token);
+                        message.push_str("\n\n");
+                    }
+                }
+                message.push_str("Gateway endpoint:\n");
+                if session.bind_choice == WizardBindChoice::Lan {
+                    message.push_str(&format!(
+                        "ws://<your-host-ip>:{}{}",
+                        session.port, "/openclaw/ws"
+                    ));
+                } else {
+                    message.push_str(&format!(
+                        "ws://{}:{}{}",
+                        session.host, session.port, "/openclaw/ws"
+                    ));
+                }
+                message.push_str("\n\nRestart drbot to apply config changes.");
+            } else {
+                message.push_str("No changes were written.\n\nYou can configure drbot via the Config tab.");
+            }
+            wizard_note_step("Done", &message)
+        }
+        WizardStepKey::ChannelsPrompt => {
+            let options = vec![
+                json!({
+                    "value": "skip",
+                    "label": "Skip for now",
+                    "hint": "Configure channels later in the Config tab.",
+                }),
+                json!({
+                    "value": "configure",
+                    "label": "Configure channels",
+                    "hint": "Enable channels and optionally set credentials.",
+                }),
+            ];
+            wizard_select_step("Channel setup (optional)", options, Some(json!("skip")))
+        }
+        WizardStepKey::ChannelsSelect => {
+            let options = vec![
+                json!({
+                    "value": "telegram",
+                    "label": "Telegram",
+                    "hint": "Bot API (long polling).",
+                }),
+                json!({
+                    "value": "discord",
+                    "label": "Discord",
+                    "hint": "Discord Gateway + REST.",
+                }),
+                json!({
+                    "value": "slack",
+                    "label": "Slack",
+                    "hint": "Socket Mode (bot token + app token).",
+                }),
+                json!({
+                    "value": "matrix",
+                    "label": "Matrix",
+                    "hint": "Matrix homeserver (access token).",
+                }),
+                json!({
+                    "value": "signal",
+                    "label": "Signal",
+                    "hint": "signal-cli socket.",
+                }),
+                json!({
+                    "value": "whatsapp",
+                    "label": "WhatsApp",
+                    "hint": "WhatsApp bridge (QR login).",
+                }),
+                json!({
+                    "value": "imessage",
+                    "label": "iMessage (macOS)",
+                    "hint": "Best-effort; requires macOS.",
+                }),
+                json!({
+                    "value": "webchat",
+                    "label": "WebChat",
+                    "hint": "Local web UI (drbot-webchat).",
+                }),
+            ];
+            let initial = if session.channels_enabled.is_empty() {
+                Some(json!([]))
+            } else {
+                Some(json!(session.channels_enabled.clone()))
+            };
+            wizard_multiselect_step("Enable channels", options, initial)
+        }
+        WizardStepKey::ChannelTelegramBotToken => wizard_text_step(
+            "Telegram bot token (optional; leave blank to keep existing).",
+            None,
+            Some("123456:ABC..."),
+            true,
+        ),
+        WizardStepKey::ChannelDiscordBotToken => wizard_text_step(
+            "Discord bot token (optional; leave blank to keep existing).",
+            None,
+            Some("Bot token"),
+            true,
+        ),
+        WizardStepKey::ChannelDiscordApplicationId => wizard_text_step(
+            "Discord application ID (optional).",
+            session
+                .discord_application_id
+                .as_deref()
+                .map(|s| json!(s)),
+            Some("Application ID"),
+            false,
+        ),
+        WizardStepKey::ChannelSlackBotToken => wizard_text_step(
+            "Slack bot token (optional; leave blank to keep existing).",
+            None,
+            Some("xoxb-..."),
+            true,
+        ),
+        WizardStepKey::ChannelSlackAppToken => wizard_text_step(
+            "Slack app token (optional; leave blank to keep existing).",
+            None,
+            Some("xapp-..."),
+            true,
+        ),
+        WizardStepKey::ChannelSlackSigningSecret => wizard_text_step(
+            "Slack signing secret (optional; leave blank to keep existing).",
+            None,
+            Some("Signing secret"),
+            true,
+        ),
+        WizardStepKey::ChannelMatrixHomeserverUrl => wizard_text_step(
+            "Matrix homeserver URL",
+            session
+                .matrix_homeserver_url
+                .as_deref()
+                .map(|s| json!(s)),
+            Some("https://matrix.example.com"),
+            false,
+        ),
+        WizardStepKey::ChannelMatrixUserId => wizard_text_step(
+            "Matrix user ID",
+            session.matrix_user_id.as_deref().map(|s| json!(s)),
+            Some("@bot:example.com"),
+            false,
+        ),
+        WizardStepKey::ChannelMatrixAccessToken => wizard_text_step(
+            "Matrix access token (optional; leave blank to keep existing).",
+            None,
+            Some("Access token"),
+            true,
+        ),
+        WizardStepKey::ChannelSignalPhoneNumber => wizard_text_step(
+            "Signal phone number",
+            session
+                .signal_phone_number
+                .as_deref()
+                .map(|s| json!(s)),
+            Some("+15551234567"),
+            false,
+        ),
+        WizardStepKey::ChannelSignalSocketPath => wizard_text_step(
+            "Signal socket path/URL",
+            session.signal_socket_path.as_deref().map(|s| json!(s)),
+            Some("/tmp/signal-cli.sock"),
+            false,
+        ),
+        WizardStepKey::ChannelWhatsAppBridgeUrl => wizard_text_step(
+            "WhatsApp bridge WebSocket URL",
+            Some(json!(session.whatsapp_bridge_url.clone())),
+            Some("ws://localhost:3001"),
+            false,
+        ),
+        WizardStepKey::ChannelWhatsAppSessionPath => wizard_text_step(
+            "WhatsApp session directory",
+            Some(json!(session.whatsapp_session_path.clone())),
+            Some("/path/to/whatsapp/session"),
+            false,
+        ),
+        WizardStepKey::ChannelWebChatHost => wizard_text_step(
+            "WebChat host",
+            Some(json!(session.webchat_host.clone())),
+            Some("127.0.0.1"),
+            false,
+        ),
+        WizardStepKey::ChannelWebChatPort => wizard_text_step(
+            "WebChat port",
+            Some(json!(session.webchat_port)),
+            Some("8080"),
+            false,
+        ),
+        WizardStepKey::ChannelWebChatRequireAuth => wizard_confirm_step(
+            "Require auth for WebChat?",
+            session.webchat_require_auth,
+        ),
+        WizardStepKey::ChannelWebChatAuthToken => {
+            if !session.webchat_require_auth {
+                wizard_note_step(
+                    "WebChat auth",
+                    "WebChat auth is disabled; skipping token setup.",
+                )
+            } else if session.auth_choice == WizardAuthChoice::Disable {
+                wizard_text_step(
+                    "WebChat auth token (required when gateway auth is disabled). Leave blank to generate.",
+                    None,
+                    Some("paste or edit token"),
+                    true,
+                )
+            } else {
+                wizard_text_step(
+                    "WebChat auth token (optional). Leave blank to use the gateway token.",
+                    None,
+                    Some("optional"),
+                    true,
+                )
+            }
+        }
+    };
+    session.current_step_id = id;
+    session.current_step = step;
+}
+
+fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSessionState {
+    let config_path = snapshot
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("drbot.toml")
+        .to_string();
+    let config_exists = snapshot
+        .get("exists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let base_hash = snapshot
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let cfg = snapshot
+        .get("config")
+        .or_else(|| snapshot.get("parsed"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let gateway = cfg.get("gateway").and_then(|v| v.as_object());
+    let host = gateway
+        .and_then(|g| g.get("host"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("127.0.0.1")
+        .trim()
+        .to_string();
+    let port = gateway
+        .and_then(|g| g.get("port"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(18789);
+    let existing_has_token = gateway
+        .and_then(|g| g.get("auth_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    let providers = cfg.get("providers").and_then(|v| v.as_object());
+    let provider_configured = providers
+        .map(|p| {
+            let has_default = p
+                .get("default_provider")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_anthropic = p
+                .get("anthropic")
+                .and_then(|v| v.get("api_key"))
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_openai = p
+                .get("openai")
+                .and_then(|v| v.get("api_key"))
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_openai_compat = p
+                .get("openai_compatible")
+                .and_then(|v| v.as_array())
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let has_cli = p
+                .get("cli")
+                .and_then(|v| v.as_array())
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            has_default || has_anthropic || has_openai || has_openai_compat || has_cli
+        })
+        .unwrap_or(false);
+    let provider_default_model = providers
+        .and_then(|p| p.get("default_model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let provider_suggestion = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|_| "anthropic".to_string())
+        .or_else(|| {
+            std::env::var("OPENAI_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|_| "openai".to_string())
+        });
+
+    let channels = cfg.get("channels").and_then(|v| v.as_object());
+    let mut channels_enabled = channels
+        .and_then(|c| c.get("enabled"))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    channels_enabled.sort();
+    channels_enabled.dedup();
+
+    let existing_telegram = channels.and_then(|c| c.get("telegram")).is_some();
+    let existing_discord = channels.and_then(|c| c.get("discord")).is_some();
+    let existing_slack = channels.and_then(|c| c.get("slack")).is_some();
+    let existing_matrix = channels.and_then(|c| c.get("matrix")).is_some();
+    let existing_signal = channels.and_then(|c| c.get("signal")).is_some();
+    let existing_whatsapp = channels.and_then(|c| c.get("whatsapp")).is_some();
+    let existing_imessage = channels.and_then(|c| c.get("imessage")).is_some();
+    let existing_webchat = channels.and_then(|c| c.get("webchat")).is_some();
+
+    let discord_application_id = channels
+        .and_then(|c| c.get("discord"))
+        .and_then(|v| v.get("application_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let matrix_homeserver_url = channels
+        .and_then(|c| c.get("matrix"))
+        .and_then(|v| v.get("homeserver_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let matrix_user_id = channels
+        .and_then(|c| c.get("matrix"))
+        .and_then(|v| v.get("user_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let signal_phone_number = channels
+        .and_then(|c| c.get("signal"))
+        .and_then(|v| v.get("phone_number"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let signal_socket_path = channels
+        .and_then(|c| c.get("signal"))
+        .and_then(|v| v.get("socket_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let whatsapp_bridge_url = channels
+        .and_then(|c| c.get("whatsapp"))
+        .and_then(|v| v.get("bridge_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ws://localhost:3001".to_string());
+    let whatsapp_session_path = channels
+        .and_then(|c| c.get("whatsapp"))
+        .and_then(|v| v.get("session_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            drbot_core::Config::data_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("whatsapp")
+                .to_string_lossy()
+                .to_string()
+        });
+
+    let webchat_host = channels
+        .and_then(|c| c.get("webchat"))
+        .and_then(|v| v.get("host"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("127.0.0.1")
+        .trim()
+        .to_string();
+    let webchat_port = channels
+        .and_then(|c| c.get("webchat"))
+        .and_then(|v| v.get("port"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8080);
+    let webchat_require_auth = channels
+        .and_then(|c| c.get("webchat"))
+        .and_then(|v| v.get("require_auth"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let auth_choice = if existing_has_token {
+        WizardAuthChoice::Keep
+    } else {
+        WizardAuthChoice::New
+    };
+    let bind_choice = wizard_bind_choice_for_host(&host);
+
+    let mut session = WizardSessionState {
+        status: WizardSessionStatus::Running,
+        error: None,
+        step: WizardStepKey::Intro,
+        current_step_id: String::new(),
+        current_step: serde_json::Value::Null,
+
+        config_path,
+        config_exists,
+        base_hash,
+        existing_has_token,
+
+        auth_choice,
+        auth_token: None,
+        bind_choice,
+        host,
+        port,
+
+        provider_configured,
+        provider_suggestion,
+        provider_choice: None,
+        provider_api_key: None,
+        provider_default_model,
+
+        configure_channels: false,
+        channels_enabled,
+        channel_steps: Vec::new(),
+        channel_step_index: 0,
+        existing_telegram,
+        existing_discord,
+        existing_slack,
+        existing_matrix,
+        existing_signal,
+        existing_whatsapp,
+        existing_imessage,
+        existing_webchat,
+        telegram_bot_token: None,
+        discord_bot_token: None,
+        discord_application_id,
+        slack_bot_token: None,
+        slack_app_token: None,
+        slack_signing_secret: None,
+        matrix_homeserver_url,
+        matrix_user_id,
+        matrix_access_token: None,
+        signal_phone_number,
+        signal_socket_path,
+        whatsapp_bridge_url,
+        whatsapp_session_path,
+        webchat_host,
+        webchat_port,
+        webchat_require_auth,
+        webchat_auth_token: None,
+
+        wrote: false,
+    };
+    wizard_make_step_for_session(&mut session);
+    session
+}
+
+async fn wizard_apply_answer_and_advance(
+    state: &GatewayState,
+    session: &mut WizardSessionState,
+    step_id: &str,
+    value: serde_json::Value,
+) -> std::result::Result<(), ErrorShape> {
+    let step_id = step_id.trim();
+    if step_id.is_empty() || step_id != session.current_step_id {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "wizard: no pending step",
+        ));
+    }
+
+    // OpenClaw parity: clients may send `null` to accept a step's initialValue.
+    let value = if value.is_null() {
+        session
+            .current_step
+            .get("initialValue")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        value
+    };
+
+    match session.step {
+        WizardStepKey::Intro => {
+            session.step = WizardStepKey::RiskNotice;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::RiskNotice => {
+            session.step = WizardStepKey::RiskConfirm;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::RiskConfirm => {
+            if !wizard_value_to_bool(&value) {
+                session.status = WizardSessionStatus::Cancelled;
+                session.error = Some("cancelled".to_string());
+                session.current_step_id = String::new();
+                session.current_step = serde_json::Value::Null;
+                return Ok(());
+            }
+            session.step = WizardStepKey::GatewayAuthMode;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayAuthMode => {
+            let choice_raw = wizard_value_to_string(&value);
+            let Some(choice) = WizardAuthChoice::from_str(&choice_raw) else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "invalid auth mode",
+                ));
+            };
+            session.auth_choice = choice;
+            if choice == WizardAuthChoice::Disable {
+                session.auth_token = None;
+                // Safety: disabling auth is only allowed for loopback binds.
+                if !wizard_is_loopback_host(&session.host) {
+                    session.host = "127.0.0.1".to_string();
+                    session.bind_choice = WizardBindChoice::Loopback;
+                }
+                session.step = WizardStepKey::GatewayBindHost;
+            } else if choice == WizardAuthChoice::New {
+                session.step = WizardStepKey::GatewayAuthToken;
+            } else {
+                session.step = WizardStepKey::GatewayBindHost;
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayAuthToken => {
+            let token = wizard_value_to_string(&value);
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "token cannot be empty",
+                ));
+            }
+            session.auth_token = Some(token);
+            session.step = WizardStepKey::GatewayBindHost;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayBindHost => {
+            let choice_raw = wizard_value_to_string(&value);
+            let choice_raw = choice_raw.trim().to_ascii_lowercase();
+            match choice_raw.as_str() {
+                "loopback" => {
+                    session.bind_choice = WizardBindChoice::Loopback;
+                    session.host = "127.0.0.1".to_string();
+                    session.step = WizardStepKey::GatewayPort;
+                }
+                "lan" => {
+                    if session.auth_choice == WizardAuthChoice::Disable {
+                        return Err(ErrorShape::new(
+                            error_codes::INVALID_REQUEST,
+                            "auth must be enabled for non-loopback binds",
+                        ));
+                    }
+                    session.bind_choice = WizardBindChoice::Lan;
+                    session.host = "0.0.0.0".to_string();
+                    session.step = WizardStepKey::GatewayPort;
+                }
+                "custom" => {
+                    if session.auth_choice == WizardAuthChoice::Disable {
+                        return Err(ErrorShape::new(
+                            error_codes::INVALID_REQUEST,
+                            "auth must be enabled for non-loopback binds",
+                        ));
+                    }
+                    session.bind_choice = WizardBindChoice::Custom;
+                    session.step = WizardStepKey::GatewayBindHostCustom;
+                }
+                _ => {
+                    return Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        "invalid bind host option",
+                    ));
+                }
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayBindHostCustom => {
+            let host = wizard_value_to_string(&value);
+            let host = host.trim().to_string();
+            if host.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "host cannot be empty",
+                ));
+            }
+            session.bind_choice = wizard_bind_choice_for_host(&host);
+            session.host = host;
+            session.step = WizardStepKey::GatewayPort;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayPort => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            let port = trimmed.parse::<u16>().ok().filter(|v| *v > 0);
+            let Some(port) = port else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "invalid port (expected 1-65535)",
+                ));
+            };
+            session.port = port;
+            session.step = WizardStepKey::ProviderSelect;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ProviderSelect => {
+            let choice_raw = wizard_value_to_string(&value);
+            let choice = choice_raw.trim().to_ascii_lowercase();
+            match choice.as_str() {
+                "" | "skip" => {
+                    session.provider_choice = None;
+                    session.provider_api_key = None;
+                    session.step = WizardStepKey::ChannelsPrompt;
+                }
+                "anthropic" | "openai" => {
+                    session.provider_choice = Some(choice.to_string());
+                    session.provider_api_key = None;
+                    session.step = WizardStepKey::ProviderApiKey;
+                }
+                _ => {
+                    return Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        "invalid provider option",
+                    ));
+                }
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ProviderApiKey => {
+            let provider = session.provider_choice.as_deref().unwrap_or("");
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            let api_key = if trimmed.is_empty() {
+                match provider {
+                    "openai" => std::env::var("OPENAI_API_KEY").ok(),
+                    _ => std::env::var("ANTHROPIC_API_KEY").ok(),
+                }
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            } else {
+                Some(trimmed.to_string())
+            };
+            let Some(api_key) = api_key else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "API key required (or set the environment variable)",
+                ));
+            };
+            session.provider_api_key = Some(api_key);
+            session.step = WizardStepKey::ProviderDefaultModel;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ProviderDefaultModel => {
+            let model = wizard_value_to_string(&value);
+            let model = model.trim().to_string();
+            if model.is_empty() {
+                session.provider_default_model = None;
+            } else {
+                session.provider_default_model = Some(model);
+            }
+            session.step = WizardStepKey::ChannelsPrompt;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelsPrompt => {
+            let choice_raw = wizard_value_to_string(&value);
+            let choice = choice_raw.trim().to_ascii_lowercase();
+            match choice.as_str() {
+                "" | "skip" => {
+                    session.configure_channels = false;
+                    session.step = WizardStepKey::ConfirmWrite;
+                }
+                "configure" => {
+                    session.configure_channels = true;
+                    session.channel_steps.clear();
+                    session.channel_step_index = 0;
+                    session.step = WizardStepKey::ChannelsSelect;
+                }
+                _ => {
+                    return Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        "invalid channel setup option",
+                    ));
+                }
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelsSelect => {
+            let mut enabled = wizard_value_to_string_vec(&value)
+                .into_iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            enabled.sort();
+            enabled.dedup();
+            session.channels_enabled = enabled;
+
+            session.channel_steps = wizard_build_channel_steps(&session.channels_enabled);
+            session.channel_step_index = 0;
+            if session.channel_steps.is_empty() {
+                session.step = WizardStepKey::ConfirmWrite;
+            } else {
+                session.step = session.channel_steps[0];
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelTelegramBotToken => {
+            let token = wizard_value_to_string(&value);
+            let token = token.trim();
+            session.telegram_bot_token = if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelDiscordBotToken => {
+            let token = wizard_value_to_string(&value);
+            let token = token.trim();
+            session.discord_bot_token = if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelDiscordApplicationId => {
+            let app_id = wizard_value_to_string(&value);
+            let app_id = app_id.trim();
+            session.discord_application_id = if app_id.is_empty() {
+                None
+            } else {
+                Some(app_id.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelSlackBotToken => {
+            let token = wizard_value_to_string(&value);
+            let token = token.trim();
+            session.slack_bot_token = if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelSlackAppToken => {
+            let token = wizard_value_to_string(&value);
+            let token = token.trim();
+            session.slack_app_token = if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelSlackSigningSecret => {
+            let secret = wizard_value_to_string(&value);
+            let secret = secret.trim();
+            session.slack_signing_secret = if secret.is_empty() {
+                None
+            } else {
+                Some(secret.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelMatrixHomeserverUrl => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.matrix_homeserver_url = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelMatrixUserId => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.matrix_user_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelMatrixAccessToken => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.matrix_access_token = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelSignalPhoneNumber => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.signal_phone_number = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelSignalSocketPath => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.signal_socket_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelWhatsAppBridgeUrl => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "WhatsApp bridge URL cannot be empty",
+                ));
+            }
+            session.whatsapp_bridge_url = trimmed.to_string();
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelWhatsAppSessionPath => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "WhatsApp session path cannot be empty",
+                ));
+            }
+            session.whatsapp_session_path = trimmed.to_string();
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelWebChatHost => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "WebChat host cannot be empty",
+                ));
+            }
+            session.webchat_host = trimmed.to_string();
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelWebChatPort => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            let port = trimmed.parse::<u16>().ok().filter(|v| *v > 0);
+            let Some(port) = port else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "invalid WebChat port (expected 1-65535)",
+                ));
+            };
+            session.webchat_port = port;
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelWebChatRequireAuth => {
+            let require_auth = wizard_value_to_bool(&value);
+            if !require_auth && !wizard_is_loopback_host(&session.webchat_host) {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "WebChat without auth is only allowed on loopback hosts (127.0.0.1/localhost).",
+                ));
+            }
+            session.webchat_require_auth = require_auth;
+            if !require_auth {
+                session.webchat_auth_token = None;
+                // Skip auth token step.
+                wizard_advance_channel_steps(session, 2);
+            } else {
+                wizard_advance_channel_steps(session, 1);
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ChannelWebChatAuthToken => {
+            if !session.webchat_require_auth {
+                wizard_advance_channel_steps(session, 1);
+                wizard_make_step_for_session(session);
+                return Ok(());
+            }
+
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                session.webchat_auth_token = if session.auth_choice == WizardAuthChoice::Disable {
+                    Some(wizard_generate_token())
+                } else {
+                    None
+                };
+            } else {
+                session.webchat_auth_token = Some(trimmed.to_string());
+            }
+            wizard_advance_channel_steps(session, 1);
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::ConfirmWrite => {
+            let do_write = wizard_value_to_bool(&value);
+            if !do_write {
+                session.wrote = false;
+                session.step = WizardStepKey::Outro;
+                wizard_make_step_for_session(session);
+                return Ok(());
+            }
+
+            // Apply merge-patch to drbot.toml via the OpenClaw config.patch implementation.
+            let mut patch = serde_json::Map::new();
+
+            let mut gateway_patch = serde_json::Map::new();
+            gateway_patch.insert("host".to_string(), json!(session.host.clone()));
+            gateway_patch.insert("port".to_string(), json!(session.port));
+            match session.auth_choice {
+                WizardAuthChoice::Keep => {}
+                WizardAuthChoice::Disable => {
+                    gateway_patch.insert("auth_token".to_string(), serde_json::Value::Null);
+                }
+                WizardAuthChoice::New => {
+                    let token = session.auth_token.clone().unwrap_or_default();
+                    if token.trim().is_empty() {
+                        return Err(ErrorShape::new(
+                            error_codes::INVALID_REQUEST,
+                            "token cannot be empty",
+                        ));
+                    }
+                    gateway_patch.insert("auth_token".to_string(), json!(token));
+                }
+            }
+            patch.insert(
+                "gateway".to_string(),
+                serde_json::Value::Object(gateway_patch),
+            );
+
+            if let Some(provider) = session.provider_choice.as_deref() {
+                let api_key = session.provider_api_key.clone().unwrap_or_default();
+                if api_key.trim().is_empty() {
+                    return Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        "API key required",
+                    ));
+                }
+
+                let mut providers_patch = serde_json::Map::new();
+                providers_patch.insert("default_provider".to_string(), json!(provider));
+                if let Some(model) = session.provider_default_model.as_deref() {
+                    providers_patch.insert("default_model".to_string(), json!(model));
+                } else {
+                    providers_patch.insert("default_model".to_string(), serde_json::Value::Null);
+                }
+
+                match provider {
+                    "openai" => {
+                        providers_patch.insert("openai".to_string(), json!({ "api_key": api_key }));
+                    }
+                    _ => {
+                        providers_patch
+                            .insert("anthropic".to_string(), json!({ "api_key": api_key }));
+                    }
+                }
+                patch.insert(
+                    "providers".to_string(),
+                    serde_json::Value::Object(providers_patch),
+                );
+            }
+
+            if session.configure_channels {
+                let mut channels_patch = serde_json::Map::new();
+                channels_patch.insert(
+                    "enabled".to_string(),
+                    json!(session.channels_enabled.clone()),
+                );
+
+                if wizard_enabled_has(&session.channels_enabled, "telegram") {
+                    if let Some(token) = session
+                        .telegram_bot_token
+                        .as_deref()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    {
+                        channels_patch
+                            .insert("telegram".to_string(), json!({ "bot_token": token }));
+                    }
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "discord") {
+                    let bot_token = session
+                        .discord_bot_token
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let application_id = session
+                        .discord_application_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let any = !bot_token.is_empty() || !application_id.is_empty();
+                    if any {
+                        let mut obj = serde_json::Map::new();
+                        if session.existing_discord {
+                            if !bot_token.is_empty() {
+                                obj.insert("bot_token".to_string(), json!(bot_token));
+                            }
+                            if !application_id.is_empty() {
+                                obj.insert("application_id".to_string(), json!(application_id));
+                            }
+                        } else {
+                            obj.insert("bot_token".to_string(), json!(bot_token));
+                            obj.insert("application_id".to_string(), json!(application_id));
+                        }
+                        channels_patch
+                            .insert("discord".to_string(), serde_json::Value::Object(obj));
+                    }
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "slack") {
+                    let bot_token = session
+                        .slack_bot_token
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let app_token = session
+                        .slack_app_token
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let signing_secret = session
+                        .slack_signing_secret
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let any = !bot_token.is_empty()
+                        || !app_token.is_empty()
+                        || !signing_secret.is_empty();
+                    if any {
+                        let mut obj = serde_json::Map::new();
+                        if session.existing_slack {
+                            if !bot_token.is_empty() {
+                                obj.insert("bot_token".to_string(), json!(bot_token));
+                            }
+                            if !app_token.is_empty() {
+                                obj.insert("app_token".to_string(), json!(app_token));
+                            }
+                            if !signing_secret.is_empty() {
+                                obj.insert("signing_secret".to_string(), json!(signing_secret));
+                            }
+                        } else {
+                            obj.insert("bot_token".to_string(), json!(bot_token));
+                            obj.insert("app_token".to_string(), json!(app_token));
+                            obj.insert("signing_secret".to_string(), json!(signing_secret));
+                        }
+                        channels_patch.insert("slack".to_string(), serde_json::Value::Object(obj));
+                    }
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "matrix") {
+                    let homeserver_url = session
+                        .matrix_homeserver_url
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let user_id = session
+                        .matrix_user_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let access_token = session
+                        .matrix_access_token
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let any = !homeserver_url.is_empty()
+                        || !user_id.is_empty()
+                        || !access_token.is_empty();
+                    if any {
+                        let mut obj = serde_json::Map::new();
+                        if session.existing_matrix {
+                            if !homeserver_url.is_empty() {
+                                obj.insert("homeserver_url".to_string(), json!(homeserver_url));
+                            }
+                            if !user_id.is_empty() {
+                                obj.insert("user_id".to_string(), json!(user_id));
+                            }
+                            if !access_token.is_empty() {
+                                obj.insert("access_token".to_string(), json!(access_token));
+                            }
+                        } else {
+                            obj.insert("homeserver_url".to_string(), json!(homeserver_url));
+                            obj.insert("user_id".to_string(), json!(user_id));
+                            obj.insert("access_token".to_string(), json!(access_token));
+                        }
+                        channels_patch.insert("matrix".to_string(), serde_json::Value::Object(obj));
+                    }
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "signal") {
+                    let phone_number = session
+                        .signal_phone_number
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let socket_path = session
+                        .signal_socket_path
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let any = !phone_number.is_empty() || !socket_path.is_empty();
+                    if any {
+                        let mut obj = serde_json::Map::new();
+                        if session.existing_signal {
+                            if !phone_number.is_empty() {
+                                obj.insert("phone_number".to_string(), json!(phone_number));
+                            }
+                            if !socket_path.is_empty() {
+                                obj.insert("socket_path".to_string(), json!(socket_path));
+                            }
+                        } else {
+                            obj.insert("phone_number".to_string(), json!(phone_number));
+                            obj.insert("socket_path".to_string(), json!(socket_path));
+                        }
+                        channels_patch.insert("signal".to_string(), serde_json::Value::Object(obj));
+                    }
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "whatsapp") {
+                    channels_patch.insert(
+                        "whatsapp".to_string(),
+                        json!({
+                            "bridge_url": session.whatsapp_bridge_url.clone(),
+                            "session_path": session.whatsapp_session_path.clone(),
+                        }),
+                    );
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "imessage")
+                    && !session.existing_imessage
+                {
+                    channels_patch.insert("imessage".to_string(), json!({}));
+                }
+
+                if wizard_enabled_has(&session.channels_enabled, "webchat") {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("host".to_string(), json!(session.webchat_host.clone()));
+                    obj.insert("port".to_string(), json!(session.webchat_port));
+                    obj.insert(
+                        "require_auth".to_string(),
+                        json!(session.webchat_require_auth),
+                    );
+                    if let Some(token) = session
+                        .webchat_auth_token
+                        .as_deref()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    {
+                        obj.insert("auth_token".to_string(), json!(token));
+                    }
+                    channels_patch.insert("webchat".to_string(), serde_json::Value::Object(obj));
+                }
+
+                patch.insert(
+                    "channels".to_string(),
+                    serde_json::Value::Object(channels_patch),
+                );
+            }
+
+            let patch = serde_json::Value::Object(patch);
+            let raw = serde_json::to_string_pretty(&patch).unwrap_or_else(|_| "{}".to_string());
+
+            match handle_config_patch(state, &raw, session.base_hash.as_deref()).await {
+                Ok(payload) => {
+                    session.wrote = true;
+                    if let Some(path) = payload.get("path").and_then(|v| v.as_str()) {
+                        if !path.trim().is_empty() {
+                            session.config_path = path.trim().to_string();
+                        }
+                    }
+                    session.step = WizardStepKey::Outro;
+                    wizard_make_step_for_session(session);
+                    Ok(())
+                }
+                Err(err) => {
+                    session.status = WizardSessionStatus::Error;
+                    session.error = Some(wizard_format_internal_error(err));
+                    session.current_step_id = String::new();
+                    session.current_step = serde_json::Value::Null;
+                    Ok(())
+                }
+            }
+        }
+        WizardStepKey::Outro => {
+            session.status = WizardSessionStatus::Done;
+            session.current_step_id = String::new();
+            session.current_step = serde_json::Value::Null;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -275,6 +2106,139 @@ fn sha256_hex(raw: &str) -> String {
 fn sha256_hex_bytes(raw: &[u8]) -> String {
     let d = digest::digest(&digest::SHA256, raw);
     drbot_hex_util::encode(d.as_ref())
+}
+
+fn normalize_shell_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.replace('\\', "/");
+    let mut name = normalized
+        .split('/')
+        .filter(|s| !s.trim().is_empty())
+        .last()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string();
+
+    // Strip common Windows executable extensions.
+    let lower = name.to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat"] {
+        if lower.ends_with(ext) && name.len() > ext.len() {
+            name.truncate(name.len() - ext.len());
+            break;
+        }
+    }
+
+    let filtered: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect();
+    let filtered = filtered.trim();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.to_string())
+    }
+}
+
+fn resolve_runtime_shell() -> Option<String> {
+    // OpenClaw parity: allow overriding shell detection to help Windows agents emit compatible commands.
+    if let Ok(override_shell) = std::env::var("CLAWDBOT_SHELL") {
+        if let Some(name) = normalize_shell_name(&override_shell) {
+            return Some(name);
+        }
+    }
+
+    if std::env::var("POWERSHELL_DISTRIBUTION_CHANNEL")
+        .ok()
+        .is_some()
+    {
+        return Some("pwsh".to_string());
+    }
+
+    if cfg!(windows) {
+        return Some("powershell".to_string());
+    }
+
+    if let Ok(shell) = std::env::var("SHELL") {
+        if let Some(name) = normalize_shell_name(&shell) {
+            return Some(name);
+        }
+    }
+
+    if std::env::var("BASH_VERSION").ok().is_some() {
+        return Some("bash".to_string());
+    }
+    if std::env::var("ZSH_VERSION").ok().is_some() {
+        return Some("zsh".to_string());
+    }
+    if std::env::var("FISH_VERSION").ok().is_some() {
+        return Some("fish".to_string());
+    }
+    if std::env::var("KSH_VERSION").ok().is_some() {
+        return Some("ksh".to_string());
+    }
+    if std::env::var("NU_VERSION").ok().is_some() || std::env::var("NUSHELL_VERSION").ok().is_some()
+    {
+        return Some("nu".to_string());
+    }
+
+    None
+}
+
+fn build_openclaw_runtime_line(
+    agent_id: &str,
+    model: Option<&str>,
+    default_model: Option<&str>,
+    thinking_level: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let agent_id = agent_id.trim();
+    if !agent_id.is_empty() {
+        parts.push(format!("agent={agent_id}"));
+    }
+
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .unwrap_or_else(|| "drbot".to_string());
+    let host = host.trim();
+    if !host.is_empty() {
+        parts.push(format!("host={host}"));
+    }
+
+    parts.push(format!(
+        "os={} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        parts.push(format!("model={model}"));
+    }
+
+    if let Some(default_model) = default_model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .filter(|m| Some(*m) != model)
+    {
+        parts.push(format!("default_model={default_model}"));
+    }
+
+    if let Some(shell) = resolve_runtime_shell() {
+        parts.push(format!("shell={shell}"));
+    }
+
+    let thinking = thinking_level
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("off");
+    parts.push(format!("thinking={thinking}"));
+
+    format!("Runtime: {}", parts.join(" | "))
 }
 
 fn base64_decode_url_safe_best_effort(input: &str) -> Option<Vec<u8>> {
@@ -418,9 +2382,7 @@ fn openclaw_inflight_store() -> &'static Mutex<HashMap<String, Arc<OpenclawInfli
     OPENCLAW_INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-async fn openclaw_inflight_get_or_insert(
-    key: &str,
-) -> Option<(Arc<OpenclawInflightEntry>, bool)> {
+async fn openclaw_inflight_get_or_insert(key: &str) -> Option<(Arc<OpenclawInflightEntry>, bool)> {
     let key = key.trim();
     if key.is_empty() {
         return None;
@@ -443,7 +2405,11 @@ async fn openclaw_inflight_wait(entry: &Arc<OpenclawInflightEntry>) -> OpenclawD
     }
 }
 
-async fn openclaw_inflight_finish(key: &str, entry: &Arc<OpenclawInflightEntry>, result: OpenclawDedupeEntry) {
+async fn openclaw_inflight_finish(
+    key: &str,
+    entry: &Arc<OpenclawInflightEntry>,
+    result: OpenclawDedupeEntry,
+) {
     {
         let mut st = entry.result.lock().await;
         *st = Some(result);
@@ -486,10 +2452,19 @@ where
 
 fn chat_send_dedupe_key(_session_key: &str, run_id: &str) -> String {
     // OpenClaw dedupe uses the client-provided idempotency key (runId).
-    format!("chat:{}", run_id.trim().replace('\n', " ").replace('\r', " "))
+    format!(
+        "chat:{}",
+        run_id.trim().replace('\n', " ").replace('\r', " ")
+    )
 }
 
 fn resolve_config_paths() -> Vec<PathBuf> {
+    if let Ok(path) = std::env::var("DRBOT_CONFIG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return vec![PathBuf::from(trimmed)];
+        }
+    }
     let mut paths = vec![
         PathBuf::from("drbot.toml"),
         PathBuf::from("config/drbot.toml"),
@@ -512,6 +2487,17 @@ fn resolve_config_path_for_read() -> PathBuf {
 }
 
 fn resolve_config_path_for_write() -> PathBuf {
+    if let Ok(path) = std::env::var("DRBOT_CONFIG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    for path in resolve_config_paths() {
+        if path.exists() {
+            return path;
+        }
+    }
     if let Some(dir) = drbot_core::Config::config_dir() {
         return dir.join("config.toml");
     }
@@ -608,7 +2594,7 @@ fn parse_agent_session_key(session_key: &str) -> Option<ParsedAgentSessionKey> {
     })
 }
 
-fn canonicalize_openclaw_session_key(default_agent_id: &str, key: &str) -> String {
+pub(crate) fn canonicalize_openclaw_session_key(default_agent_id: &str, key: &str) -> String {
     let raw = key.trim();
     if raw.is_empty() {
         return String::new();
@@ -620,16 +2606,42 @@ fn canonicalize_openclaw_session_key(default_agent_id: &str, key: &str) -> Strin
         return "unknown".to_string();
     }
 
+    fn normalize_store_key(value: &str) -> String {
+        let raw = value.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+        if !raw.contains(':') {
+            return raw.to_string();
+        }
+        let Some((channel_type, channel_id)) = raw.split_once(':') else {
+            return raw.to_string();
+        };
+        let channel_type = channel_type.trim();
+        let channel_id = channel_id.trim();
+        if channel_type.is_empty() || channel_id.is_empty() {
+            return raw.to_string();
+        }
+        let derived = derive_openclaw_group_aware_channel_id(channel_type, channel_id);
+        if derived == channel_id {
+            raw.to_string()
+        } else {
+            format!("{}:{}", channel_type, derived)
+        }
+    }
+
     if raw.to_ascii_lowercase().starts_with("agent:") {
         if let Some(parsed) = parse_agent_session_key(raw) {
             let agent_id = crate::openclaw_paths::normalize_agent_id(&parsed.agent_id);
-            return format!("agent:{}:{}", agent_id, parsed.rest.trim());
+            let rest = normalize_store_key(&parsed.rest);
+            return format!("agent:{}:{}", agent_id, rest);
         }
         return raw.to_string();
     }
 
     let agent_id = crate::openclaw_paths::normalize_agent_id(default_agent_id);
-    format!("agent:{}:{}", agent_id, raw)
+    let rest = normalize_store_key(raw);
+    format!("agent:{}:{}", agent_id, rest)
 }
 
 fn openclaw_session_key_to_store_key(key: &str) -> String {
@@ -642,7 +2654,102 @@ fn openclaw_session_key_to_store_key(key: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-fn openclaw_session_key_agent_id(key: &str, default_agent_id: &str) -> String {
+fn openclaw_session_store_key_candidates(
+    default_agent_id: &str,
+    raw_key: &str,
+) -> (String, Vec<String>) {
+    let raw_key = raw_key.trim();
+    let canonical_key = canonicalize_openclaw_session_key(default_agent_id, raw_key);
+    let legacy_key = openclaw_session_key_to_store_key(&canonical_key);
+    let canonical_agent_id = openclaw_session_key_agent_id(&canonical_key, default_agent_id);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut additional = Vec::new();
+    if !raw_key.is_empty() && !raw_key.to_ascii_lowercase().starts_with("agent:") {
+        additional.push(format!("agent:{}:{}", canonical_agent_id, raw_key));
+    }
+    if let Some(group) = parse_openclaw_group_key(&legacy_key) {
+        let legacy_untyped_store_key = format!("{}:{}", group.channel, group.id);
+        additional.push(legacy_untyped_store_key.clone());
+        additional.push(format!(
+            "agent:{}:{}",
+            canonical_agent_id, legacy_untyped_store_key
+        ));
+    }
+
+    for candidate in [canonical_key.as_str(), legacy_key.as_str(), raw_key]
+        .into_iter()
+        .chain(additional.iter().map(|s| s.as_str()))
+    {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    (canonical_key, out)
+}
+
+async fn load_openclaw_session_by_candidates(
+    store: &Arc<dyn drbot_sessions::SessionStore>,
+    candidates: &[String],
+) -> Option<(drbot_core::session::Session, String)> {
+    for candidate in candidates {
+        if let Ok(Some(session)) = store.get_by_channel("openclaw", candidate).await {
+            return Some((session, candidate.clone()));
+        }
+    }
+    None
+}
+
+async fn get_or_create_openclaw_session(
+    store: &Arc<dyn drbot_sessions::SessionStore>,
+    user_id: Uuid,
+    canonical_key: &str,
+    legacy_candidates: &[String],
+) -> Option<drbot_core::session::Session> {
+    let canonical_key = canonical_key.trim();
+    if canonical_key.is_empty() {
+        return None;
+    }
+
+    if let Ok(Some(session)) = store.get_by_channel("openclaw", canonical_key).await {
+        return Some(session);
+    }
+
+    if let Some((mut session, found_key)) =
+        load_openclaw_session_by_candidates(store, legacy_candidates).await
+    {
+        if found_key != canonical_key {
+            if store
+                .get_by_channel("openclaw", canonical_key)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                let previous = session.channel_id.clone();
+                session.channel_type = "openclaw".to_string();
+                session.channel_id = canonical_key.to_string();
+                if store.update(&session).await.is_err() {
+                    session.channel_id = previous;
+                }
+            }
+        }
+        return Some(session);
+    }
+
+    store
+        .get_or_create(user_id, "openclaw", canonical_key)
+        .await
+        .ok()
+}
+
+pub(crate) fn openclaw_session_key_agent_id(key: &str, default_agent_id: &str) -> String {
     let raw = key.trim();
     if raw.is_empty() {
         return crate::openclaw_paths::normalize_agent_id(default_agent_id);
@@ -699,6 +2806,131 @@ fn parse_openclaw_group_key(key: &str) -> Option<ParsedGroupKey> {
     })
 }
 
+fn strip_openclaw_chat_type_prefix(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some(prefix) = trimmed.get(0..6) {
+        if prefix.eq_ignore_ascii_case("group:") {
+            return trimmed.get(6..).unwrap_or("").trim();
+        }
+    }
+    if let Some(prefix) = trimmed.get(0..8) {
+        if prefix.eq_ignore_ascii_case("channel:") {
+            return trimmed.get(8..).unwrap_or("").trim();
+        }
+    }
+    trimmed
+}
+
+fn openclaw_media_token_is_local_path(token: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() {
+        return true;
+    }
+
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+    {
+        return false;
+    }
+    if lower.starts_with("file://") || lower.starts_with("file:") {
+        return true;
+    }
+
+    if token.starts_with('/')
+        || token.starts_with('~')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with(".\\")
+        || token.starts_with("..\\")
+        || token.starts_with("\\\\")
+        || token.starts_with("//")
+    {
+        return true;
+    }
+
+    let bytes = token.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+        && bytes[0].is_ascii_alphabetic()
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Strip OpenClaw-style `MEDIA:` lines that point at local file paths.
+///
+/// OpenClaw v2026.2.12: avoid leaking local file paths as visible message text.
+pub(crate) fn strip_openclaw_media_path_lines<'a>(message: &'a str) -> Cow<'a, str> {
+    if !message.contains("MEDIA:") && !message.contains("media:") {
+        return Cow::Borrowed(message);
+    }
+
+    let mut removed_any = false;
+    let mut kept: Vec<&str> = Vec::new();
+
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if let Some(prefix) = trimmed.get(0..6) {
+            if prefix.eq_ignore_ascii_case("media:") {
+                let rest = trimmed.get(6..).unwrap_or("").trim();
+                if openclaw_media_token_is_local_path(rest) {
+                    removed_any = true;
+                    continue;
+                }
+            }
+        }
+        kept.push(line);
+    }
+
+    if !removed_any {
+        Cow::Borrowed(message)
+    } else {
+        Cow::Owned(kept.join("\n"))
+    }
+}
+
+pub(crate) fn derive_openclaw_group_aware_channel_id(
+    channel_type: &str,
+    channel_id: &str,
+) -> String {
+    let channel_type = channel_type.trim().to_ascii_lowercase();
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        return String::new();
+    }
+
+    let lowered = channel_id.to_ascii_lowercase();
+    if lowered.starts_with("group:") || lowered.starts_with("channel:") {
+        return channel_id.to_string();
+    }
+
+    if channel_type == "telegram" {
+        if let Ok(id) = channel_id.parse::<i64>() {
+            if id < 0 {
+                return format!("group:{}", channel_id);
+            }
+        }
+    }
+
+    if channel_type == "slack" {
+        if let Some(first) = channel_id.chars().next() {
+            match first {
+                'C' | 'c' => return format!("channel:{}", channel_id),
+                'G' | 'g' => return format!("group:{}", channel_id),
+                _ => {}
+            }
+        }
+    }
+
+    channel_id.to_string()
+}
+
 fn normalize_openclaw_group_label(raw: &str) -> String {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -730,8 +2962,7 @@ fn normalize_openclaw_group_label(raw: &str) -> String {
         out.push(mapped);
     }
 
-    out.trim_matches(|c: char| c == '-' || c == '.')
-        .to_string()
+    out.trim_matches(|c: char| c == '-' || c == '.').to_string()
 }
 
 fn shorten_openclaw_group_id(raw: &str) -> String {
@@ -1318,7 +3549,7 @@ async fn find_node_client(state: &GatewayState, node_id: &str) -> Option<Opencla
     })
 }
 
-async fn invoke_node_command(
+pub(crate) async fn invoke_node_command(
     state: &GatewayState,
     node_id: &str,
     command: &str,
@@ -1612,7 +3843,7 @@ async fn refresh_remote_node_bins_best_effort(state: GatewayState, node_id: Stri
         return;
     }
 
-    let workspace_dirs = vec![crate::openclaw_paths::resolve_agent_workspace_dir("default")];
+    let workspace_dirs = vec![resolve_agent_workspace_dir_for_state(&state, "default")];
     let required_bins = crate::openclaw_skills::collect_required_skill_bins_for_platform(
         &workspace_dirs,
         state.config(),
@@ -1769,8 +4000,15 @@ fn parse_node_run_output(payload: &serde_json::Value) -> (Option<i64>, bool, Str
 
     // OpenClaw node hosts return `{ exitCode, success, timedOut, stdout, stderr, error }`.
     let success = payload.get("success").and_then(|v| v.as_bool());
-    let timed_out = payload.get("timedOut").and_then(|v| v.as_bool()).unwrap_or(false);
-    let error_text = payload.get("error").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let timed_out = payload
+        .get("timedOut")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let error_text = payload
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if !error_text.is_empty() {
         if !stderr.trim().is_empty() {
             stderr.push('\n');
@@ -1874,7 +4112,12 @@ async fn run_skill_install_on_node(
 
     let script = match kind {
         "brew" => {
-            let Some(formula) = plan.formula.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let Some(formula) = plan
+                .formula
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
                 return crate::openclaw_skills::SkillInstallResult {
                     ok: false,
                     message: "missing brew formula".to_string(),
@@ -1890,7 +4133,12 @@ async fn run_skill_install_on_node(
             )
         }
         "node" => {
-            let Some(package) = plan.package.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let Some(package) = plan
+                .package
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
                 return crate::openclaw_skills::SkillInstallResult {
                     ok: false,
                     message: "missing node package".to_string(),
@@ -1934,7 +4182,12 @@ async fn run_skill_install_on_node(
             };
         }
         "go" => {
-            let Some(module) = plan.module.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let Some(module) = plan
+                .module
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
                 return crate::openclaw_skills::SkillInstallResult {
                     ok: false,
                     message: "missing go module".to_string(),
@@ -1956,7 +4209,12 @@ go install {module}"#,
             )
         }
         "uv" => {
-            let Some(package) = plan.package.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let Some(package) = plan
+                .package
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
                 return crate::openclaw_skills::SkillInstallResult {
                     ok: false,
                     message: "missing uv package".to_string(),
@@ -1976,7 +4234,12 @@ uv tool install {package}"#,
             )
         }
         "download" => {
-            let Some(url) = plan.url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let Some(url) = plan
+                .url
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
                 return crate::openclaw_skills::SkillInstallResult {
                     ok: false,
                     message: "missing download url".to_string(),
@@ -2351,7 +4614,174 @@ async fn wait_for_agent_run(run_id: &str, timeout_ms: u64) -> Option<AgentRunSna
     }
 }
 
-fn drbot_message_to_openclaw(msg: &Message) -> serde_json::Value {
+pub(crate) async fn openclaw_wait_for_agent_run_for_tool(
+    run_id: &str,
+    timeout_ms: u64,
+) -> Option<serde_json::Value> {
+    wait_for_agent_run(run_id, timeout_ms).await.map(|snap| {
+        json!({
+            "runId": run_id,
+            "status": snap.status,
+            "startedAt": snap.started_at,
+            "endedAt": snap.ended_at,
+            "error": snap.error,
+        })
+    })
+}
+
+pub(crate) async fn openclaw_start_agent_run_for_tool(
+    state: GatewayState,
+    run_id: String,
+    agent_id: String,
+    session_key: String,
+    message: String,
+    timeout_ms: Option<u64>,
+    extra_system_prompt: Option<String>,
+) -> Result<(), ErrorShape> {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "runId required",
+        ));
+    }
+
+    let agent_id = crate::openclaw_paths::normalize_agent_id(&agent_id);
+    let session_key = if session_key.trim().is_empty() {
+        "main".to_string()
+    } else {
+        session_key
+    };
+    let session_key = canonicalize_openclaw_session_key(&agent_id, &session_key);
+
+    let provider = state
+        .provider()
+        .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "provider not configured"))?;
+
+    let (_rx, created) = register_agent_run(&run_id).await;
+    if !created {
+        return Ok(());
+    }
+
+    let user_msg = openclaw_user_message_to_drbot(message.as_str(), &[]);
+    tokio::spawn(openclaw_spawn_agent_run_for_tool_task(
+        state,
+        provider,
+        run_id.clone(),
+        agent_id,
+        session_key,
+        user_msg,
+        timeout_ms,
+        extra_system_prompt,
+    ));
+
+    Ok(())
+}
+
+/// Run a single OpenClaw agent turn for the inbound webhook endpoints (best-effort).
+pub(crate) async fn openclaw_run_agent_for_webhook(
+    state: GatewayState,
+    peer: SocketAddr,
+    req_id: String,
+    run_id: String,
+    agent_id: String,
+    session_key: String,
+    message: String,
+    timeout_ms: Option<u64>,
+    extra_system_prompt: Option<String>,
+) -> Result<serde_json::Value, ErrorShape> {
+    let provider = state
+        .provider()
+        .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "provider not configured"))?;
+
+    let conn_id = format!("hook:{}", run_id);
+    let (tx, mut rx) = mpsc::unbounded_channel::<OpenclawOutbound>();
+    let queued_bytes = Arc::new(AtomicU64::new(0));
+    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let event_seq = Arc::new(AtomicU64::new(0));
+    let run_seq = Arc::new(Mutex::new(HashMap::new()));
+    let wizard_sessions = Arc::new(Mutex::new(HashMap::new()));
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
+    let ctx = ConnCtx {
+        state: state.clone(),
+        tx,
+        queued_bytes: queued_bytes.clone(),
+        closing: closing.clone(),
+        event_seq,
+        run_seq,
+        wizard_sessions,
+        shutdown_tx,
+        conn_id: conn_id.clone(),
+        peer,
+    };
+
+    let agent_id = crate::openclaw_paths::normalize_agent_id(&agent_id);
+    let session_key = if session_key.trim().is_empty() {
+        "main".to_string()
+    } else {
+        session_key
+    };
+    let session_key = canonicalize_openclaw_session_key(&agent_id, &session_key);
+
+    let timeout_ms = timeout_ms.map(|v| v.clamp(1_000, 900_000));
+    let wait_timeout_ms = timeout_ms.unwrap_or(120_000).clamp(1_000, 900_000);
+
+    let user_msg = Message::user(message);
+    tokio::spawn(spawn_agent_run(
+        ctx.clone(),
+        provider,
+        req_id.clone(),
+        run_id.clone(),
+        agent_id.clone(),
+        session_key,
+        user_msg,
+        timeout_ms,
+        extra_system_prompt,
+        None,
+    ));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_timeout_ms);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(ErrorShape::new(error_codes::AGENT_TIMEOUT, "timeout"));
+        }
+        let remain = deadline.saturating_duration_since(now);
+        let next = match tokio::time::timeout(remain, rx.recv()).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Err(ErrorShape::new(error_codes::UNAVAILABLE, "hook run closed"));
+            }
+            Err(_) => {
+                return Err(ErrorShape::new(error_codes::AGENT_TIMEOUT, "timeout"));
+            }
+        };
+
+        match next {
+            OpenclawOutbound::Text(text) => {
+                let parsed = serde_json::from_str::<GatewayFrame>(&text);
+                let Ok(GatewayFrame::Res(res)) = parsed else {
+                    continue;
+                };
+                if res.id != req_id {
+                    continue;
+                }
+                if res.ok {
+                    return Ok(res.payload.unwrap_or_else(|| json!({})));
+                }
+                return Err(res
+                    .error
+                    .unwrap_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "agent failed")));
+            }
+            OpenclawOutbound::Close { code: _, reason } => {
+                return Err(ErrorShape::new(error_codes::UNAVAILABLE, reason));
+            }
+        }
+    }
+}
+
+pub(crate) fn drbot_message_to_openclaw(msg: &Message) -> serde_json::Value {
     let role = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -2577,6 +5007,169 @@ fn assistant_message_from_text(text: &str) -> Message {
     Message::assistant(text)
 }
 
+fn resolve_openclaw_agent_name_for_response_prefix(state: &GatewayState, agent_id: &str) -> String {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let agents_file = load_openclaw_agents_file(state);
+    let cfg_entry = agents_file
+        .agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+
+    cfg_entry
+        .map(|c| c.name.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                "drbot".to_string()
+            } else {
+                agent_id
+            }
+        })
+}
+
+pub(crate) fn resolve_openclaw_outbound_response_prefix(
+    state: &GatewayState,
+    agent_id: &str,
+    channel: Option<&str>,
+    account_id: Option<&str>,
+) -> Option<String> {
+    let cfg = state.config();
+    let channel = channel.map(|raw| raw.trim()).filter(|s| !s.is_empty());
+    let channel = channel.map(|raw| {
+        let lowered = raw.to_ascii_lowercase();
+        match lowered.as_str() {
+            "imsg" => "imessage".to_string(),
+            "google-chat" | "gchat" => "googlechat".to_string(),
+            other => other.to_string(),
+        }
+    });
+
+    let account_id = account_id.map(|raw| raw.trim()).filter(|s| !s.is_empty());
+
+    let account_prefix = match (channel.as_deref(), account_id) {
+        (Some("telegram"), Some(account)) => cfg
+            .channels
+            .telegram
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("discord"), Some(account)) => cfg
+            .channels
+            .discord
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("slack"), Some(account)) => cfg
+            .channels
+            .slack
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("whatsapp"), Some(account)) => cfg
+            .channels
+            .whatsapp
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("signal"), Some(account)) => cfg
+            .channels
+            .signal
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("imessage"), Some(account)) => cfg
+            .channels
+            .imessage
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("matrix"), Some(account)) => cfg
+            .channels
+            .matrix
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("webchat"), Some(account)) => cfg
+            .channels
+            .webchat
+            .as_ref()
+            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        _ => None,
+    };
+
+    let channel_prefix = channel.as_deref().and_then(|ch| match ch {
+        "telegram" => cfg
+            .channels
+            .telegram
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "discord" => cfg
+            .channels
+            .discord
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "slack" => cfg
+            .channels
+            .slack
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "whatsapp" => cfg
+            .channels
+            .whatsapp
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "signal" => cfg
+            .channels
+            .signal
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "imessage" => cfg
+            .channels
+            .imessage
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "matrix" => cfg
+            .channels
+            .matrix
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        "webchat" => cfg
+            .channels
+            .webchat
+            .as_ref()
+            .and_then(|c| c.response_prefix.clone()),
+        _ => None,
+    });
+
+    let configured = account_prefix
+        .or(channel_prefix)
+        .or_else(|| cfg.messages.response_prefix.clone());
+    let Some(configured) = configured else {
+        return None;
+    };
+
+    if configured.trim().eq_ignore_ascii_case("auto") {
+        let name = resolve_openclaw_agent_name_for_response_prefix(state, agent_id);
+        if name.trim().is_empty() {
+            return None;
+        }
+        return Some(format!("[{}]", name.trim()));
+    }
+
+    Some(configured)
+}
+
+pub(crate) fn apply_openclaw_outbound_response_prefix(
+    state: &GatewayState,
+    agent_id: &str,
+    channel: Option<&str>,
+    account_id: Option<&str>,
+    message: &str,
+) -> String {
+    let Some(prefix) =
+        resolve_openclaw_outbound_response_prefix(state, agent_id, channel, account_id)
+    else {
+        return message.to_string();
+    };
+    if prefix.is_empty() || message.starts_with(prefix.as_str()) {
+        return message.to_string();
+    }
+    format!("{}{}", prefix, message)
+}
 fn error_response(
     id: &str,
     code: &str,
@@ -2604,7 +5197,71 @@ fn ok_response(id: &str, payload: serde_json::Value) -> GatewayFrame {
     })
 }
 
-async fn build_channels_snapshot(now: u64, state: &GatewayState) -> serde_json::Value {
+/// Dispatch-side result helper: maps `Result<Value, ErrorShape>` to the
+/// appropriate `GatewayFrame`.
+fn moltbook_dispatch_result(
+    id: &str,
+    res: std::result::Result<serde_json::Value, ErrorShape>,
+) -> GatewayFrame {
+    match res {
+        Ok(payload) => ok_response(id, payload),
+        Err(err) => GatewayFrame::Res(ResponseFrame {
+            id: id.to_string(),
+            ok: false,
+            payload: None,
+            error: Some(err),
+        }),
+    }
+}
+
+/// Dispatch-side Moltbook write approval gate.
+///
+/// Returns `Ok(true)` when writes are allowed, `Ok(false)` when `dry_run` is
+/// set, or an error `GatewayFrame` if approval is denied / times out.
+async fn moltbook_write_gate(
+    state: &GatewayState,
+    req_id: &str,
+    tool: &str,
+    command: &str,
+    ask: &str,
+    resolved_url: &str,
+    dry_run: bool,
+) -> std::result::Result<bool, GatewayFrame> {
+    let allowed_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if allowed_by_env {
+        return Ok(true);
+    }
+    if dry_run {
+        return Ok(false);
+    }
+    let approval = ExecApprovalRequestPayload {
+        command: command.to_string(),
+        cwd: None,
+        host: Some("moltbook".to_string()),
+        security: Some("integration-http-write".to_string()),
+        ask: Some(ask.to_string()),
+        agent_id: Some("default".to_string()),
+        resolved_path: Some(resolved_url.to_string()),
+        session_key: None,
+    };
+    if let Err(err) =
+        crate::openclaw_exec_approvals::ensure_tool_write_allowed(state, tool, approval, 120_000)
+            .await
+    {
+        return Err(GatewayFrame::Res(ResponseFrame {
+            id: req_id.to_string(),
+            ok: false,
+            payload: None,
+            error: Some(err),
+        }));
+    }
+    Ok(true)
+}
+
+async fn build_channels_snapshot(now: u64, state: &GatewayState, probe: bool) -> serde_json::Value {
     // Align ordering with OpenClaw's channel registry, but keep drbot-only channels too.
     let channel_order = vec![
         "telegram",
@@ -2625,6 +5282,9 @@ async fn build_channels_snapshot(now: u64, state: &GatewayState) -> serde_json::
     let whatsapp_login = state.openclaw_web_login().snapshot_whatsapp();
 
     let mut channel_labels = serde_json::Map::new();
+    let mut channel_detail_labels = serde_json::Map::new();
+    let mut channel_system_images = serde_json::Map::new();
+    let mut channel_meta: Vec<serde_json::Value> = Vec::new();
     let label_for = |key: &str| -> String {
         match key {
             "telegram" => "Telegram".to_string(),
@@ -2639,8 +5299,31 @@ async fn build_channels_snapshot(now: u64, state: &GatewayState) -> serde_json::
             other => other.to_string(),
         }
     };
+    let system_image_for = |key: &str| -> &'static str {
+        match key {
+            "telegram" => "paperplane",
+            "whatsapp" => "message",
+            "discord" => "gamecontroller",
+            "googlechat" => "bubble.left.and.bubble.right",
+            "slack" => "bubble.left.and.bubble.right",
+            "signal" => "lock.shield",
+            "imessage" => "message",
+            "matrix" => "square.grid.2x2",
+            "webchat" => "globe",
+            _ => "message",
+        }
+    };
     for key in &channel_order {
-        channel_labels.insert((*key).to_string(), json!(label_for(key)));
+        let label = label_for(key);
+        channel_labels.insert((*key).to_string(), json!(label.clone()));
+        channel_detail_labels.insert((*key).to_string(), json!(label.clone()));
+        channel_system_images.insert((*key).to_string(), json!(system_image_for(key).to_string()));
+        channel_meta.push(json!({
+            "id": (*key).to_string(),
+            "label": label.clone(),
+            "detailLabel": label,
+            "systemImage": system_image_for(key),
+        }));
     }
 
     let is_enabled = |name: &str| config.channels.enabled.iter().any(|c| c == name);
@@ -2661,8 +5344,14 @@ async fn build_channels_snapshot(now: u64, state: &GatewayState) -> serde_json::
     let mut channel_default_account_id = serde_json::Map::new();
 
     for key in &channel_order {
-        let configured = runtime.get(*key).map(|r| r.configured).unwrap_or_else(|| is_configured(key));
-        let enabled = runtime.get(*key).map(|r| r.enabled).unwrap_or_else(|| is_enabled(key));
+        let configured = runtime
+            .get(*key)
+            .map(|r| r.configured)
+            .unwrap_or_else(|| is_configured(key));
+        let enabled = runtime
+            .get(*key)
+            .map(|r| r.enabled)
+            .unwrap_or_else(|| is_enabled(key));
         let linked = if *key == "whatsapp" {
             configured && whatsapp_login.connected
         } else {
@@ -2684,38 +5373,89 @@ async fn build_channels_snapshot(now: u64, state: &GatewayState) -> serde_json::
         let last_inbound_at = rt.and_then(|r| r.last_inbound_at_ms);
         let last_outbound_at = rt.and_then(|r| r.last_outbound_at_ms);
 
+        let mut channel_summary = serde_json::Map::new();
+        channel_summary.insert("configured".to_string(), json!(configured));
+        channel_summary.insert("enabled".to_string(), json!(enabled));
+        channel_summary.insert("linked".to_string(), json!(linked));
+        channel_summary.insert("running".to_string(), json!(running));
+        channel_summary.insert("connected".to_string(), json!(connected));
+        channel_summary.insert("reconnectAttempts".to_string(), json!(reconnect_attempts));
+        channel_summary.insert("lastError".to_string(), json!(last_error.clone()));
+        channel_summary.insert("lastConnectedAt".to_string(), json!(last_connected_at));
+        channel_summary.insert("lastStartAt".to_string(), json!(last_start_at));
+        channel_summary.insert("lastStopAt".to_string(), json!(last_stop_at));
+        channel_summary.insert("lastInboundAt".to_string(), json!(last_inbound_at));
+        channel_summary.insert("lastOutboundAt".to_string(), json!(last_outbound_at));
+
+        let probe_payload = if probe {
+            let probe_error = if connected {
+                None
+            } else if !enabled {
+                Some("disabled".to_string())
+            } else if !configured {
+                Some("not configured".to_string())
+            } else if !running {
+                Some("stopped".to_string())
+            } else {
+                last_error
+                    .clone()
+                    .or_else(|| Some("not connected".to_string()))
+            };
+            Some(json!({ "ok": connected, "error": probe_error }))
+        } else {
+            None
+        };
+        if let Some(payload) = probe_payload.as_ref() {
+            channel_summary.insert("probe".to_string(), payload.clone());
+            channel_summary.insert("lastProbeAt".to_string(), json!(now));
+        }
+
+        if *key == "telegram" || *key == "discord" {
+            if configured {
+                channel_summary.insert("tokenSource".to_string(), json!("config"));
+            }
+        }
+        if *key == "slack" && configured {
+            channel_summary.insert("botTokenSource".to_string(), json!("config"));
+            channel_summary.insert("appTokenSource".to_string(), json!("config"));
+        }
+        if *key == "signal" {
+            let base_url = config
+                .channels
+                .signal
+                .as_ref()
+                .map(|c| c.socket_path.clone())
+                .unwrap_or_default();
+            channel_summary.insert("baseUrl".to_string(), json!(base_url));
+        }
+
         channels_obj.insert(
             (*key).to_string(),
-            json!({
-                "configured": configured,
-                "enabled": enabled,
-                "linked": linked,
-                "running": running,
-                "connected": connected,
-                "reconnectAttempts": reconnect_attempts,
-                "lastError": last_error,
-                "lastInboundAt": last_inbound_at,
-                "lastOutboundAt": last_outbound_at,
-            }),
+            serde_json::Value::Object(channel_summary),
         );
+
+        let mut account_snapshot = serde_json::Map::new();
+        account_snapshot.insert("accountId".to_string(), json!("default"));
+        account_snapshot.insert("enabled".to_string(), json!(enabled));
+        account_snapshot.insert("configured".to_string(), json!(configured));
+        account_snapshot.insert("linked".to_string(), json!(linked));
+        account_snapshot.insert("running".to_string(), json!(running));
+        account_snapshot.insert("connected".to_string(), json!(connected));
+        account_snapshot.insert("reconnectAttempts".to_string(), json!(reconnect_attempts));
+        account_snapshot.insert("lastConnectedAt".to_string(), json!(last_connected_at));
+        account_snapshot.insert("lastError".to_string(), json!(last_error));
+        account_snapshot.insert("lastStartAt".to_string(), json!(last_start_at));
+        account_snapshot.insert("lastStopAt".to_string(), json!(last_stop_at));
+        account_snapshot.insert("lastInboundAt".to_string(), json!(last_inbound_at));
+        account_snapshot.insert("lastOutboundAt".to_string(), json!(last_outbound_at));
+        if let Some(payload) = probe_payload {
+            account_snapshot.insert("probe".to_string(), payload);
+            account_snapshot.insert("lastProbeAt".to_string(), json!(now));
+        }
 
         channel_accounts.insert(
             (*key).to_string(),
-            json!([{
-                "accountId": "default",
-                "enabled": enabled,
-                "configured": configured,
-                "linked": linked,
-                "running": running,
-                "connected": connected,
-                "reconnectAttempts": reconnect_attempts,
-                "lastConnectedAt": last_connected_at,
-                "lastError": last_error,
-                "lastStartAt": last_start_at,
-                "lastStopAt": last_stop_at,
-                "lastInboundAt": last_inbound_at,
-                "lastOutboundAt": last_outbound_at,
-            }]),
+            serde_json::Value::Array(vec![serde_json::Value::Object(account_snapshot)]),
         );
         channel_default_account_id.insert((*key).to_string(), json!("default"));
     }
@@ -2724,6 +5464,9 @@ async fn build_channels_snapshot(now: u64, state: &GatewayState) -> serde_json::
         "ts": now,
         "channelOrder": channel_order,
         "channelLabels": channel_labels,
+        "channelDetailLabels": channel_detail_labels,
+        "channelSystemImages": channel_system_images,
+        "channelMeta": channel_meta,
         "channels": serde_json::Value::Object(channels_obj),
         "channelAccounts": channel_accounts,
         "channelDefaultAccountId": channel_default_account_id,
@@ -2747,31 +5490,1323 @@ fn build_config_schema() -> serde_json::Value {
                     "tls_key": { "type": ["string", "null"] }
                 }
             },
-            "providers": { "type": "object" },
-            "channels": { "type": "object" },
-            "storage": { "type": "object" },
-            "logging": { "type": "object" }
+            "hooks": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean" },
+                    "token": { "type": ["string", "null"] },
+                    "path": { "type": "string" },
+                    "maxBodyBytes": { "type": ["integer", "null"] },
+                    "maxMessageChars": { "type": ["integer", "null"] },
+                    "allowedAgentIds": { "type": "array", "items": { "type": "string" } },
+                    "allowRequestSessionKey": { "type": "boolean" },
+                    "defaultSessionKey": { "type": ["string", "null"] },
+                    "allowedSessionKeyPrefixes": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": {}
+            },
+            "providers": {
+                "type": "object",
+                "additionalProperties": {}
+            },
+            "channels": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": {}
+                }
+            },
+            "messages": {
+                "type": "object",
+                "properties": {
+                    "responsePrefix": { "type": ["string", "null"] }
+                },
+                "additionalProperties": {}
+            },
+            "storage": {
+                "type": "object",
+                "additionalProperties": {}
+            },
+            "logging": {
+                "type": "object",
+                "additionalProperties": {}
+            }
         }
     })
 }
 
-async fn handle_config_get() -> serde_json::Value {
+const CONFIG_SECRET_PLACEHOLDER: &str = "<redacted>";
+
+fn is_config_secret_key_name(key: &str) -> bool {
+    let normalized = key
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "");
+    // Also match common camelCase variants (apiKey/botToken) by removing underscores.
+    let compact = normalized.replace('_', "");
+
+    // OpenClaw v2026.2.12 parity: do not treat token-limit fields (maxTokens/max_token/etc)
+    // as secrets during redaction.
+    if matches!(compact.as_str(), "maxtoken" | "maxtokens") {
+        return false;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "auth_token"
+            | "api_key"
+            | "authorization"
+            | "bot_token"
+            | "app_token"
+            | "signing_secret"
+            | "access_token"
+            | "refresh_token"
+            | "client_secret"
+            | "password"
+            | "secret"
+    ) || matches!(
+        compact.as_str(),
+        "authtoken"
+            | "apikey"
+            | "authorization"
+            | "bottoken"
+            | "apptoken"
+            | "signingsecret"
+            | "accesstoken"
+            | "refreshtoken"
+            | "clientsecret"
+            | "password"
+            | "secret"
+    ) || normalized.contains("authorization")
+        || compact.contains("authorization")
+        || normalized.ends_with("_token")
+        || compact.ends_with("token")
+        || normalized.ends_with("_secret")
+        || compact.ends_with("secret")
+        || normalized.ends_with("_api_key")
+        || compact.ends_with("apikey")
+}
+
+fn redact_config_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (key, entry) in obj.iter_mut() {
+                if is_config_secret_key_name(key) {
+                    let should_redact = match entry {
+                        serde_json::Value::Null => false,
+                        serde_json::Value::String(s) => !s.trim().is_empty(),
+                        _ => true,
+                    };
+                    if should_redact {
+                        *entry = json!(CONFIG_SECRET_PLACEHOLDER);
+                    }
+                } else {
+                    redact_config_json(entry);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_config_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_config_raw_best_effort(raw: &str) -> String {
+    raw.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                return line.to_string();
+            }
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            let indent = &line[..indent_len];
+
+            let (body, comment) = match trimmed.split_once('#') {
+                Some((left, right)) => (left.trim_end(), Some(right)),
+                None => (trimmed, None),
+            };
+            let Some((key_raw, _value)) = body.split_once('=') else {
+                return line.to_string();
+            };
+            let key = key_raw.trim();
+            if key.is_empty() || !is_config_secret_key_name(key) {
+                return line.to_string();
+            }
+            let mut out = format!("{indent}{key} = \"{CONFIG_SECRET_PLACEHOLDER}\"");
+            if let Some(c) = comment {
+                out.push_str(" #");
+                out.push_str(c);
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_redaction_placeholder(value: &str) -> bool {
+    value.trim() == CONFIG_SECRET_PLACEHOLDER
+}
+
+fn strip_line_breaks(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn sanitize_secret_string(value: &mut String) {
+    let next = strip_line_breaks(value).trim().to_string();
+    if next != value.as_str() {
+        *value = next;
+    }
+}
+
+fn sanitize_secret_option(value: &mut Option<String>) {
+    let Some(current) = value.as_mut() else {
+        return;
+    };
+    let next = strip_line_breaks(current).trim().to_string();
+    if next.is_empty() {
+        *value = None;
+        return;
+    }
+    if next.eq_ignore_ascii_case("undefined") || next.eq_ignore_ascii_case("null") {
+        *value = None;
+        return;
+    }
+    if next != current.as_str() {
+        *current = next;
+    }
+}
+
+fn sanitize_config_secrets(cfg: &mut drbot_core::Config) {
+    sanitize_secret_option(&mut cfg.gateway.auth_token);
+    sanitize_secret_option(&mut cfg.hooks.token);
+
+    if let Some(provider) = cfg.providers.anthropic.as_mut() {
+        sanitize_secret_string(&mut provider.api_key);
+        for value in provider.headers.values_mut() {
+            sanitize_secret_string(value);
+        }
+    }
+    if let Some(provider) = cfg.providers.openai.as_mut() {
+        sanitize_secret_string(&mut provider.api_key);
+        for value in provider.headers.values_mut() {
+            sanitize_secret_string(value);
+        }
+    }
+    for provider in &mut cfg.providers.openai_compatible {
+        sanitize_secret_string(&mut provider.api_key);
+        for value in provider.headers.values_mut() {
+            sanitize_secret_string(value);
+        }
+    }
+
+    if let Some(channel) = cfg.channels.telegram.as_mut() {
+        sanitize_secret_string(&mut channel.bot_token);
+    }
+    if let Some(channel) = cfg.channels.discord.as_mut() {
+        sanitize_secret_string(&mut channel.bot_token);
+    }
+    if let Some(channel) = cfg.channels.slack.as_mut() {
+        sanitize_secret_string(&mut channel.bot_token);
+        sanitize_secret_string(&mut channel.app_token);
+        sanitize_secret_string(&mut channel.signing_secret);
+    }
+    if let Some(channel) = cfg.channels.matrix.as_mut() {
+        sanitize_secret_string(&mut channel.access_token);
+    }
+    if let Some(channel) = cfg.channels.webchat.as_mut() {
+        sanitize_secret_option(&mut channel.auth_token);
+    }
+}
+
+fn merge_redacted_config_secrets(next: &mut drbot_core::Config, prev: &drbot_core::Config) {
+    if let Some(next_token) = next.gateway.auth_token.as_deref() {
+        if is_redaction_placeholder(next_token) {
+            next.gateway.auth_token = prev.gateway.auth_token.clone();
+        }
+    }
+
+    if let Some(next_token) = next.hooks.token.as_deref() {
+        if is_redaction_placeholder(next_token) {
+            next.hooks.token = prev.hooks.token.clone();
+        }
+    }
+
+    if let Some(next) = next.providers.anthropic.as_mut() {
+        if is_redaction_placeholder(&next.api_key) {
+            if let Some(prev) = prev.providers.anthropic.as_ref() {
+                next.api_key = prev.api_key.clone();
+            }
+        }
+        if let Some(prev) = prev.providers.anthropic.as_ref() {
+            for (key, value) in next.headers.iter_mut() {
+                if is_redaction_placeholder(value) {
+                    if let Some(prev_value) = prev.headers.get(key) {
+                        *value = prev_value.clone();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(next) = next.providers.openai.as_mut() {
+        if is_redaction_placeholder(&next.api_key) {
+            if let Some(prev) = prev.providers.openai.as_ref() {
+                next.api_key = prev.api_key.clone();
+            }
+        }
+        if let Some(prev) = prev.providers.openai.as_ref() {
+            for (key, value) in next.headers.iter_mut() {
+                if is_redaction_placeholder(value) {
+                    if let Some(prev_value) = prev.headers.get(key) {
+                        *value = prev_value.clone();
+                    }
+                }
+            }
+        }
+    }
+    if !next.providers.openai_compatible.is_empty() {
+        let mut prev_by_name: HashMap<String, &drbot_core::config::OpenAICompatibleConfig> =
+            HashMap::new();
+        for entry in &prev.providers.openai_compatible {
+            let key = entry.name.trim();
+            if key.is_empty() {
+                continue;
+            }
+            prev_by_name.insert(key.to_string(), entry);
+        }
+        for entry in &mut next.providers.openai_compatible {
+            if let Some(prev_entry) = prev_by_name.get(entry.name.trim()) {
+                if is_redaction_placeholder(&entry.api_key) {
+                    entry.api_key = prev_entry.api_key.clone();
+                }
+                for (key, value) in entry.headers.iter_mut() {
+                    if is_redaction_placeholder(value) {
+                        if let Some(prev_value) = prev_entry.headers.get(key) {
+                            *value = prev_value.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(next) = next.channels.telegram.as_mut() {
+        if is_redaction_placeholder(&next.bot_token) {
+            if let Some(prev) = prev.channels.telegram.as_ref() {
+                next.bot_token = prev.bot_token.clone();
+            }
+        }
+    }
+    if let Some(next) = next.channels.discord.as_mut() {
+        if is_redaction_placeholder(&next.bot_token) {
+            if let Some(prev) = prev.channels.discord.as_ref() {
+                next.bot_token = prev.bot_token.clone();
+            }
+        }
+    }
+    if let Some(next) = next.channels.slack.as_mut() {
+        if let Some(prev) = prev.channels.slack.as_ref() {
+            if is_redaction_placeholder(&next.bot_token) {
+                next.bot_token = prev.bot_token.clone();
+            }
+            if is_redaction_placeholder(&next.app_token) {
+                next.app_token = prev.app_token.clone();
+            }
+            if is_redaction_placeholder(&next.signing_secret) {
+                next.signing_secret = prev.signing_secret.clone();
+            }
+        }
+    }
+    if let Some(next) = next.channels.matrix.as_mut() {
+        if is_redaction_placeholder(&next.access_token) {
+            if let Some(prev) = prev.channels.matrix.as_ref() {
+                next.access_token = prev.access_token.clone();
+            }
+        }
+    }
+    if let Some(next) = next.channels.webchat.as_mut() {
+        if let Some(next_token) = next.auth_token.as_deref() {
+            if is_redaction_placeholder(next_token) {
+                next.auth_token = prev
+                    .channels
+                    .webchat
+                    .as_ref()
+                    .and_then(|c| c.auth_token.clone());
+            }
+        }
+    }
+}
+
+fn sanitize_config_json_secret_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (key, entry) in obj.iter_mut() {
+                if is_config_secret_key_name(key) {
+                    if let Some(s) = entry.as_str() {
+                        let mut owned = s.to_string();
+                        sanitize_secret_string(&mut owned);
+                        *entry = json!(owned);
+                    } else {
+                        sanitize_config_json_secret_strings(entry);
+                    }
+                } else {
+                    sanitize_config_json_secret_strings(entry);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                sanitize_config_json_secret_strings(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn restore_redacted_config_json_secrets(value: &mut serde_json::Value, prev: &serde_json::Value) {
+    match (value, prev) {
+        (serde_json::Value::Object(next_obj), serde_json::Value::Object(prev_obj)) => {
+            for (key, entry) in next_obj.iter_mut() {
+                if is_config_secret_key_name(key) {
+                    if let Some(s) = entry.as_str() {
+                        if is_redaction_placeholder(s) {
+                            if let Some(prev_value) = prev_obj.get(key) {
+                                *entry = prev_value.clone();
+                            }
+                            continue;
+                        }
+                    }
+                }
+                if let Some(prev_value) = prev_obj.get(key) {
+                    restore_redacted_config_json_secrets(entry, prev_value);
+                }
+            }
+        }
+        (serde_json::Value::Array(next_items), serde_json::Value::Array(prev_items)) => {
+            for (idx, entry) in next_items.iter_mut().enumerate() {
+                if let Some(prev_entry) = prev_items.get(idx) {
+                    restore_redacted_config_json_secrets(entry, prev_entry);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redact_config_json_replaces_secret_values() {
+        let mut value = json!({
+            "gateway": { "host": "127.0.0.1", "auth_token": "secret" },
+            "providers": { "openai": { "api_key": "sk-123", "base_url": "https://example.com", "maxTokens": 123, "maxToken": 456, "max_token": 789 } },
+            "channels": {
+                "telegram": { "bot_token": "tg-123" },
+                "slack": { "bot_token": "x", "app_token": "y", "signing_secret": "z" },
+                "matrix": { "access_token": "m" },
+                "webchat": { "auth_token": "w" }
+            }
+        });
+
+        redact_config_json(&mut value);
+
+        assert_eq!(
+            value
+                .get("gateway")
+                .and_then(|v| v.get("auth_token"))
+                .and_then(|v| v.as_str()),
+            Some(CONFIG_SECRET_PLACEHOLDER)
+        );
+        assert_eq!(
+            value
+                .get("providers")
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("api_key"))
+                .and_then(|v| v.as_str()),
+            Some(CONFIG_SECRET_PLACEHOLDER)
+        );
+        assert_eq!(
+            value
+                .get("providers")
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            value
+                .get("providers")
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("maxTokens"))
+                .and_then(|v| v.as_u64()),
+            Some(123)
+        );
+        assert_eq!(
+            value
+                .get("providers")
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("maxToken"))
+                .and_then(|v| v.as_u64()),
+            Some(456)
+        );
+        assert_eq!(
+            value
+                .get("providers")
+                .and_then(|v| v.get("openai"))
+                .and_then(|v| v.get("max_token"))
+                .and_then(|v| v.as_u64()),
+            Some(789)
+        );
+        assert_eq!(
+            value
+                .get("channels")
+                .and_then(|v| v.get("slack"))
+                .and_then(|v| v.get("signing_secret"))
+                .and_then(|v| v.as_str()),
+            Some(CONFIG_SECRET_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn merge_redacted_config_secrets_preserves_previous_values() {
+        use drbot_core::config::{
+            AnthropicConfig, ChannelsConfig, DiscordConfig, GatewayConfig, HooksConfig,
+            MatrixConfig, MessagesConfig, OpenAICompatibleConfig, OpenAIConfig, ProvidersConfig,
+            SlackConfig, TelegramConfig, WebChatConfig,
+        };
+
+        let prev = drbot_core::Config {
+            gateway: GatewayConfig {
+                host: "127.0.0.1".to_string(),
+                port: 18789,
+                auth_token: Some("prev-gw".to_string()),
+                tls_enabled: false,
+                tls_cert: None,
+                tls_key: None,
+            },
+            hooks: HooksConfig {
+                enabled: true,
+                token: Some("prev-hooks".to_string()),
+                ..HooksConfig::default()
+            },
+            providers: ProvidersConfig {
+                default_provider: None,
+                default_model: None,
+                anthropic: Some(AnthropicConfig {
+                    api_key: "prev-anthropic".to_string(),
+                    base_url: None,
+                    headers: HashMap::new(),
+                    default_model: None,
+                    max_tokens: None,
+                }),
+                openai: Some(OpenAIConfig {
+                    api_key: "prev-openai".to_string(),
+                    base_url: None,
+                    headers: HashMap::new(),
+                    organization: None,
+                    default_model: None,
+                }),
+                ollama: None,
+                bedrock: None,
+                cli: Vec::new(),
+                openai_compatible: vec![OpenAICompatibleConfig {
+                    name: "openrouter".to_string(),
+                    api_key: "prev-openrouter".to_string(),
+                    base_url: "https://openrouter.ai/api/v1".to_string(),
+                    default_model: None,
+                    headers: HashMap::new(),
+                }],
+            },
+            channels: ChannelsConfig {
+                enabled: Vec::new(),
+                telegram: Some(TelegramConfig {
+                    bot_token: "prev-tg".to_string(),
+                    response_prefix: None,
+                    accounts: HashMap::new(),
+                    allowed_users: Vec::new(),
+                    allowed_chats: Vec::new(),
+                }),
+                discord: Some(DiscordConfig {
+                    bot_token: "prev-discord".to_string(),
+                    application_id: "app".to_string(),
+                    response_prefix: None,
+                    accounts: HashMap::new(),
+                    allowed_guilds: Vec::new(),
+                }),
+                slack: Some(SlackConfig {
+                    bot_token: "prev-slack-bot".to_string(),
+                    app_token: "prev-slack-app".to_string(),
+                    signing_secret: "prev-slack-signing".to_string(),
+                    response_prefix: None,
+                    accounts: HashMap::new(),
+                }),
+                whatsapp: None,
+                signal: None,
+                imessage: None,
+                matrix: Some(MatrixConfig {
+                    homeserver_url: "https://m.example".to_string(),
+                    user_id: "@u:m.example".to_string(),
+                    access_token: "prev-matrix".to_string(),
+                    response_prefix: None,
+                    accounts: HashMap::new(),
+                    allowed_rooms: Vec::new(),
+                }),
+                webchat: Some(WebChatConfig {
+                    port: 8080,
+                    host: "127.0.0.1".to_string(),
+                    require_auth: false,
+                    auth_token: Some("prev-webchat".to_string()),
+                    response_prefix: None,
+                    accounts: HashMap::new(),
+                }),
+            },
+            messages: MessagesConfig::default(),
+            storage: drbot_core::config::StorageConfig {
+                database_path: std::path::PathBuf::from("db"),
+                media_path: std::path::PathBuf::from("media"),
+            },
+            logging: drbot_core::config::LoggingConfig {
+                level: "info".to_string(),
+                format: "pretty".to_string(),
+                file: None,
+            },
+        };
+
+        let mut next = prev.clone();
+        next.gateway.auth_token = Some(CONFIG_SECRET_PLACEHOLDER.to_string());
+        next.hooks.token = Some(CONFIG_SECRET_PLACEHOLDER.to_string());
+        next.providers.anthropic.as_mut().unwrap().api_key = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.providers.openai.as_mut().unwrap().api_key = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.providers.openai_compatible[0].api_key = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.telegram.as_mut().unwrap().bot_token = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.discord.as_mut().unwrap().bot_token = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.slack.as_mut().unwrap().bot_token = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.slack.as_mut().unwrap().app_token = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.slack.as_mut().unwrap().signing_secret =
+            CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.matrix.as_mut().unwrap().access_token = CONFIG_SECRET_PLACEHOLDER.to_string();
+        next.channels.webchat.as_mut().unwrap().auth_token =
+            Some(CONFIG_SECRET_PLACEHOLDER.to_string());
+
+        merge_redacted_config_secrets(&mut next, &prev);
+
+        assert_eq!(next.gateway.auth_token.as_deref(), Some("prev-gw"));
+        assert_eq!(next.hooks.token.as_deref(), Some("prev-hooks"));
+        assert_eq!(
+            next.providers.anthropic.as_ref().unwrap().api_key,
+            "prev-anthropic"
+        );
+        assert_eq!(
+            next.providers.openai.as_ref().unwrap().api_key,
+            "prev-openai"
+        );
+        assert_eq!(
+            next.providers.openai_compatible[0].api_key,
+            "prev-openrouter"
+        );
+        assert_eq!(
+            next.channels.telegram.as_ref().unwrap().bot_token,
+            "prev-tg"
+        );
+        assert_eq!(
+            next.channels.discord.as_ref().unwrap().bot_token,
+            "prev-discord"
+        );
+        assert_eq!(
+            next.channels.slack.as_ref().unwrap().signing_secret,
+            "prev-slack-signing"
+        );
+        assert_eq!(
+            next.channels.matrix.as_ref().unwrap().access_token,
+            "prev-matrix"
+        );
+        assert_eq!(
+            next.channels
+                .webchat
+                .as_ref()
+                .unwrap()
+                .auth_token
+                .as_deref(),
+            Some("prev-webchat")
+        );
+    }
+
+    #[test]
+    fn sanitize_config_secrets_strips_embedded_newlines() {
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = Some("line1\nline2\r\n".to_string());
+        cfg.providers.openai = Some(drbot_core::config::OpenAIConfig {
+            api_key: "sk-123\n".to_string(),
+            base_url: None,
+            headers: HashMap::from_iter([("Authorization".to_string(), "Bearer a\nb".to_string())]),
+            organization: None,
+            default_model: None,
+        });
+        cfg.providers.openai_compatible = vec![drbot_core::config::OpenAICompatibleConfig {
+            name: "xai".to_string(),
+            api_key: "key\r\n123".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            default_model: None,
+            headers: HashMap::from_iter([("Authorization".to_string(), "Bearer a\nb".to_string())]),
+        }];
+        cfg.channels.slack = Some(drbot_core::config::SlackConfig {
+            bot_token: "x\n".to_string(),
+            app_token: "y\r\n".to_string(),
+            signing_secret: "z\n".to_string(),
+            response_prefix: None,
+            accounts: HashMap::new(),
+        });
+        cfg.channels.webchat = Some(drbot_core::config::WebChatConfig {
+            port: 8080,
+            host: "127.0.0.1".to_string(),
+            require_auth: true,
+            auth_token: Some("w\n".to_string()),
+            response_prefix: None,
+            accounts: HashMap::new(),
+        });
+
+        sanitize_config_secrets(&mut cfg);
+
+        assert_eq!(cfg.gateway.auth_token.as_deref(), Some("line1line2"));
+        assert_eq!(
+            cfg.providers.openai.as_ref().unwrap().api_key.as_str(),
+            "sk-123"
+        );
+        assert_eq!(
+            cfg.providers.openai_compatible[0].api_key.as_str(),
+            "key123"
+        );
+        assert_eq!(
+            cfg.providers.openai_compatible[0]
+                .headers
+                .get("Authorization")
+                .map(|s| s.as_str()),
+            Some("Bearer ab")
+        );
+        assert_eq!(cfg.channels.slack.as_ref().unwrap().bot_token.as_str(), "x");
+        assert_eq!(cfg.channels.slack.as_ref().unwrap().app_token.as_str(), "y");
+        assert_eq!(
+            cfg.channels.slack.as_ref().unwrap().signing_secret.as_str(),
+            "z"
+        );
+        assert_eq!(
+            cfg.channels.webchat.as_ref().unwrap().auth_token.as_deref(),
+            Some("w")
+        );
+    }
+
+    #[test]
+    fn sanitize_config_secrets_clears_undefined_tokens() {
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = Some("undefined".to_string());
+        cfg.hooks.token = Some("undefined".to_string());
+        cfg.channels.webchat = Some(drbot_core::config::WebChatConfig {
+            port: 8080,
+            host: "127.0.0.1".to_string(),
+            require_auth: true,
+            auth_token: Some("undefined".to_string()),
+            response_prefix: None,
+            accounts: HashMap::new(),
+        });
+
+        sanitize_config_secrets(&mut cfg);
+
+        assert!(cfg.gateway.auth_token.is_none());
+        assert!(cfg.hooks.token.is_none());
+        assert!(cfg
+            .channels
+            .webchat
+            .as_ref()
+            .unwrap()
+            .auth_token
+            .as_deref()
+            .is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod sessions_compact_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sessions_compact_archives_and_summarizes() {
+        let base =
+            std::env::temp_dir().join(format!("drbot-sessions-compact-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+
+        let state = GatewayState::new(cfg);
+        let store = state
+            .session_store()
+            .expect("session store not configured")
+            .clone();
+
+        let user_id = Uuid::new_v4();
+        let mut session = drbot_core::session::Session::new(user_id, "openclaw", "main");
+        for i in 0..30 {
+            session.add_message(Message::user(format!("user {}", i)));
+            session.add_message(Message::assistant(format!("assistant {}", i)));
+        }
+        let total_messages = session.messages.len();
+
+        store.create(&session).await.unwrap();
+
+        let max_lines = 10;
+        let res = handle_sessions_compact(&state, "main", max_lines)
+            .await
+            .expect("sessions.compact failed");
+
+        assert_eq!(res.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(res.get("compacted").and_then(|v| v.as_bool()), Some(true));
+
+        let archived_path = res
+            .get("archived")
+            .and_then(|v| v.as_str())
+            .expect("missing archived path");
+        let archived_count = res
+            .get("archivedCount")
+            .and_then(|v| v.as_u64())
+            .expect("missing archivedCount") as usize;
+        let kept = res
+            .get("kept")
+            .and_then(|v| v.as_u64())
+            .expect("missing kept") as usize;
+
+        let expected_archived = total_messages.saturating_sub(max_lines.saturating_sub(1));
+        assert_eq!(archived_count, expected_archived);
+        assert_eq!(kept, max_lines);
+
+        let archived_raw = std::fs::read_to_string(archived_path).expect("archive file missing");
+        let archived_lines: Vec<&str> = archived_raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(archived_lines.len(), archived_count);
+        for line in &archived_lines {
+            let _: Message = serde_json::from_str(line).expect("invalid archive jsonl line");
+        }
+
+        let updated = store
+            .get_by_channel("openclaw", "main")
+            .await
+            .unwrap()
+            .expect("updated session missing");
+        assert_eq!(updated.messages.len(), max_lines);
+        assert_eq!(updated.messages[0].role, Role::Assistant);
+        let summary = updated.messages[0].text_content();
+        assert!(summary.contains("Session compacted"));
+        assert!(summary.contains(&format!("Archived {} messages", archived_count)));
+        assert!(summary.contains("Archive file:"));
+
+        let tail_start = total_messages.saturating_sub(max_lines.saturating_sub(1));
+        assert_eq!(
+            updated.messages[1].text_content(),
+            session.messages[tail_start].text_content()
+        );
+        assert_eq!(
+            updated.messages.last().unwrap().text_content(),
+            session.messages.last().unwrap().text_content()
+        );
+    }
+}
+
+#[cfg(test)]
+mod exec_ask_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_exec_ask_mode_from_sidecar() {
+        let base =
+            std::env::temp_dir().join(format!("drbot-openclaw-exec-ask-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+
+        let state = GatewayState::new(cfg);
+        let canonical =
+            canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, "main");
+
+        // Default when unset.
+        let file = OpenclawSessionsSidecarFile {
+            version: 1,
+            entries: HashMap::new(),
+        };
+        save_openclaw_sessions_sidecar(&state, crate::openclaw_paths::DEFAULT_AGENT_ID, &file)
+            .unwrap();
+        assert_eq!(
+            resolve_openclaw_session_exec_ask_mode(&state, "main"),
+            OpenclawExecAskMode::Ask
+        );
+
+        // deny => Deny
+        let mut entries = HashMap::new();
+        entries.insert(canonical.clone(), json!({ "execAsk": "deny" }));
+        let file = OpenclawSessionsSidecarFile {
+            version: 1,
+            entries,
+        };
+        save_openclaw_sessions_sidecar(&state, crate::openclaw_paths::DEFAULT_AGENT_ID, &file)
+            .unwrap();
+        assert_eq!(
+            resolve_openclaw_session_exec_ask_mode(&state, "main"),
+            OpenclawExecAskMode::Deny
+        );
+
+        // never => Allow
+        let mut entries = HashMap::new();
+        entries.insert(canonical.clone(), json!({ "execAsk": "never" }));
+        let file = OpenclawSessionsSidecarFile {
+            version: 1,
+            entries,
+        };
+        save_openclaw_sessions_sidecar(&state, crate::openclaw_paths::DEFAULT_AGENT_ID, &file)
+            .unwrap();
+        assert_eq!(
+            resolve_openclaw_session_exec_ask_mode(&state, "main"),
+            OpenclawExecAskMode::Allow
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_filter_tests {
+    use super::*;
+
+    #[test]
+    fn tool_filter_applies_tools_by_sender_over_group_tools() {
+        let base = std::env::temp_dir().join(format!(
+            "drbot-openclaw-tool-filter-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+
+        let state = GatewayState::new(cfg);
+
+        let policy_path = base.join("tool-policy.json");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "rules": [{
+                    "match": { "keyPrefix": "whatsapp:group:" },
+                    "tools": { "allow": ["read"] },
+                    "toolsBySender": {
+                        "alice": { "allow": ["read", "exec"] }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let alice = resolve_openclaw_tool_filter(&state, "whatsapp:group:family", Some("alice"));
+        assert!(alice.is_allowed("read"));
+        assert!(alice.is_allowed("exec"));
+        assert!(
+            alice.is_allowed("apply_patch"),
+            "exec allowlist should imply apply_patch"
+        );
+
+        let bob = resolve_openclaw_tool_filter(&state, "whatsapp:group:family", Some("bob"));
+        assert!(bob.is_allowed("read"));
+        assert!(!bob.is_allowed("exec"));
+        assert!(!bob.is_allowed("apply_patch"));
+    }
+
+    #[test]
+    fn tool_filter_hard_deny_beats_allow_and_inference() {
+        let base = std::env::temp_dir().join(format!(
+            "drbot-openclaw-tool-filter-hard-deny-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+
+        let state = GatewayState::new(cfg);
+
+        let policy_path = base.join("tool-policy.json");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "hardDeny": ["exec"],
+                "rules": [{
+                    "match": { "keyPrefix": "whatsapp:group:" },
+                    "tools": { "allow": ["read", "exec"] }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let filter = resolve_openclaw_tool_filter(&state, "whatsapp:group:trusted", None);
+        assert!(!filter.is_allowed("exec"));
+        assert!(
+            !filter.is_allowed("apply_patch"),
+            "apply_patch should not be allowed via exec inference when exec is hard-denied"
+        );
+        assert!(filter.is_allowed("read"));
+    }
+}
+
+#[cfg(test)]
+mod effective_tool_filter_tests {
+    use super::*;
+
+    #[test]
+    fn effective_tool_filter_respects_global_tools_allowlist_with_message_alias() {
+        let base = std::env::temp_dir().join(format!(
+            "drbot-openclaw-effective-tool-filter-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+        let state = GatewayState::new(cfg);
+
+        let tools_path = resolve_openclaw_tools_config_path(&state);
+        std::fs::write(
+            &tools_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "tools": {
+                    "allow": ["message"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let filter = resolve_openclaw_effective_tool_filter(
+            &state,
+            "whatsapp:group:family",
+            None,
+            "default",
+        );
+        assert!(
+            filter.is_allowed("send"),
+            "message allowlist should enable send"
+        );
+        assert!(
+            filter.is_allowed("poll"),
+            "message allowlist should enable poll"
+        );
+        assert!(
+            !filter.is_allowed("exec"),
+            "message allowlist should not enable unrelated tools"
+        );
+    }
+
+    #[test]
+    fn effective_tool_filter_applies_profile_also_allow() {
+        let base = std::env::temp_dir().join(format!(
+            "drbot-openclaw-effective-tool-filter-profile-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+        let state = GatewayState::new(cfg);
+
+        let tools_path = resolve_openclaw_tools_config_path(&state);
+        std::fs::write(
+            &tools_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "tools": {
+                    "profile": "coding",
+                    "alsoAllow": ["message"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let filter = resolve_openclaw_effective_tool_filter(
+            &state,
+            "whatsapp:group:family",
+            None,
+            "default",
+        );
+        assert!(
+            filter.is_allowed("read"),
+            "coding profile should enable fs tools"
+        );
+        assert!(
+            filter.is_allowed("process"),
+            "coding profile should enable runtime tools (process)"
+        );
+        assert!(
+            filter.is_allowed("sessions_send"),
+            "coding profile should enable sessions tools"
+        );
+        assert!(
+            filter.is_allowed("memory_search"),
+            "coding profile should enable memory tools"
+        );
+        assert!(
+            filter.is_allowed("send"),
+            "alsoAllow message should enable send even when profile blocks it"
+        );
+    }
+
+    #[test]
+    fn effective_tool_filter_messaging_profile_enables_message_aliases() {
+        let base = std::env::temp_dir().join(format!(
+            "drbot-openclaw-effective-tool-filter-messaging-profile-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut cfg = drbot_core::Config::default();
+        cfg.gateway.auth_token = None;
+        cfg.storage.database_path = base.join("drbot.db");
+        cfg.storage.media_path = base.join("media");
+        let state = GatewayState::new(cfg);
+
+        let tools_path = resolve_openclaw_tools_config_path(&state);
+        std::fs::write(
+            &tools_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "tools": {
+                    "profile": "messaging"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let filter = resolve_openclaw_effective_tool_filter(
+            &state,
+            "whatsapp:group:family",
+            None,
+            "default",
+        );
+        assert!(
+            filter.is_allowed("message"),
+            "messaging profile should enable message tool"
+        );
+        assert!(
+            filter.is_allowed("send"),
+            "messaging profile should enable send via message allowlist aliasing"
+        );
+        assert!(
+            filter.is_allowed("poll"),
+            "messaging profile should enable poll via message allowlist aliasing"
+        );
+        assert!(
+            filter.is_allowed("sessions_send"),
+            "messaging profile should include key session tools"
+        );
+        assert!(
+            !filter.is_allowed("exec"),
+            "messaging profile should not enable exec/runtime tools by default"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_key_tests {
+    use super::*;
+
+    #[test]
+    fn canonicalizes_group_aware_channel_ids() {
+        assert_eq!(
+            canonicalize_openclaw_session_key(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                "slack:C123"
+            ),
+            "agent:default:slack:channel:C123"
+        );
+        assert_eq!(
+            canonicalize_openclaw_session_key(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                "slack:channel:C123"
+            ),
+            "agent:default:slack:channel:C123"
+        );
+        assert_eq!(
+            canonicalize_openclaw_session_key(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                "telegram:-100123"
+            ),
+            "agent:default:telegram:group:-100123"
+        );
+    }
+}
+
+fn compute_openclaw_config_hash_parts(
+    config_raw: &str,
+    agents_raw: &str,
+    tools_raw: &str,
+    memory_raw: &str,
+) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(config_raw.as_bytes());
+    bytes.extend_from_slice(b"\n--openclaw-agents.json--\n");
+    bytes.extend_from_slice(agents_raw.as_bytes());
+    bytes.extend_from_slice(b"\n--openclaw-tools.json--\n");
+    bytes.extend_from_slice(tools_raw.as_bytes());
+    bytes.extend_from_slice(b"\n--openclaw-memory.json--\n");
+    bytes.extend_from_slice(memory_raw.as_bytes());
+    sha256_hex_bytes(&bytes)
+}
+
+fn load_openclaw_config_file_raw(path: &PathBuf) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn openclaw_config_any_source_exists(state: &GatewayState, config_exists: bool) -> bool {
+    if config_exists {
+        return true;
+    }
+    let agents_path = resolve_openclaw_agents_path(state);
+    if agents_path.exists() {
+        return true;
+    }
+    let tools_path = resolve_openclaw_tools_config_path(state);
+    if tools_path.exists() {
+        return true;
+    }
+    let memory_path = resolve_openclaw_memory_config_path(state);
+    memory_path.exists()
+}
+
+fn compute_openclaw_config_hash_for_state(
+    state: &GatewayState,
+    config_exists: bool,
+    config_raw: &str,
+) -> String {
+    let config_raw_for_hash = if config_exists { config_raw } else { "" };
+    let agents_raw = load_openclaw_config_file_raw(&resolve_openclaw_agents_path(state));
+    let tools_raw = load_openclaw_config_file_raw(&resolve_openclaw_tools_config_path(state));
+    let memory_raw = load_openclaw_config_file_raw(&resolve_openclaw_memory_config_path(state));
+    compute_openclaw_config_hash_parts(config_raw_for_hash, &agents_raw, &tools_raw, &memory_raw)
+}
+
+pub(crate) async fn handle_config_get(state: &GatewayState) -> serde_json::Value {
     let path = resolve_config_path_for_read();
     let exists = path.exists();
 
-    let raw = if exists {
+    let raw_unredacted = if exists {
         std::fs::read_to_string(&path).ok()
     } else {
         // Provide a reasonable starting point for the UI even if no config exists yet.
         toml::to_string_pretty(&drbot_core::Config::default()).ok()
     };
 
-    let raw_str = raw.clone().unwrap_or_default();
-    let hash = sha256_hex(&raw_str);
-    let (parsed, valid, issues) = match toml::from_str::<serde_json::Value>(&raw_str) {
-        Ok(v) => (v, true, Vec::<String>::new()),
-        Err(e) => (json!({}), false, vec![e.to_string()]),
+    let raw_str = raw_unredacted.clone().unwrap_or_default();
+    let hash = compute_openclaw_config_hash_for_state(state, exists, &raw_str);
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("toml")
+        .to_ascii_lowercase();
+
+    // Parse config into a JSON-ish value so the UI can operate in JSON mode.
+    // We keep the underlying drbot config file format (TOML by default).
+    let parsed_unredacted: Result<serde_json::Value, String> = if ext == "json" {
+        json5::from_str(&raw_str).map_err(|e| e.to_string())
+    } else {
+        toml::from_str::<serde_json::Value>(&raw_str).map_err(|e| e.to_string())
     };
+
+    let config_valid: Result<drbot_core::Config, String> = if ext == "json" {
+        json5::from_str::<serde_json::Value>(&raw_str)
+            .map_err(|e| e.to_string())
+            .and_then(|v| {
+                serde_json::from_value::<drbot_core::Config>(v).map_err(|e| e.to_string())
+            })
+    } else {
+        toml::from_str::<drbot_core::Config>(&raw_str).map_err(|e| e.to_string())
+    };
+
+    let mut issues: Vec<String> = Vec::new();
+    let parsed_unredacted = match parsed_unredacted {
+        Ok(v) => v,
+        Err(e) => {
+            issues.push(e);
+            json!({})
+        }
+    };
+
+    let cfg_struct = match config_valid {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            issues.push(e);
+            None
+        }
+    };
+    let valid = cfg_struct.is_some();
+
+    // Augment the drbot config snapshot with OpenClaw-style agent/tool config.
+    let mut combined_unredacted = if parsed_unredacted.is_object() {
+        parsed_unredacted
+    } else if let Some(cfg) = cfg_struct.as_ref() {
+        serde_json::to_value(cfg).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !combined_unredacted.is_object() {
+        combined_unredacted = json!({});
+    }
+    let tools_file = load_openclaw_tools_config_file(state);
+    let tools_value = serde_json::to_value(&tools_file.tools).unwrap_or_else(|_| json!({}));
+    let memory_file = load_openclaw_memory_config_file(state);
+    let memory_value = serde_json::to_value(&memory_file.memory).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = combined_unredacted.as_object_mut() {
+        obj.insert("tools".to_string(), tools_value);
+        obj.insert(
+            "agents".to_string(),
+            build_openclaw_agents_config_snapshot(state, cfg_struct.as_ref()),
+        );
+        obj.insert("memory".to_string(), memory_value);
+    }
+
+    let mut parsed = combined_unredacted.clone();
+    redact_config_json(&mut parsed);
+
+    // Return JSON (not TOML) so OpenClaw Control UI's default "form" mode can save.
+    let rendered = serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| "{}".to_string());
+    let raw = Some(format!("{rendered}\n"));
 
     json!({
         "path": path.to_string_lossy(),
@@ -2785,7 +6820,7 @@ async fn handle_config_get() -> serde_json::Value {
     })
 }
 
-async fn handle_config_schema() -> serde_json::Value {
+pub(crate) async fn handle_config_schema() -> serde_json::Value {
     json!({
         "schema": build_config_schema(),
         "uiHints": {},
@@ -2794,7 +6829,603 @@ async fn handle_config_schema() -> serde_json::Value {
     })
 }
 
-async fn handle_config_set(
+fn build_openclaw_agents_config_snapshot(
+    state: &GatewayState,
+    cfg: Option<&drbot_core::Config>,
+) -> serde_json::Value {
+    let default_workspace =
+        resolve_agent_workspace_dir_for_state(state, crate::openclaw_paths::DEFAULT_AGENT_ID)
+            .to_string_lossy()
+            .to_string();
+    let default_model = cfg.and_then(|c| c.providers.default_model.clone());
+
+    let mut models: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    if let Some(provider) = state.provider() {
+        for model in provider.models() {
+            let id = model.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let alias = model.name.trim();
+            let payload = if alias.is_empty() {
+                json!({})
+            } else {
+                json!({ "alias": alias })
+            };
+            models.insert(id.to_string(), payload);
+        }
+    }
+
+    let agent_ids = list_agent_ids_for_state(state);
+    let agents_file = load_openclaw_agents_file(state);
+    let default_subagent_thinking = agents_file
+        .defaults
+        .subagents
+        .as_ref()
+        .and_then(|s| s.thinking.clone());
+    let default_image_model = agents_file.defaults.image_model.clone();
+    let mut list: Vec<serde_json::Value> = Vec::new();
+
+    for agent_id in agent_ids {
+        let agent_id = crate::openclaw_paths::normalize_agent_id(&agent_id);
+        let cfg_entry = agents_file
+            .agents
+            .iter()
+            .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+
+        let name = cfg_entry
+            .map(|c| c.name.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                    "drbot".to_string()
+                } else {
+                    agent_id.clone()
+                }
+            });
+
+        let workspace = cfg_entry
+            .map(|c| c.workspace.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                resolve_agent_workspace_dir_for_state(state, &agent_id)
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".to_string(), json!(agent_id));
+        obj.insert("name".to_string(), json!(name));
+        obj.insert("workspace".to_string(), json!(workspace));
+
+        if let Some(model) = cfg_entry.and_then(|c| c.model.clone()) {
+            obj.insert("model".to_string(), model);
+        }
+        obj.insert(
+            "imageModel".to_string(),
+            serde_json::to_value(cfg_entry.and_then(|c| c.image_model.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(skills) = cfg_entry.and_then(|c| c.skills.clone()) {
+            obj.insert("skills".to_string(), json!(skills));
+        }
+        if let Some(tools) = cfg_entry.and_then(|c| c.tools.clone()) {
+            obj.insert(
+                "tools".to_string(),
+                serde_json::to_value(tools).unwrap_or_else(|_| json!({})),
+            );
+        }
+
+        let agent_subagent_thinking = cfg_entry
+            .and_then(|c| c.subagents.as_ref())
+            .and_then(|s| s.thinking.clone());
+        obj.insert(
+            "subagents".to_string(),
+            json!({ "thinking": agent_subagent_thinking }),
+        );
+
+        list.push(serde_json::Value::Object(obj));
+    }
+
+    json!({
+        "defaults": {
+            "workspace": default_workspace,
+            "model": default_model,
+            "imageModel": default_image_model,
+            "models": serde_json::Value::Object(models),
+            "subagents": { "thinking": default_subagent_thinking },
+        },
+        "list": list,
+    })
+}
+
+fn parse_config_value_for_path(path: &PathBuf, raw: &str) -> Result<serde_json::Value, String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("toml")
+        .to_ascii_lowercase();
+    if ext == "json" {
+        json5::from_str::<serde_json::Value>(raw).map_err(|e| e.to_string())
+    } else {
+        toml::from_str::<serde_json::Value>(raw).map_err(|e| e.to_string())
+    }
+}
+
+fn parse_config_struct_for_path(path: &PathBuf, raw: &str) -> Result<drbot_core::Config, String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("toml")
+        .to_ascii_lowercase();
+    if ext == "json" {
+        json5::from_str::<serde_json::Value>(raw)
+            .map_err(|e| e.to_string())
+            .and_then(|v| {
+                serde_json::from_value::<drbot_core::Config>(v).map_err(|e| e.to_string())
+            })
+    } else {
+        toml::from_str::<drbot_core::Config>(raw).map_err(|e| e.to_string())
+    }
+}
+
+fn build_openclaw_config_snapshot_unredacted(
+    state: &GatewayState,
+    config_path: &PathBuf,
+    config_exists: bool,
+    config_raw: &str,
+) -> (serde_json::Value, Option<drbot_core::Config>) {
+    let (cfg_struct, mut base_value) = if config_exists {
+        let cfg_struct = parse_config_struct_for_path(config_path, config_raw).ok();
+        let base_value = parse_config_value_for_path(config_path, config_raw)
+            .ok()
+            .or_else(|| {
+                cfg_struct
+                    .as_ref()
+                    .and_then(|c| serde_json::to_value(c).ok())
+            })
+            .unwrap_or_else(|| json!({}));
+        (cfg_struct, base_value)
+    } else {
+        let cfg = drbot_core::Config::default();
+        let base_value = serde_json::to_value(&cfg).unwrap_or_else(|_| json!({}));
+        (Some(cfg), base_value)
+    };
+
+    if !base_value.is_object() {
+        base_value = json!({});
+    }
+    let tools_file = load_openclaw_tools_config_file(state);
+    let tools_value = serde_json::to_value(&tools_file.tools).unwrap_or_else(|_| json!({}));
+    let memory_file = load_openclaw_memory_config_file(state);
+    let memory_value = serde_json::to_value(&memory_file.memory).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = base_value.as_object_mut() {
+        obj.insert("tools".to_string(), tools_value);
+        obj.insert(
+            "agents".to_string(),
+            build_openclaw_agents_config_snapshot(state, cfg_struct.as_ref()),
+        );
+        obj.insert("memory".to_string(), memory_value);
+    }
+
+    (base_value, cfg_struct)
+}
+
+fn parse_openclaw_config_raw_value(raw: &str) -> Result<serde_json::Value, ErrorShape> {
+    match json5::from_str::<serde_json::Value>(raw) {
+        Ok(v) => Ok(v),
+        Err(json_err) => toml::from_str::<serde_json::Value>(raw).map_err(|toml_err| {
+            ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                format!("invalid config (json5: {}; toml: {})", json_err, toml_err),
+            )
+        }),
+    }
+}
+
+fn extract_openclaw_model_primary(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for key in ["primary", "model", "id", "value"] {
+                if let Some(primary) = obj.get(key).and_then(|v| v.as_str()) {
+                    let trimmed = primary.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_openclaw_model_list_config_update(
+    value: &serde_json::Value,
+) -> Option<Option<OpenclawModelListConfig>> {
+    match value {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(OpenclawModelListConfig {
+                    primary: Some(trimmed.chars().take(200).collect::<String>()),
+                    fallbacks: Vec::new(),
+                    extra: HashMap::new(),
+                }))
+            }
+        }
+        serde_json::Value::Object(_) => {
+            let mut cfg = serde_json::from_value::<OpenclawModelListConfig>(value.clone())
+                .unwrap_or_default();
+            if cfg
+                .primary
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                cfg.primary = extract_openclaw_model_primary(value);
+            }
+            cfg.primary = cfg.primary.and_then(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.chars().take(200).collect::<String>())
+                }
+            });
+            cfg.fallbacks = cfg
+                .fallbacks
+                .into_iter()
+                .map(|s| s.trim().chars().take(200).collect::<String>())
+                .filter(|s| !s.is_empty())
+                .take(16)
+                .collect::<Vec<_>>();
+            if cfg.primary.is_none() && cfg.fallbacks.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(cfg))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn apply_agents_defaults_model_to_drbot_config(
+    cfg: &mut drbot_core::Config,
+    root: &serde_json::Value,
+) {
+    let Some(agents) = root.get("agents").and_then(|v| v.as_object()) else {
+        return;
+    };
+    if !agents.contains_key("defaults") {
+        return;
+    }
+    let Some(defaults) = agents.get("defaults").and_then(|v| v.as_object()) else {
+        return;
+    };
+    if !defaults.contains_key("model") {
+        return;
+    }
+    match defaults.get("model") {
+        Some(serde_json::Value::Null) => {
+            cfg.providers.default_model = None;
+        }
+        Some(value) => {
+            if let Some(primary) = extract_openclaw_model_primary(value) {
+                cfg.providers.default_model = Some(primary);
+            }
+        }
+        None => {}
+    }
+}
+
+fn apply_openclaw_memory_config_update(
+    state: &GatewayState,
+    value: &serde_json::Value,
+) -> Result<(), ErrorShape> {
+    if value.is_null() {
+        let file = OpenclawMemoryConfigFile::default();
+        return store_openclaw_memory_config_file(state, &file);
+    }
+    let memory: OpenclawMemoryConfig = serde_json::from_value(value.clone()).map_err(|e| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            format!("invalid memory config: {}", e),
+        )
+    })?;
+    let mut file = load_openclaw_memory_config_file(state);
+    file.memory = memory;
+    store_openclaw_memory_config_file(state, &file)
+}
+
+fn apply_openclaw_global_tools_config_update(
+    state: &GatewayState,
+    value: &serde_json::Value,
+) -> Result<(), ErrorShape> {
+    if value.is_null() {
+        let file = OpenclawToolsConfigFile::default();
+        return store_openclaw_tools_config_file(state, &file);
+    }
+    let tools: OpenclawToolsConfig = serde_json::from_value(value.clone()).map_err(|e| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            format!("invalid tools config: {}", e),
+        )
+    })?;
+    let mut file = load_openclaw_tools_config_file(state);
+    file.tools = tools;
+    store_openclaw_tools_config_file(state, &file)
+}
+
+fn apply_openclaw_agents_config_update(
+    state: &GatewayState,
+    value: &serde_json::Value,
+) -> Result<(), ErrorShape> {
+    let Some(obj) = value.as_object() else {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "agents config must be an object",
+        ));
+    };
+    let mut file = load_openclaw_agents_file(state);
+    let mut touched = false;
+
+    if let Some(defaults) = obj.get("defaults").and_then(|v| v.as_object()) {
+        if defaults.contains_key("subagents") {
+            match defaults.get("subagents") {
+                Some(serde_json::Value::Null) | None => {
+                    file.defaults.subagents = None;
+                }
+                Some(serde_json::Value::String(s)) => {
+                    let thinking = s.trim().to_string().chars().take(64).collect::<String>();
+                    file.defaults.subagents = if thinking.trim().is_empty() {
+                        None
+                    } else {
+                        Some(OpenclawSubagentsConfig {
+                            thinking: Some(thinking),
+                        })
+                    };
+                }
+                Some(serde_json::Value::Object(map)) => {
+                    if map.contains_key("thinking") {
+                        let thinking = map
+                            .get("thinking")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.chars().take(64).collect::<String>());
+                        file.defaults.subagents = if thinking.is_none() {
+                            None
+                        } else {
+                            Some(OpenclawSubagentsConfig { thinking })
+                        };
+                    }
+                }
+                _ => {}
+            }
+            touched = true;
+        }
+        if defaults.contains_key("imageModel") {
+            if let Some(value) = defaults.get("imageModel") {
+                if let Some(parsed) = parse_openclaw_model_list_config_update(value) {
+                    file.defaults.image_model = parsed;
+                }
+            }
+            touched = true;
+        }
+    }
+
+    let Some(list_value) = obj.get("list") else {
+        // Absent list => no-op (avoid wiping agent config when callers only patch gateway/providers).
+        return if touched {
+            store_openclaw_agents_file(state, &file)
+        } else {
+            Ok(())
+        };
+    };
+    if list_value.is_null() {
+        // Clearing agents.list is a no-op for safety.
+        return if touched {
+            store_openclaw_agents_file(state, &file)
+        } else {
+            Ok(())
+        };
+    }
+    let Some(list) = list_value.as_array() else {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "agents.list must be an array",
+        ));
+    };
+    touched = true;
+
+    for entry in list {
+        let Some(entry_obj) = entry.as_object() else {
+            continue;
+        };
+        let id_raw = entry_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if id_raw.is_empty() {
+            continue;
+        }
+        let agent_id = crate::openclaw_paths::normalize_agent_id(id_raw);
+
+        let mut idx = file
+            .agents
+            .iter()
+            .position(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+        if idx.is_none() {
+            let fallback_workspace = default_agent_workspace_dir(state, &agent_id)
+                .to_string_lossy()
+                .to_string();
+            file.agents.push(OpenclawAgentConfig {
+                agent_id: agent_id.clone(),
+                name: if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                    "drbot".to_string()
+                } else {
+                    agent_id.clone()
+                },
+                workspace: fallback_workspace,
+                model: None,
+                image_model: None,
+                skills: None,
+                tools: None,
+                subagents: None,
+                avatar: None,
+                emoji: None,
+            });
+            idx = Some(file.agents.len() - 1);
+        }
+        let idx = idx.unwrap();
+        let agent = &mut file.agents[idx];
+
+        if entry_obj.contains_key("name") {
+            let name = entry_obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            if let Some(name) = name.filter(|s| !s.is_empty()) {
+                agent.name = name;
+            }
+        }
+
+        if entry_obj.contains_key("workspace") {
+            let workspace = entry_obj
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            if let Some(workspace) = workspace.filter(|s| !s.is_empty()) {
+                agent.workspace = workspace.clone();
+                let workspace_dir = crate::openclaw_paths::resolve_user_path(&workspace);
+                if let Err(e) = std::fs::create_dir_all(&workspace_dir) {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("failed to create workspace dir: {}", e),
+                    )
+                    .with_details(json!({ "workspace": workspace })));
+                }
+                ensure_agent_workspace_bootstrap(
+                    &workspace_dir,
+                    &agent.name,
+                    agent.emoji.as_deref(),
+                )?;
+            }
+        }
+
+        if entry_obj.contains_key("model") {
+            agent.model = match entry_obj.get("model") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::String(s)) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(json!(trimmed))
+                    }
+                }
+                Some(other) => Some(other.clone()),
+            };
+        }
+
+        if entry_obj.contains_key("imageModel") {
+            if let Some(value) = entry_obj.get("imageModel") {
+                if let Some(parsed) = parse_openclaw_model_list_config_update(value) {
+                    agent.image_model = parsed;
+                }
+            }
+        }
+
+        if entry_obj.contains_key("skills") {
+            agent.skills = match entry_obj.get("skills") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::Array(items)) => {
+                    let normalized = items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>();
+                    Some(normalized)
+                }
+                _ => None,
+            };
+        }
+
+        if entry_obj.contains_key("tools") {
+            agent.tools = match entry_obj.get("tools") {
+                Some(serde_json::Value::Null) | None => None,
+                Some(other) => Some(
+                    serde_json::from_value::<OpenclawToolsConfig>(other.clone()).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::INVALID_REQUEST,
+                            format!("invalid agents.list[].tools: {}", e),
+                        )
+                    })?,
+                ),
+            };
+        }
+
+        if entry_obj.contains_key("subagents") {
+            match entry_obj.get("subagents") {
+                Some(serde_json::Value::Null) | None => {
+                    agent.subagents = None;
+                }
+                Some(serde_json::Value::String(s)) => {
+                    let thinking = s.trim().to_string().chars().take(64).collect::<String>();
+                    agent.subagents = if thinking.trim().is_empty() {
+                        None
+                    } else {
+                        Some(OpenclawSubagentsConfig {
+                            thinking: Some(thinking),
+                        })
+                    };
+                }
+                Some(serde_json::Value::Object(map)) => {
+                    if map.contains_key("thinking") {
+                        let thinking = map
+                            .get("thinking")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.chars().take(64).collect::<String>());
+                        agent.subagents = if thinking.is_none() {
+                            None
+                        } else {
+                            Some(OpenclawSubagentsConfig { thinking })
+                        };
+                    }
+                }
+                _ => {}
+            }
+            touched = true;
+        }
+    }
+
+    if touched {
+        store_openclaw_agents_file(state, &file)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn handle_config_set(
+    state: &GatewayState,
     raw: &str,
     base_hash: Option<&str>,
 ) -> Result<serde_json::Value, ErrorShape> {
@@ -2802,9 +7433,10 @@ async fn handle_config_set(
     let current_path = resolve_config_path_for_read();
     let current_exists = current_path.exists();
     let current_raw = std::fs::read_to_string(&current_path).unwrap_or_default();
-    let current_hash = sha256_hex(&current_raw);
+    let any_exists = openclaw_config_any_source_exists(state, current_exists);
+    let current_hash = compute_openclaw_config_hash_for_state(state, current_exists, &current_raw);
 
-    if current_exists {
+    if any_exists {
         let expected_trimmed = base_hash.unwrap_or("").trim();
         if expected_trimmed.is_empty() {
             return Err(ErrorShape::new(
@@ -2813,20 +7445,67 @@ async fn handle_config_set(
             ));
         }
         if expected_trimmed != current_hash {
-            return Err(
-                ErrorShape::new(
-                    error_codes::INVALID_REQUEST,
-                    "config changed since last load; re-run config.get and retry",
-                )
-                .with_details(json!({"expected": expected_trimmed, "actual": current_hash})),
-            );
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                "config changed since last load; re-run config.get and retry",
+            )
+            .with_details(json!({"expected": expected_trimmed, "actual": current_hash})));
         }
     }
 
-    // Validate TOML parses into drbot config before writing.
-    let cfg: drbot_core::Config = toml::from_str(raw).map_err(|e| {
-        ErrorShape::new(error_codes::INVALID_REQUEST, format!("invalid config: {}", e))
+    let (prev_snapshot, prev_cfg) = build_openclaw_config_snapshot_unredacted(
+        state,
+        &current_path,
+        current_exists,
+        &current_raw,
+    );
+
+    let mut root_value = parse_openclaw_config_raw_value(raw)?;
+    if !root_value.is_object() {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "config.set raw must be an object",
+        ));
+    }
+
+    // Preserve secrets when users keep redaction placeholders from config.get.
+    restore_redacted_config_json_secrets(&mut root_value, &prev_snapshot);
+    sanitize_config_json_secret_strings(&mut root_value);
+
+    let mut cfg: drbot_core::Config = serde_json::from_value(root_value.clone()).map_err(|e| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            format!("invalid config: {}", e),
+        )
     })?;
+    apply_agents_defaults_model_to_drbot_config(&mut cfg, &root_value);
+    if current_exists {
+        if let Some(prev_cfg) = prev_cfg.as_ref() {
+            merge_redacted_config_secrets(&mut cfg, prev_cfg);
+        }
+    }
+    sanitize_config_secrets(&mut cfg);
+    let write_ext = write_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("toml")
+        .to_ascii_lowercase();
+    let raw_out = if write_ext == "json" {
+        let rendered = serde_json::to_string_pretty(&cfg).map_err(|e| {
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to serialize config: {}", e),
+            )
+        })?;
+        format!("{rendered}\n")
+    } else {
+        toml::to_string_pretty(&cfg).map_err(|e| {
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to serialize config: {}", e),
+            )
+        })?
+    };
 
     if let Some(parent) = write_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -2837,17 +7516,33 @@ async fn handle_config_set(
         }
     }
 
-    if let Err(e) = std::fs::write(&write_path, raw) {
+    if let Err(e) = std::fs::write(&write_path, raw_out) {
         return Err(ErrorShape::new(
             error_codes::UNAVAILABLE,
             format!("failed to write config: {}", e),
         ));
     }
 
+    if let Some(tools_value) = root_value.get("tools") {
+        apply_openclaw_global_tools_config_update(state, tools_value)?;
+    }
+    if let Some(agents_value) = root_value.get("agents") {
+        apply_openclaw_agents_config_update(state, agents_value)?;
+    }
+    if let Some(memory_value) = root_value.get("memory") {
+        apply_openclaw_memory_config_update(state, memory_value)?;
+    }
+
+    state.set_provider(crate::state::init_provider(&cfg));
+    state.channel_manager().apply_core_config(&cfg).await;
+    crate::openclaw_inbound::start_inbound_bridge(state.clone()).await;
+
+    let snapshot = handle_config_get(state).await;
+    let cfg_json = snapshot.get("config").cloned().unwrap_or_else(|| json!({}));
     Ok(json!({
         "ok": true,
         "path": write_path.to_string_lossy(),
-        "config": serde_json::to_value(&cfg).unwrap_or_else(|_| json!({})),
+        "config": cfg_json,
     }))
 }
 
@@ -2880,7 +7575,8 @@ fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) 
     }
 }
 
-async fn handle_config_patch(
+pub(crate) async fn handle_config_patch(
+    state: &GatewayState,
     raw: &str,
     base_hash: Option<&str>,
 ) -> Result<serde_json::Value, ErrorShape> {
@@ -2888,9 +7584,10 @@ async fn handle_config_patch(
     let current_path = resolve_config_path_for_read();
     let current_exists = current_path.exists();
     let current_raw = std::fs::read_to_string(&current_path).unwrap_or_default();
-    let current_hash = sha256_hex(&current_raw);
+    let any_exists = openclaw_config_any_source_exists(state, current_exists);
+    let current_hash = compute_openclaw_config_hash_for_state(state, current_exists, &current_raw);
 
-    if current_exists {
+    if any_exists {
         let expected_trimmed = base_hash.unwrap_or("").trim();
         if expected_trimmed.is_empty() {
             return Err(ErrorShape::new(
@@ -2899,29 +7596,28 @@ async fn handle_config_patch(
             ));
         }
         if expected_trimmed != current_hash {
-            return Err(
-                ErrorShape::new(
-                    error_codes::INVALID_REQUEST,
-                    "config changed since last load; re-run config.get and retry",
-                )
-                .with_details(json!({"expected": expected_trimmed, "actual": current_hash})),
-            );
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                "config changed since last load; re-run config.get and retry",
+            )
+            .with_details(json!({"expected": expected_trimmed, "actual": current_hash})));
         }
     }
 
-    // Load the current config as the merge base. If no config exists yet, patch the defaults.
-    let base_cfg: drbot_core::Config = if current_exists {
-        toml::from_str(&current_raw).map_err(|_| {
-            ErrorShape::new(
-                error_codes::INVALID_REQUEST,
-                "invalid config; fix before patching",
-            )
-        })?
-    } else {
-        drbot_core::Config::default()
-    };
+    let (prev_snapshot, prev_cfg) = build_openclaw_config_snapshot_unredacted(
+        state,
+        &current_path,
+        current_exists,
+        &current_raw,
+    );
+    if current_exists && prev_cfg.is_none() {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "invalid config; fix before patching",
+        ));
+    }
 
-    let patch_value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+    let patch_value: serde_json::Value = json5::from_str(raw).map_err(|e| {
         ErrorShape::new(
             error_codes::INVALID_REQUEST,
             format!("invalid config.patch params: {}", e),
@@ -2934,29 +7630,391 @@ async fn handle_config_patch(
         ));
     }
 
-    let mut merged = serde_json::to_value(&base_cfg).unwrap_or_else(|_| json!({}));
-    apply_merge_patch(&mut merged, &patch_value);
-    let merged_cfg: drbot_core::Config = serde_json::from_value(merged).map_err(|e| {
-        ErrorShape::new(error_codes::INVALID_REQUEST, format!("invalid config: {}", e))
-    })?;
-    let raw_out = toml::to_string_pretty(&merged_cfg).map_err(|e| {
-        ErrorShape::new(error_codes::UNAVAILABLE, format!("failed to serialize config: {}", e))
-    })?;
+    let mut merged_root = prev_snapshot.clone();
+    apply_merge_patch(&mut merged_root, &patch_value);
+    // Preserve secrets when users keep redaction placeholders from config.get.
+    restore_redacted_config_json_secrets(&mut merged_root, &prev_snapshot);
+    sanitize_config_json_secret_strings(&mut merged_root);
+
+    let mut merged_cfg: drbot_core::Config =
+        serde_json::from_value(merged_root.clone()).map_err(|e| {
+            ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                format!("invalid config: {}", e),
+            )
+        })?;
+    let agents_default_model_in_patch = patch_value
+        .get("agents")
+        .and_then(|v| v.get("defaults"))
+        .and_then(|v| v.get("model"))
+        .is_some();
+    let providers_default_model_in_patch = patch_value
+        .get("providers")
+        .and_then(|v| v.get("default_model"))
+        .is_some();
+    if agents_default_model_in_patch && !providers_default_model_in_patch {
+        apply_agents_defaults_model_to_drbot_config(&mut merged_cfg, &merged_root);
+    }
+    if current_exists {
+        if let Some(prev_cfg) = prev_cfg.as_ref() {
+            merge_redacted_config_secrets(&mut merged_cfg, prev_cfg);
+        }
+    }
+    sanitize_config_secrets(&mut merged_cfg);
+    let write_ext = write_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("toml")
+        .to_ascii_lowercase();
+    let raw_out = if write_ext == "json" {
+        let rendered = serde_json::to_string_pretty(&merged_cfg).map_err(|e| {
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to serialize config: {}", e),
+            )
+        })?;
+        format!("{rendered}\n")
+    } else {
+        toml::to_string_pretty(&merged_cfg).map_err(|e| {
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to serialize config: {}", e),
+            )
+        })?
+    };
 
     if let Some(parent) = write_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            ErrorShape::new(error_codes::UNAVAILABLE, format!("failed to create config dir: {}", e))
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to create config dir: {}", e),
+            )
         })?;
     }
     std::fs::write(&write_path, raw_out).map_err(|e| {
-        ErrorShape::new(error_codes::UNAVAILABLE, format!("failed to write config: {}", e))
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to write config: {}", e),
+        )
     })?;
 
+    if patch_value.get("tools").is_some() {
+        if let Some(tools_value) = merged_root.get("tools") {
+            apply_openclaw_global_tools_config_update(state, tools_value)?;
+        }
+    }
+    if patch_value.get("agents").is_some() {
+        if let Some(agents_value) = merged_root.get("agents") {
+            apply_openclaw_agents_config_update(state, agents_value)?;
+        }
+    }
+    if patch_value.get("memory").is_some() {
+        if let Some(memory_value) = merged_root.get("memory") {
+            apply_openclaw_memory_config_update(state, memory_value)?;
+        } else {
+            apply_openclaw_memory_config_update(state, &serde_json::Value::Null)?;
+        }
+    }
+
+    state.set_provider(crate::state::init_provider(&merged_cfg));
+    state.channel_manager().apply_core_config(&merged_cfg).await;
+    crate::openclaw_inbound::start_inbound_bridge(state.clone()).await;
+
+    let snapshot = handle_config_get(state).await;
+    let cfg_json = snapshot.get("config").cloned().unwrap_or_else(|| json!({}));
     Ok(json!({
         "ok": true,
         "path": write_path.to_string_lossy(),
-        "config": serde_json::to_value(&merged_cfg).unwrap_or_else(|_| json!({})),
+        "config": cfg_json,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Update (OpenClaw parity)
+// ---------------------------------------------------------------------------
+
+static OPENCLAW_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn openclaw_update_lock() -> &'static Mutex<()> {
+    OPENCLAW_UPDATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub(crate) async fn handle_update_run(
+    state: &GatewayState,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    use drbot_update::{
+        ReleaseChannel, UpdateChecker, UpdateConfig, UpdateDownloader, UpdateError, UpdateInstaller,
+    };
+
+    let session_key = params
+        .get("sessionKey")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let note = params
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let restart_delay_ms = params
+        .get("restartDelayMs")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(60_000))
+        .unwrap_or(2_000);
+    let timeout_ms = params
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.max(1_000).min(30 * 60_000));
+
+    let lock = openclaw_update_lock();
+    let _guard = match lock.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            let result = json!({
+                "status": "error",
+                "mode": "drbot-update",
+                "reason": "update already in progress",
+                "steps": [],
+                "durationMs": 0,
+            });
+            let sentinel_payload = json!({
+                "kind": "update",
+                "status": "error",
+                "ts": now_ms(),
+                "sessionKey": session_key,
+                "message": note,
+                "doctorHint": "Update already in progress.",
+                "stats": {
+                    "mode": "drbot-update",
+                    "root": serde_json::Value::Null,
+                    "before": serde_json::Value::Null,
+                    "after": serde_json::Value::Null,
+                    "steps": [],
+                    "reason": "locked",
+                    "durationMs": 0
+                }
+            });
+            let sentinel_path = crate::openclaw_restart::write_restart_sentinel_best_effort(
+                state,
+                sentinel_payload.clone(),
+            );
+            return json!({
+                "ok": true,
+                "result": result,
+                "restart": {
+                    "ok": false,
+                    "pid": std::process::id(),
+                    "signal": "SIGUSR1",
+                    "delayMs": restart_delay_ms,
+                    "reason": "update.run",
+                    "mode": "signal",
+                },
+                "sentinel": {
+                    "path": sentinel_path,
+                    "payload": sentinel_payload,
+                }
+            });
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+    let channel = std::env::var("DRBOT_UPDATE_CHANNEL")
+        .ok()
+        .and_then(|raw| ReleaseChannel::from_str(raw.trim()))
+        .unwrap_or(ReleaseChannel::Stable);
+    let manifest_url = std::env::var("DRBOT_UPDATE_MANIFEST_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    let root = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.trim().is_empty());
+
+    let before = json!({
+        "version": current_version,
+        "channel": channel.name(),
+    });
+
+    let update_fut = async {
+        let cfg = UpdateConfig {
+            channel,
+            auto_check: false,
+            check_interval_hours: 24,
+            manifest_url: manifest_url.clone(),
+            rollback_versions: 2,
+        };
+
+        let checker = UpdateChecker::new(cfg);
+        let t0 = std::time::Instant::now();
+        let manifest = checker.fetch_manifest().await?;
+        steps.push(json!({
+            "name": "manifest",
+            "command": format!("GET {}", manifest_url.as_deref().unwrap_or_else(|| channel.manifest_url())),
+            "cwd": serde_json::Value::Null,
+            "durationMs": t0.elapsed().as_millis() as u64,
+            "log": { "stdoutTail": serde_json::Value::Null, "stderrTail": serde_json::Value::Null, "exitCode": serde_json::Value::Null },
+        }));
+
+        let binary = manifest
+            .binary_for_current_platform()
+            .cloned()
+            .ok_or(UpdateError::UnsupportedPlatform)?;
+
+        if !manifest.needs_update(env!("CARGO_PKG_VERSION")) {
+            return Ok::<_, UpdateError>((manifest, None, None));
+        }
+
+        if !manifest.is_version_supported(env!("CARGO_PKG_VERSION")) {
+            return Err(UpdateError::InvalidVersion(format!(
+                "Version {} is too old for upgrade. Minimum required: {}",
+                env!("CARGO_PKG_VERSION"),
+                manifest.min_version.as_deref().unwrap_or("unknown")
+            )));
+        }
+
+        let downloader = UpdateDownloader::new();
+        let download_dir = UpdateDownloader::download_dir();
+        let download_path = download_dir.join(format!(
+            "drbot-{}-{}",
+            manifest.latest_version,
+            Uuid::new_v4()
+        ));
+        let t1 = std::time::Instant::now();
+        let downloaded = downloader
+            .download(
+                &binary,
+                &download_path,
+                None::<fn(drbot_update::UpdateProgress)>,
+            )
+            .await?;
+        steps.push(json!({
+            "name": "download",
+            "command": format!("GET {}", binary.url),
+            "cwd": serde_json::Value::Null,
+            "durationMs": t1.elapsed().as_millis() as u64,
+            "log": { "stdoutTail": serde_json::Value::Null, "stderrTail": serde_json::Value::Null, "exitCode": serde_json::Value::Null },
+        }));
+
+        let installer = UpdateInstaller::new();
+        let t2 = std::time::Instant::now();
+        installer
+            .install(&downloaded, None::<fn(drbot_update::UpdateProgress)>)
+            .await?;
+        steps.push(json!({
+            "name": "install",
+            "command": "replace current executable",
+            "cwd": serde_json::Value::Null,
+            "durationMs": t2.elapsed().as_millis() as u64,
+            "log": { "stdoutTail": serde_json::Value::Null, "stderrTail": serde_json::Value::Null, "exitCode": serde_json::Value::Null },
+        }));
+
+        Ok((manifest, Some(binary.url.clone()), Some(downloaded)))
+    };
+
+    let res = if let Some(timeout_ms) = timeout_ms {
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), update_fut).await {
+            Ok(r) => r.map_err(|e| e),
+            Err(_) => Err(UpdateError::DownloadFailed("timeout".to_string())),
+        }
+    } else {
+        update_fut.await
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let (status, reason, after) = match res {
+        Ok((manifest, _url, _downloaded)) => {
+            if manifest.needs_update(env!("CARGO_PKG_VERSION")) {
+                (
+                    "ok",
+                    None,
+                    Some(json!({
+                        "version": manifest.latest_version,
+                        "channel": channel.name(),
+                    })),
+                )
+            } else {
+                ("skipped", Some("no update available".to_string()), None)
+            }
+        }
+        Err(err) => ("error", Some(err.to_string()), None),
+    };
+
+    let mut result_map = serde_json::Map::new();
+    result_map.insert("status".to_string(), json!(status));
+    result_map.insert("mode".to_string(), json!("drbot-update"));
+    result_map.insert(
+        "root".to_string(),
+        root.clone()
+            .map(|v| json!(v))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    result_map.insert("before".to_string(), before.clone());
+    result_map.insert(
+        "after".to_string(),
+        after.clone().unwrap_or(serde_json::Value::Null),
+    );
+    result_map.insert("steps".to_string(), json!(steps.clone()));
+    result_map.insert("durationMs".to_string(), json!(duration_ms));
+    if let Some(reason) = reason.as_deref() {
+        result_map.insert("reason".to_string(), json!(reason));
+    }
+    let result = serde_json::Value::Object(result_map);
+
+    let sentinel_payload = json!({
+        "kind": "update",
+        "status": status,
+        "ts": now_ms(),
+        "sessionKey": session_key,
+        "message": note,
+        "doctorHint": if status == "ok" { "Update applied. Restarting drbot." } else { "Update failed. Update via your package manager / git checkout." },
+        "stats": {
+            "mode": "drbot-update",
+            "root": root,
+            "before": before,
+            "after": after,
+            "steps": steps,
+            "reason": reason,
+            "durationMs": duration_ms
+        }
+    });
+    let sentinel_path = crate::openclaw_restart::write_restart_sentinel_best_effort(
+        state,
+        sentinel_payload.clone(),
+    );
+
+    let restart = if status == "ok" {
+        serde_json::to_value(&crate::openclaw_restart::schedule_sigusr1_restart(
+            Some(restart_delay_ms),
+            Some("update.run"),
+        ))
+        .unwrap_or_else(|_| json!({"ok": false}))
+    } else {
+        json!({
+            "ok": false,
+            "pid": std::process::id(),
+            "signal": "SIGUSR1",
+            "delayMs": restart_delay_ms,
+            "reason": "update.run",
+            "mode": "signal",
+        })
+    };
+
+    json!({
+        "ok": true,
+        "result": result,
+        "restart": restart,
+        "sentinel": {
+            "path": sentinel_path,
+            "payload": sentinel_payload,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2991,7 +8049,10 @@ fn resolve_openclaw_sessions_sidecar_path(state: &GatewayState, agent_id: &str) 
     PathBuf::from("openclaw_sessions.json")
 }
 
-fn load_openclaw_sessions_sidecar(state: &GatewayState, agent_id: &str) -> OpenclawSessionsSidecarFile {
+fn load_openclaw_sessions_sidecar(
+    state: &GatewayState,
+    agent_id: &str,
+) -> OpenclawSessionsSidecarFile {
     let path = resolve_openclaw_sessions_sidecar_path(state, agent_id);
     read_json_file::<OpenclawSessionsSidecarFile>(&path).unwrap_or_default()
 }
@@ -3013,7 +8074,10 @@ fn extract_sidecar_string(entry: Option<&serde_json::Value>, field: &str) -> Opt
         .filter(|s| !s.is_empty())
 }
 
-fn extract_sidecar_literal(entry: Option<&serde_json::Value>, field: &str) -> Option<serde_json::Value> {
+fn extract_sidecar_literal(
+    entry: Option<&serde_json::Value>,
+    field: &str,
+) -> Option<serde_json::Value> {
     entry?.get(field).cloned().filter(|v| !v.is_null())
 }
 
@@ -3073,13 +8137,904 @@ pub(crate) fn resolve_openclaw_session_model_override(
         return None;
     }
     let canonical = canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, key);
-    let agent_id = openclaw_session_key_agent_id(
-        &canonical,
-        crate::openclaw_paths::DEFAULT_AGENT_ID,
-    );
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical, crate::openclaw_paths::DEFAULT_AGENT_ID);
     let file = load_openclaw_sessions_sidecar(state, &agent_id);
-    let entry = file.entries.get(&canonical).or_else(|| file.entries.get(key));
+    let entry = file
+        .entries
+        .get(&canonical)
+        .or_else(|| file.entries.get(key));
     extract_sidecar_string(entry, "model")
+}
+
+pub(crate) fn resolve_openclaw_session_thinking_level(
+    state: &GatewayState,
+    session_key: &str,
+) -> Option<String> {
+    let key = session_key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let canonical = canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, key);
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical, crate::openclaw_paths::DEFAULT_AGENT_ID);
+    let file = load_openclaw_sessions_sidecar(state, &agent_id);
+    let entry = file
+        .entries
+        .get(&canonical)
+        .or_else(|| file.entries.get(key));
+    extract_sidecar_string(entry, "thinkingLevel")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenclawSendPolicyMode {
+    Ask,
+    Allow,
+    Deny,
+}
+
+impl Default for OpenclawSendPolicyMode {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+fn parse_openclaw_send_policy_mode_str(value: &str) -> Option<OpenclawSendPolicyMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ask" => Some(OpenclawSendPolicyMode::Ask),
+        "allow" => Some(OpenclawSendPolicyMode::Allow),
+        "deny" => Some(OpenclawSendPolicyMode::Deny),
+        _ => None,
+    }
+}
+
+fn parse_openclaw_send_policy_mode(value: &serde_json::Value) -> Option<OpenclawSendPolicyMode> {
+    match value {
+        serde_json::Value::String(s) => parse_openclaw_send_policy_mode_str(s),
+        serde_json::Value::Bool(b) => Some(if *b {
+            OpenclawSendPolicyMode::Allow
+        } else {
+            OpenclawSendPolicyMode::Deny
+        }),
+        serde_json::Value::Object(map) => {
+            if let Some(mode) = map
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .and_then(parse_openclaw_send_policy_mode_str)
+            {
+                return Some(mode);
+            }
+            if let Some(mode) = map
+                .get("policy")
+                .and_then(|v| v.as_str())
+                .and_then(parse_openclaw_send_policy_mode_str)
+            {
+                return Some(mode);
+            }
+            if let Some(allow) = map.get("allow").and_then(|v| v.as_bool()) {
+                return Some(if allow {
+                    OpenclawSendPolicyMode::Allow
+                } else {
+                    OpenclawSendPolicyMode::Deny
+                });
+            }
+            if let Some(enabled) = map.get("enabled").and_then(|v| v.as_bool()) {
+                return Some(if enabled {
+                    OpenclawSendPolicyMode::Allow
+                } else {
+                    OpenclawSendPolicyMode::Deny
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_openclaw_session_send_policy_mode(
+    state: &GatewayState,
+    session_key: &str,
+) -> OpenclawSendPolicyMode {
+    let key = session_key.trim();
+    if key.is_empty() {
+        return OpenclawSendPolicyMode::Ask;
+    }
+
+    let canonical = canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, key);
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical, crate::openclaw_paths::DEFAULT_AGENT_ID);
+    let file = load_openclaw_sessions_sidecar(state, &agent_id);
+    let entry = file
+        .entries
+        .get(&canonical)
+        .or_else(|| file.entries.get(key));
+    let policy = entry
+        .and_then(|v| v.get("sendPolicy"))
+        .filter(|v| !v.is_null())
+        .and_then(parse_openclaw_send_policy_mode);
+    policy.unwrap_or(OpenclawSendPolicyMode::Ask)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenclawExecAskMode {
+    Ask,
+    Allow,
+    Deny,
+}
+
+impl Default for OpenclawExecAskMode {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+fn parse_openclaw_exec_ask_mode_str(value: &str) -> Option<OpenclawExecAskMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ask" | "always" | "prompt" | "approve" | "approval" | "on" => {
+            Some(OpenclawExecAskMode::Ask)
+        }
+        "allow" | "auto" | "never" | "off" | "none" | "skip" => Some(OpenclawExecAskMode::Allow),
+        "deny" | "block" | "forbid" | "disabled" => Some(OpenclawExecAskMode::Deny),
+        _ => None,
+    }
+}
+
+fn parse_openclaw_exec_ask_mode(value: &serde_json::Value) -> Option<OpenclawExecAskMode> {
+    match value {
+        serde_json::Value::String(s) => parse_openclaw_exec_ask_mode_str(s),
+        serde_json::Value::Bool(b) => Some(if *b {
+            OpenclawExecAskMode::Allow
+        } else {
+            OpenclawExecAskMode::Deny
+        }),
+        serde_json::Value::Object(map) => {
+            if let Some(mode) = map
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .and_then(parse_openclaw_exec_ask_mode_str)
+            {
+                return Some(mode);
+            }
+            if let Some(mode) = map
+                .get("policy")
+                .and_then(|v| v.as_str())
+                .and_then(parse_openclaw_exec_ask_mode_str)
+            {
+                return Some(mode);
+            }
+            if let Some(allow) = map.get("allow").and_then(|v| v.as_bool()) {
+                return Some(if allow {
+                    OpenclawExecAskMode::Allow
+                } else {
+                    OpenclawExecAskMode::Deny
+                });
+            }
+            if let Some(enabled) = map.get("enabled").and_then(|v| v.as_bool()) {
+                return Some(if enabled {
+                    OpenclawExecAskMode::Allow
+                } else {
+                    OpenclawExecAskMode::Deny
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_openclaw_session_exec_ask_mode(
+    state: &GatewayState,
+    session_key: &str,
+) -> OpenclawExecAskMode {
+    let key = session_key.trim();
+    if key.is_empty() {
+        return OpenclawExecAskMode::Ask;
+    }
+
+    let canonical = canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, key);
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical, crate::openclaw_paths::DEFAULT_AGENT_ID);
+    let file = load_openclaw_sessions_sidecar(state, &agent_id);
+    let entry = file
+        .entries
+        .get(&canonical)
+        .or_else(|| file.entries.get(key));
+    let mode = entry
+        .and_then(|v| v.get("execAsk"))
+        .filter(|v| !v.is_null())
+        .and_then(parse_openclaw_exec_ask_mode);
+    mode.unwrap_or(OpenclawExecAskMode::Ask)
+}
+
+pub(crate) fn merge_openclaw_exec_ask_modes(
+    a: OpenclawExecAskMode,
+    b: OpenclawExecAskMode,
+) -> OpenclawExecAskMode {
+    use OpenclawExecAskMode::*;
+    match (a, b) {
+        (Deny, _) | (_, Deny) => Deny,
+        (Ask, _) | (_, Ask) => Ask,
+        _ => Allow,
+    }
+}
+
+fn normalize_tool_policy_key(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "")
+}
+
+fn tool_policy_key_aliases(tool: &str) -> Vec<String> {
+    let normalized = normalize_tool_policy_key(tool);
+    let mut out: Vec<String> = vec![normalized.clone()];
+
+    match normalized.as_str() {
+        "bash" => out.push("exec".to_string()),
+        "exec" => out.push("bash".to_string()),
+        // OpenClaw's canonical messaging tool is `message`; drbot exposes `send`/`poll`.
+        "send" => out.push("message".to_string()),
+        "poll" => out.push("message".to_string()),
+        "message" => {
+            out.push("send".to_string());
+            out.push("poll".to_string());
+        }
+        "write_file" => {
+            out.push("write".to_string());
+            out.push("writefile".to_string());
+        }
+        "write" => {
+            out.push("write_file".to_string());
+            out.push("writefile".to_string());
+        }
+        "read_file" => {
+            out.push("read".to_string());
+            out.push("readfile".to_string());
+        }
+        "read" => {
+            out.push("read_file".to_string());
+            out.push("readfile".to_string());
+        }
+        "apply_patch" => out.push("applypatch".to_string()),
+        _ => {}
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn parse_openclaw_tool_policy_mode(
+    value: &serde_json::Value,
+    tool: &str,
+) -> Option<OpenclawExecAskMode> {
+    let tool = tool.trim();
+    if tool.is_empty() {
+        return None;
+    }
+
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(_) | serde_json::Value::Bool(_) => {
+            parse_openclaw_exec_ask_mode(value)
+        }
+        serde_json::Value::Object(map) => {
+            // If this object looks like a mode spec, treat it as a default policy for all tools.
+            if map.contains_key("mode")
+                || map.contains_key("policy")
+                || map.contains_key("allow")
+                || map.contains_key("enabled")
+            {
+                return parse_openclaw_exec_ask_mode(value);
+            }
+
+            let aliases = tool_policy_key_aliases(tool);
+
+            let lookup_in = |candidate: &serde_json::Map<String, serde_json::Value>| -> Option<OpenclawExecAskMode> {
+                for (k, v) in candidate.iter() {
+                    let key = normalize_tool_policy_key(k);
+                    if aliases.iter().any(|a| a == &key) {
+                        return parse_openclaw_exec_ask_mode(v);
+                    }
+                }
+                None
+            };
+
+            if let Some(v) = map
+                .get("tools")
+                .and_then(|v| v.as_object())
+                .and_then(|obj| lookup_in(obj))
+            {
+                return Some(v);
+            }
+            if let Some(v) = map
+                .get("overrides")
+                .and_then(|v| v.as_object())
+                .and_then(|obj| lookup_in(obj))
+            {
+                return Some(v);
+            }
+            if let Some(v) = lookup_in(map) {
+                return Some(v);
+            }
+
+            // Default fallback ("default" / "*").
+            if let Some(default) = map.get("default").or_else(|| map.get("*")) {
+                return parse_openclaw_exec_ask_mode(default);
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_openclaw_session_tool_policy_mode(
+    state: &GatewayState,
+    session_key: &str,
+    tool: &str,
+) -> Option<OpenclawExecAskMode> {
+    let key = session_key.trim();
+    let tool = tool.trim();
+    if key.is_empty() || tool.is_empty() {
+        return None;
+    }
+
+    let canonical = canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, key);
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical, crate::openclaw_paths::DEFAULT_AGENT_ID);
+    let file = load_openclaw_sessions_sidecar(state, &agent_id);
+    let entry = file
+        .entries
+        .get(&canonical)
+        .or_else(|| file.entries.get(key));
+    let policy = entry
+        .and_then(|v| v.get("toolPolicy"))
+        .filter(|v| !v.is_null())?;
+    parse_openclaw_tool_policy_mode(policy, tool)
+}
+
+// ---------------------------------------------------------------------------
+// Tool allow/deny policy rules (OpenClaw parity)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenclawToolPolicyFile {
+    version: u32,
+    #[serde(default, rename = "hardDeny")]
+    hard_deny: Vec<String>,
+    #[serde(default)]
+    rules: Vec<OpenclawToolPolicyRule>,
+}
+
+impl Default for OpenclawToolPolicyFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            hard_deny: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OpenclawToolPolicyRule {
+    #[serde(default)]
+    r#match: OpenclawToolPolicyMatch,
+    #[serde(default)]
+    tools: Option<OpenclawToolAllowDenyPolicy>,
+    #[serde(default, rename = "toolsBySender")]
+    tools_by_sender: HashMap<String, OpenclawToolAllowDenyPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OpenclawToolPolicyMatch {
+    #[serde(default, rename = "keyPrefix")]
+    key_prefix: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default, rename = "chatType")]
+    chat_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OpenclawToolAllowDenyPolicy {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OpenclawToolFilter {
+    allow: Vec<String>,
+    deny: Vec<String>,
+    hard_deny: Vec<String>,
+}
+
+fn resolve_openclaw_tool_policy_path(state: &GatewayState) -> PathBuf {
+    resolve_openclaw_state_dir(state)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tool-policy.json")
+}
+
+fn load_openclaw_tool_policy_file(state: &GatewayState) -> OpenclawToolPolicyFile {
+    let path = resolve_openclaw_tool_policy_path(state);
+    read_json_file::<OpenclawToolPolicyFile>(&path).unwrap_or_default()
+}
+
+fn normalize_match_value(raw: Option<&str>) -> Option<String> {
+    raw.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_ascii_lowercase())
+        }
+    })
+}
+
+fn derive_channel_from_store_key(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split(':').filter(|p| !p.is_empty()).collect();
+    if parts.len() >= 3 {
+        let kind = parts[1].trim().to_ascii_lowercase();
+        if kind == "group" || kind == "channel" {
+            let channel = parts[0].trim();
+            if !channel.is_empty() {
+                return Some(channel.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+fn derive_chat_type_from_store_key(key: &str) -> Option<String> {
+    if key.contains(":group:") {
+        return Some("group".to_string());
+    }
+    if key.contains(":channel:") {
+        return Some("channel".to_string());
+    }
+    None
+}
+
+fn normalize_sender_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_at = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    without_at.trim().to_ascii_lowercase()
+}
+
+fn resolve_tools_by_sender(
+    tools_by_sender: &HashMap<String, OpenclawToolAllowDenyPolicy>,
+    sender_id: Option<&str>,
+) -> Option<OpenclawToolAllowDenyPolicy> {
+    let sender_id = sender_id?;
+    let normalized_sender = normalize_sender_key(sender_id);
+    if normalized_sender.is_empty() {
+        return None;
+    }
+
+    let mut wildcard: Option<OpenclawToolAllowDenyPolicy> = None;
+    let mut normalized: HashMap<String, OpenclawToolAllowDenyPolicy> = HashMap::new();
+    for (key, policy) in tools_by_sender.iter() {
+        let norm = normalize_sender_key(key);
+        if norm.is_empty() {
+            continue;
+        }
+        if norm == "*" {
+            wildcard = Some(policy.clone());
+            continue;
+        }
+        normalized.entry(norm).or_insert_with(|| policy.clone());
+    }
+
+    if let Some(found) = normalized.get(&normalized_sender) {
+        return Some(found.clone());
+    }
+    wildcard
+}
+
+fn expand_openclaw_tool_groups(entries: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    for raw in entries {
+        let normalized = normalize_tool_policy_key(&raw);
+        if normalized.is_empty() {
+            continue;
+        }
+
+        let group_members: Option<&[&str]> = match normalized.as_str() {
+            "group:memory" => Some(&["memory_search", "memory_get"]),
+            "group:web" => Some(&["web_search", "web_fetch"]),
+            "group:fs" => Some(&["read", "write", "edit", "apply_patch"]),
+            "group:runtime" => Some(&["exec", "process"]),
+            "group:sessions" => Some(&[
+                "sessions_list",
+                "sessions_history",
+                "sessions_send",
+                "sessions_spawn",
+                "session_status",
+            ]),
+            "group:ui" => Some(&["browser", "canvas"]),
+            "group:automation" => Some(&["cron", "gateway"]),
+            "group:messaging" => Some(&["message"]),
+            "group:nodes" => Some(&["nodes"]),
+            "group:openclaw" => Some(&[
+                "browser",
+                "canvas",
+                "nodes",
+                "cron",
+                "message",
+                "gateway",
+                "agents_list",
+                "sessions_list",
+                "sessions_history",
+                "sessions_send",
+                "sessions_spawn",
+                "session_status",
+                "memory_search",
+                "memory_get",
+                "web_search",
+                "web_fetch",
+                "image",
+            ]),
+            _ => None,
+        };
+
+        if let Some(members) = group_members {
+            for member in members {
+                out.push(member.to_string());
+            }
+            continue;
+        }
+
+        out.push(normalized);
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn openclaw_policy_pattern_matches(name: &str, raw_pattern: &str) -> bool {
+    let name = name.trim();
+    let pattern = raw_pattern.trim();
+    if name.is_empty() || pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return name == pattern;
+    }
+
+    let starts_with_wild = pattern.starts_with('*');
+    let ends_with_wild = pattern.ends_with('*');
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    let mut pos = 0usize;
+    let mut idx = 0usize;
+    if !starts_with_wild {
+        let first = parts[0];
+        if !name.starts_with(first) {
+            return false;
+        }
+        pos = first.len();
+        idx = 1;
+    }
+
+    let last_idx = parts.len().saturating_sub(1);
+    while idx < last_idx {
+        let segment = parts[idx];
+        idx += 1;
+        if segment.is_empty() {
+            continue;
+        }
+        let Some(found) = name[pos..].find(segment) else {
+            return false;
+        };
+        pos = pos.saturating_add(found).saturating_add(segment.len());
+    }
+
+    let last = parts[last_idx];
+    if last.is_empty() {
+        return true;
+    }
+    if ends_with_wild {
+        return name[pos..].contains(last);
+    }
+    if !name.ends_with(last) {
+        return false;
+    }
+    let start = name.len().saturating_sub(last.len());
+    start >= pos
+}
+
+impl OpenclawToolFilter {
+    fn allows_exec_implies_apply_patch(&self) -> bool {
+        let exec_aliases = tool_policy_key_aliases("exec");
+
+        for alias in &exec_aliases {
+            for pattern in &self.hard_deny {
+                if openclaw_policy_pattern_matches(alias, pattern) {
+                    return false;
+                }
+            }
+            for pattern in &self.deny {
+                if openclaw_policy_pattern_matches(alias, pattern) {
+                    return false;
+                }
+            }
+        }
+
+        self.allow.iter().any(|pattern| {
+            exec_aliases
+                .iter()
+                .any(|alias| openclaw_policy_pattern_matches(alias, pattern))
+        })
+    }
+
+    pub(crate) fn is_allowed(&self, tool_name: &str) -> bool {
+        let aliases = tool_policy_key_aliases(tool_name);
+
+        for alias in &aliases {
+            for pattern in &self.hard_deny {
+                if openclaw_policy_pattern_matches(alias, pattern) {
+                    return false;
+                }
+            }
+            for pattern in &self.deny {
+                if openclaw_policy_pattern_matches(alias, pattern) {
+                    return false;
+                }
+            }
+        }
+
+        if self.allow.is_empty() {
+            return true;
+        }
+
+        if aliases.iter().any(|alias| {
+            self.allow
+                .iter()
+                .any(|pattern| openclaw_policy_pattern_matches(alias, pattern))
+        }) {
+            return true;
+        }
+
+        if aliases
+            .iter()
+            .any(|alias| alias == "apply_patch" || alias == "applypatch")
+        {
+            return self.allows_exec_implies_apply_patch();
+        }
+
+        false
+    }
+}
+
+pub(crate) fn resolve_openclaw_tool_filter(
+    state: &GatewayState,
+    session_key: &str,
+    sender_id: Option<&str>,
+) -> OpenclawToolFilter {
+    let canonical =
+        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, session_key);
+    let store_key = openclaw_session_key_to_store_key(&canonical);
+    let channel = derive_channel_from_store_key(&store_key);
+    let chat_type = derive_chat_type_from_store_key(&store_key);
+    let canonical_lower = canonical.to_ascii_lowercase();
+    let store_lower = store_key.to_ascii_lowercase();
+
+    let file = load_openclaw_tool_policy_file(state);
+    let hard_deny = expand_openclaw_tool_groups(file.hard_deny);
+
+    let mut matches: Vec<(usize, usize, &OpenclawToolPolicyRule)> = Vec::new();
+    for (idx, rule) in file.rules.iter().enumerate() {
+        let match_channel = normalize_match_value(rule.r#match.channel.as_deref());
+        if let Some(match_channel) = match_channel.as_deref() {
+            if channel.as_deref() != Some(match_channel) {
+                continue;
+            }
+        }
+
+        let match_chat_type = normalize_match_value(rule.r#match.chat_type.as_deref());
+        if let Some(match_chat_type) = match_chat_type.as_deref() {
+            if chat_type.as_deref() != Some(match_chat_type) {
+                continue;
+            }
+        }
+
+        let prefix = rule
+            .r#match
+            .key_prefix
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase());
+        if let Some(prefix) = prefix.as_deref() {
+            if !canonical_lower.starts_with(prefix) && !store_lower.starts_with(prefix) {
+                continue;
+            }
+        }
+        let prefix_len = prefix.as_deref().map(|p| p.len()).unwrap_or(0);
+        matches.push((prefix_len, idx, rule));
+    }
+
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+    for (_prefix_len, _idx, rule) in matches {
+        if let Some(policy) = resolve_tools_by_sender(&rule.tools_by_sender, sender_id) {
+            return OpenclawToolFilter {
+                allow: expand_openclaw_tool_groups(policy.allow),
+                deny: expand_openclaw_tool_groups(policy.deny),
+                hard_deny: hard_deny.clone(),
+            };
+        }
+        if let Some(policy) = rule.tools.as_ref() {
+            return OpenclawToolFilter {
+                allow: expand_openclaw_tool_groups(policy.allow.clone()),
+                deny: expand_openclaw_tool_groups(policy.deny.clone()),
+                hard_deny: hard_deny.clone(),
+            };
+        }
+    }
+
+    OpenclawToolFilter {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        hard_deny,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OpenclawToolFilterStack {
+    filters: Vec<OpenclawToolFilter>,
+}
+
+impl OpenclawToolFilterStack {
+    pub(crate) fn is_allowed(&self, tool_name: &str) -> bool {
+        self.filters
+            .iter()
+            .all(|filter| filter.is_allowed(tool_name))
+    }
+}
+
+fn resolve_openclaw_agent_tools_config(
+    state: &GatewayState,
+    agent_id: &str,
+) -> Option<OpenclawToolsConfig> {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let file = load_openclaw_agents_file(state);
+    file.agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+        .and_then(|a| a.tools.clone())
+}
+
+fn resolve_openclaw_tool_profile_policy(profile: &str) -> Option<OpenclawToolAllowDenyPolicy> {
+    let normalized = profile.trim().to_ascii_lowercase();
+    let allow: Vec<&str> = match normalized.as_str() {
+        "minimal" => vec!["session_status"],
+        "coding" => vec![
+            "group:fs",
+            "group:runtime",
+            "group:sessions",
+            "group:memory",
+            "image",
+        ],
+        "messaging" => vec![
+            "group:messaging",
+            "sessions_list",
+            "sessions_history",
+            "sessions_send",
+            "session_status",
+        ],
+        "full" => Vec::new(),
+        _ => Vec::new(),
+    };
+    if allow.is_empty() {
+        return None;
+    }
+    Some(OpenclawToolAllowDenyPolicy {
+        allow: allow.into_iter().map(|s| s.to_string()).collect(),
+        deny: Vec::new(),
+    })
+}
+
+fn resolve_openclaw_tools_explicit_policy_filter(
+    cfg: &OpenclawToolsConfig,
+) -> Option<OpenclawToolFilter> {
+    let mut allow: Vec<String> = Vec::new();
+    if !cfg.allow.is_empty() {
+        allow.extend(cfg.allow.clone());
+        if !cfg.also_allow.is_empty() {
+            allow.extend(cfg.also_allow.clone());
+        }
+    } else if !cfg.also_allow.is_empty() {
+        allow.push("*".to_string());
+        allow.extend(cfg.also_allow.clone());
+    }
+    let deny = cfg.deny.clone();
+
+    if allow.is_empty() && deny.is_empty() {
+        return None;
+    }
+
+    Some(OpenclawToolFilter {
+        allow: expand_openclaw_tool_groups(allow),
+        deny: expand_openclaw_tool_groups(deny),
+        hard_deny: Vec::new(),
+    })
+}
+
+fn resolve_openclaw_tools_profile_filter(
+    global_tools: &OpenclawToolsConfig,
+    agent_tools: Option<&OpenclawToolsConfig>,
+) -> Option<OpenclawToolFilter> {
+    let profile = agent_tools
+        .and_then(|t| t.profile.as_deref())
+        .or_else(|| global_tools.profile.as_deref())?;
+    let mut policy = resolve_openclaw_tool_profile_policy(profile)?;
+
+    let also_allow = agent_tools
+        .filter(|t| !t.also_allow.is_empty())
+        .map(|t| t.also_allow.clone())
+        .or_else(|| {
+            if global_tools.also_allow.is_empty() {
+                None
+            } else {
+                Some(global_tools.also_allow.clone())
+            }
+        })
+        .unwrap_or_default();
+    if !also_allow.is_empty() && !policy.allow.is_empty() {
+        policy.allow.extend(also_allow);
+    }
+
+    Some(OpenclawToolFilter {
+        allow: expand_openclaw_tool_groups(policy.allow),
+        deny: expand_openclaw_tool_groups(policy.deny),
+        hard_deny: Vec::new(),
+    })
+}
+
+pub(crate) fn resolve_openclaw_effective_tool_filter(
+    state: &GatewayState,
+    session_key: &str,
+    sender_id: Option<&str>,
+    agent_id: &str,
+) -> OpenclawToolFilterStack {
+    let global_tools = load_openclaw_tools_config_file(state).tools;
+    let agent_tools = resolve_openclaw_agent_tools_config(state, agent_id);
+
+    let mut filters: Vec<OpenclawToolFilter> = Vec::new();
+
+    if let Some(profile_filter) =
+        resolve_openclaw_tools_profile_filter(&global_tools, agent_tools.as_ref())
+    {
+        filters.push(profile_filter);
+    }
+    if let Some(global_filter) = resolve_openclaw_tools_explicit_policy_filter(&global_tools) {
+        filters.push(global_filter);
+    }
+    if let Some(agent_tools) = agent_tools.as_ref() {
+        if let Some(agent_filter) = resolve_openclaw_tools_explicit_policy_filter(agent_tools) {
+            filters.push(agent_filter);
+        }
+    }
+
+    filters.push(resolve_openclaw_tool_filter(state, session_key, sender_id));
+
+    OpenclawToolFilterStack { filters }
 }
 
 async fn handle_sessions_list(
@@ -3172,7 +9127,12 @@ async fn handle_sessions_list(
         .map(|s| s.to_ascii_lowercase())
         .filter(|s| !s.is_empty());
 
-    let store_path = state.config().storage.database_path.to_string_lossy().to_string();
+    let store_path = state
+        .config()
+        .storage
+        .database_path
+        .to_string_lossy()
+        .to_string();
     let defaults = json!({
         "modelProvider": state.config().providers.default_provider,
         "model": state.config().providers.default_model,
@@ -3280,6 +9240,7 @@ async fn handle_sessions_list(
         row.insert("kind".to_string(), json!(kind));
         row.insert("updatedAt".to_string(), json!(updated_at_ms));
         row.insert("sessionId".to_string(), json!(s.id.to_string()));
+        row.insert("count".to_string(), json!(s.metadata.message_count));
 
         if let Some(label) = s.title.clone() {
             row.insert("label".to_string(), json!(label));
@@ -3347,12 +9308,21 @@ async fn handle_sessions_list(
         if let Some(v) = extract_sidecar_literal(sidecar_entry, "groupActivation") {
             row.insert("groupActivation".to_string(), v);
         }
+        if let Some(v) = extract_sidecar_literal(sidecar_entry, "toolPolicy") {
+            row.insert("toolPolicy".to_string(), v);
+        }
         if let Some(v) = extract_sidecar_string(sidecar_entry, "spawnedBy") {
             row.insert("spawnedBy".to_string(), json!(v));
         }
 
-        row.insert("inputTokens".to_string(), json!(s.metadata.total_input_tokens));
-        row.insert("outputTokens".to_string(), json!(s.metadata.total_output_tokens));
+        row.insert(
+            "inputTokens".to_string(),
+            json!(s.metadata.total_input_tokens),
+        );
+        row.insert(
+            "outputTokens".to_string(),
+            json!(s.metadata.total_output_tokens),
+        );
         row.insert("totalTokens".to_string(), json!(total_tokens));
 
         if let Some(v) = state.config().providers.default_provider.clone() {
@@ -3476,6 +9446,21 @@ async fn handle_sessions_list(
     }))
 }
 
+pub(crate) async fn openclaw_sessions_list_for_tool(
+    state: &GatewayState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, ErrorShape> {
+    handle_sessions_list(state, params).await
+}
+
+pub(crate) async fn openclaw_sessions_patch_for_tool(
+    state: &GatewayState,
+    key: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, ErrorShape> {
+    handle_sessions_patch(state, key, patch).await
+}
+
 async fn handle_sessions_patch(
     state: &GatewayState,
     key: &str,
@@ -3483,16 +9468,17 @@ async fn handle_sessions_patch(
 ) -> Result<serde_json::Value, ErrorShape> {
     let raw_key = key.trim();
     if raw_key.is_empty() {
-        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "key required",
+        ));
     }
 
-    let canonical_key =
-        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+    let (canonical_key, openclaw_candidates) =
+        openclaw_session_store_key_candidates(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
     let store_key = openclaw_session_key_to_store_key(&canonical_key);
-    let agent_id = openclaw_session_key_agent_id(
-        &canonical_key,
-        crate::openclaw_paths::DEFAULT_AGENT_ID,
-    );
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical_key, crate::openclaw_paths::DEFAULT_AGENT_ID);
 
     let store = state
         .session_store()
@@ -3501,11 +9487,18 @@ async fn handle_sessions_patch(
     // Stable operator user id (single-user gateway).
     let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
 
-    // Try "openclaw" first, then fall back to split keys. If missing, create.
-    let mut session = store
-        .get_by_channel("openclaw", &store_key)
-        .await
-        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+    // Prefer OpenClaw sessions when present, otherwise fall back to channel sessions derived from
+    // the session key ("whatsapp:...", "signal:...", etc).
+    let mut session: Option<drbot_core::session::Session> = None;
+    for candidate in &openclaw_candidates {
+        session = store
+            .get_by_channel("openclaw", candidate)
+            .await
+            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+        if session.is_some() {
+            break;
+        }
+    }
     if session.is_none() {
         let (channel_type, channel_id) = session_key_to_channel(&store_key);
         session = store
@@ -3513,11 +9506,19 @@ async fn handle_sessions_patch(
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
         if session.is_none() {
-            session = store
-                .get_or_create(user_id, &channel_type, &channel_id)
-                .await
-                .map(Some)
-                .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+            if channel_type == "openclaw" {
+                session = store
+                    .get_or_create(user_id, "openclaw", &canonical_key)
+                    .await
+                    .map(Some)
+                    .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+            } else {
+                session = store
+                    .get_or_create(user_id, &channel_type, &channel_id)
+                    .await
+                    .map(Some)
+                    .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+            }
         }
     }
     let mut session =
@@ -3546,7 +9547,9 @@ async fn handle_sessions_patch(
                         let list = store
                             .list(drbot_sessions::ListOptions::default())
                             .await
-                            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+                            .map_err(|e| {
+                                ErrorShape::new(error_codes::UNAVAILABLE, e.to_string())
+                            })?;
                         for other in list {
                             if other.id == session.id {
                                 continue;
@@ -3601,6 +9604,12 @@ async fn handle_sessions_patch(
         }
         apply_sidecar_patch_literal(&mut sidecar_entry, patch, field);
     }
+    for field in ["toolPolicy"] {
+        if patch.get(field).is_some() {
+            touched = true;
+        }
+        apply_sidecar_patch_literal(&mut sidecar_entry, patch, field);
+    }
 
     if sidecar_entry.is_empty() {
         sidecar.entries.remove(&canonical_key);
@@ -3611,12 +9620,10 @@ async fn handle_sessions_patch(
             sidecar.entries.remove(store_key.as_str());
         }
     } else {
-        sidecar
-            .entries
-            .insert(
-                canonical_key.clone(),
-                serde_json::Value::Object(sidecar_entry),
-            );
+        sidecar.entries.insert(
+            canonical_key.clone(),
+            serde_json::Value::Object(sidecar_entry),
+        );
         if canonical_key != raw_key {
             sidecar.entries.remove(raw_key);
         }
@@ -3661,6 +9668,7 @@ async fn handle_sessions_patch(
             "execNode": extract_sidecar_string(sidecar_entry, "execNode"),
             "sendPolicy": extract_sidecar_literal(sidecar_entry, "sendPolicy"),
             "groupActivation": extract_sidecar_literal(sidecar_entry, "groupActivation"),
+            "toolPolicy": extract_sidecar_literal(sidecar_entry, "toolPolicy"),
             "spawnedBy": extract_sidecar_string(sidecar_entry, "spawnedBy"),
             "model": resolved_model.clone(),
             "modelProvider": state.config().providers.default_provider,
@@ -3678,32 +9686,24 @@ async fn handle_sessions_delete(
 ) -> Result<serde_json::Value, ErrorShape> {
     let raw_key = key.trim();
     if raw_key.is_empty() {
-        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "key required",
+        ));
     }
 
-    let canonical_key = canonicalize_openclaw_session_key(
-        crate::openclaw_paths::DEFAULT_AGENT_ID,
-        raw_key,
-    );
+    let (canonical_key, openclaw_candidates) =
+        openclaw_session_store_key_candidates(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
     let store_key = openclaw_session_key_to_store_key(&canonical_key);
-    let agent_id = openclaw_session_key_agent_id(
-        &canonical_key,
-        crate::openclaw_paths::DEFAULT_AGENT_ID,
-    );
+    let agent_id =
+        openclaw_session_key_agent_id(&canonical_key, crate::openclaw_paths::DEFAULT_AGENT_ID);
 
     let store = state
         .session_store()
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
 
     let mut session = None;
-    let mut candidates: Vec<&str> = Vec::new();
-    candidates.push(store_key.as_str());
-    if store_key != raw_key {
-        candidates.push(raw_key);
-    }
-
-    for candidate in candidates {
-        // Try "openclaw" first, then fall back to split keys.
+    for candidate in &openclaw_candidates {
         session = store
             .get_by_channel("openclaw", candidate)
             .await
@@ -3711,15 +9711,13 @@ async fn handle_sessions_delete(
         if session.is_some() {
             break;
         }
-
-        let (channel_type, channel_id) = session_key_to_channel(candidate);
+    }
+    if session.is_none() {
+        let (channel_type, channel_id) = session_key_to_channel(&store_key);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-        if session.is_some() {
-            break;
-        }
     }
     let session =
         session.ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "unknown session"))?;
@@ -3763,6 +9761,10 @@ fn default_voicewake_triggers() -> Vec<String> {
     ]
 }
 
+fn default_voicewake_language() -> String {
+    "en".to_string()
+}
+
 fn normalize_voicewake_triggers(input: &[serde_json::Value]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for v in input.iter().take(32) {
@@ -3780,10 +9782,23 @@ fn normalize_voicewake_triggers(input: &[serde_json::Value]) -> Vec<String> {
     }
 }
 
+fn normalize_voicewake_language(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return default_voicewake_language();
+    }
+    trimmed.chars().take(32).collect::<String>()
+}
+
 async fn handle_voicewake_get(state: &GatewayState) -> Result<serde_json::Value, ErrorShape> {
     let path = resolve_voicewake_path(state);
     if !path.exists() {
-        return Ok(json!({ "triggers": default_voicewake_triggers() }));
+        let language = default_voicewake_language();
+        return Ok(json!({
+            "triggers": default_voicewake_triggers(),
+            "language": language,
+            "locale": language,
+        }));
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         ErrorShape::new(
@@ -3797,15 +9812,51 @@ async fn handle_voicewake_get(state: &GatewayState) -> Result<serde_json::Value,
         .and_then(|v| v.as_array())
         .map(|arr| normalize_voicewake_triggers(arr))
         .unwrap_or_else(default_voicewake_triggers);
-    Ok(json!({ "triggers": triggers }))
+
+    let language = parsed
+        .get("language")
+        .and_then(|v| v.as_str())
+        .or_else(|| parsed.get("locale").and_then(|v| v.as_str()))
+        .map(normalize_voicewake_language)
+        .unwrap_or_else(default_voicewake_language);
+
+    Ok(json!({
+        "triggers": triggers,
+        "language": language,
+        "locale": language,
+    }))
 }
 
 async fn handle_voicewake_set(
     state: &GatewayState,
     triggers: &[serde_json::Value],
+    language: Option<&str>,
 ) -> Result<serde_json::Value, ErrorShape> {
     let path = resolve_voicewake_path(state);
     let triggers = normalize_voicewake_triggers(triggers);
+    let mut resolved_language = default_voicewake_language();
+
+    if path.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(lang) = parsed
+                    .get("language")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| parsed.get("locale").and_then(|v| v.as_str()))
+                {
+                    let normalized = normalize_voicewake_language(lang);
+                    if !normalized.trim().is_empty() {
+                        resolved_language = normalized;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(lang) = language.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        resolved_language = normalize_voicewake_language(lang);
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             ErrorShape::new(
@@ -3814,7 +9865,8 @@ async fn handle_voicewake_set(
             )
         })?;
     }
-    let file = json!({ "triggers": triggers, "updatedAtMs": now_ms() });
+    let file =
+        json!({ "triggers": triggers, "language": resolved_language, "updatedAtMs": now_ms() });
     let raw = serde_json::to_string_pretty(&file).unwrap_or_else(|_| file.to_string());
     std::fs::write(&path, raw).map_err(|e| {
         ErrorShape::new(
@@ -3822,7 +9874,17 @@ async fn handle_voicewake_set(
             format!("failed to write voicewake config: {}", e),
         )
     })?;
-    Ok(json!({ "triggers": file.get("triggers").cloned().unwrap_or_else(|| json!([])) }))
+    let language = file
+        .get("language")
+        .and_then(|v| v.as_str())
+        .map(normalize_voicewake_language)
+        .unwrap_or_else(default_voicewake_language);
+
+    Ok(json!({
+        "triggers": file.get("triggers").cloned().unwrap_or_else(|| json!([])),
+        "language": language,
+        "locale": language,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -4161,7 +10223,459 @@ fn is_browser_node(client: &OpenclawClient) -> bool {
         || client.commands.iter().any(|c| c == "browser.proxy")
 }
 
-async fn handle_browser_request(
+#[derive(Default)]
+struct OpenclawBrowserProfileRuntime {
+    browser: Option<Browser>,
+    pages: HashMap<String, Page>,
+    active_target_id: Option<String>,
+    refs_by_target: HashMap<String, HashMap<String, String>>,
+    user_data_dir: Option<String>,
+    ws_url: Option<String>,
+}
+
+#[derive(Default)]
+struct OpenclawBrowserRuntime {
+    profiles: HashMap<String, OpenclawBrowserProfileRuntime>,
+}
+
+static OPENCLAW_BROWSER_RUNTIME: OnceLock<Mutex<OpenclawBrowserRuntime>> = OnceLock::new();
+
+fn openclaw_browser_runtime() -> &'static Mutex<OpenclawBrowserRuntime> {
+    OPENCLAW_BROWSER_RUNTIME.get_or_init(|| Mutex::new(OpenclawBrowserRuntime::default()))
+}
+
+const OPENCLAW_BROWSER_DEFAULT_PROFILE: &str = "openclaw";
+const OPENCLAW_BROWSER_DEFAULT_COLOR: &str = "#4f46e5";
+const OPENCLAW_BROWSER_PROFILE_COLORS: &[&str] = &[
+    "#FF4500", "#0066CC", "#00AA00", "#9933FF", "#FF6699", "#00CCCC", "#FF9900", "#6666FF",
+    "#CC3366", "#339966",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OpenclawBrowserProfilesFile {
+    #[serde(default)]
+    profiles: HashMap<String, OpenclawBrowserProfileRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenclawBrowserProfileRecord {
+    color: String,
+    #[serde(rename = "cdpUrl", default, skip_serializing_if = "Option::is_none")]
+    cdp_url: Option<String>,
+}
+
+fn openclaw_browser_profiles_path(state: &GatewayState) -> PathBuf {
+    resolve_openclaw_state_dir(state)
+        .or_else(resolve_data_dir)
+        .unwrap_or_else(|| std::env::temp_dir().join("drbot-openclaw"))
+        .join("browser")
+        .join("profiles.json")
+}
+
+fn load_openclaw_browser_profiles(state: &GatewayState) -> OpenclawBrowserProfilesFile {
+    let path = openclaw_browser_profiles_path(state);
+    read_json_file::<OpenclawBrowserProfilesFile>(&path).unwrap_or_default()
+}
+
+fn store_openclaw_browser_profiles(
+    state: &GatewayState,
+    profiles: &OpenclawBrowserProfilesFile,
+) -> Result<(), ErrorShape> {
+    let path = openclaw_browser_profiles_path(state);
+    write_json_atomic(&path, profiles)
+}
+
+fn is_valid_openclaw_browser_profile_name(name: &str) -> bool {
+    // OpenClaw parity: lowercase letters, digits, and hyphens; must start with alnum.
+    let name = name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+fn allocate_openclaw_browser_profile_color(used: &HashSet<String>) -> String {
+    for color in OPENCLAW_BROWSER_PROFILE_COLORS {
+        if !used.contains(&color.to_uppercase()) {
+            return color.to_string();
+        }
+    }
+    let idx = used.len() % OPENCLAW_BROWSER_PROFILE_COLORS.len();
+    OPENCLAW_BROWSER_PROFILE_COLORS
+        .get(idx)
+        .copied()
+        .unwrap_or(OPENCLAW_BROWSER_DEFAULT_COLOR)
+        .to_string()
+}
+
+fn resolve_openclaw_browser_profile(
+    state: &GatewayState,
+    raw: Option<&str>,
+) -> Result<String, ErrorShape> {
+    let profile = raw.unwrap_or(OPENCLAW_BROWSER_DEFAULT_PROFILE).trim();
+    if profile.is_empty() {
+        return Ok(OPENCLAW_BROWSER_DEFAULT_PROFILE.to_string());
+    }
+    let lowered = profile.to_ascii_lowercase();
+    if lowered == "chrome" {
+        return Err(ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            "profile=chrome is not supported by this gateway (no extension relay). Use profile=openclaw.",
+        ));
+    }
+    if lowered == OPENCLAW_BROWSER_DEFAULT_PROFILE {
+        return Ok(lowered);
+    }
+    if !is_valid_openclaw_browser_profile_name(&lowered) {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "invalid profile name: use lowercase letters, numbers, and hyphens only",
+        ));
+    }
+    let stored = load_openclaw_browser_profiles(state);
+    if stored.profiles.contains_key(&lowered) {
+        Ok(lowered)
+    } else {
+        Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            format!("Profile \"{}\" not found.", lowered),
+        ))
+    }
+}
+
+fn resolve_openclaw_browser_profile_color(state: &GatewayState, profile: &str) -> String {
+    let profile = profile.trim();
+    if profile.is_empty() || profile.eq_ignore_ascii_case(OPENCLAW_BROWSER_DEFAULT_PROFILE) {
+        return OPENCLAW_BROWSER_DEFAULT_COLOR.to_string();
+    }
+    let stored = load_openclaw_browser_profiles(state);
+    stored
+        .profiles
+        .get(profile)
+        .map(|p| p.color.clone())
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| OPENCLAW_BROWSER_DEFAULT_COLOR.to_string())
+}
+
+fn resolve_openclaw_browser_user_data_dir(state: &GatewayState, profile: &str) -> String {
+    let safe_profile = profile
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect::<String>();
+    let profile = if safe_profile.is_empty() {
+        "openclaw".to_string()
+    } else {
+        safe_profile
+    };
+
+    let base = resolve_openclaw_state_dir(state)
+        .or_else(resolve_data_dir)
+        .unwrap_or_else(|| std::env::temp_dir().join("drbot-openclaw"));
+    base.join("browser")
+        .join(profile)
+        .join("user-data")
+        .to_string_lossy()
+        .to_string()
+}
+
+async fn ensure_openclaw_browser_running(
+    state: &GatewayState,
+    profile: &str,
+) -> Result<(), ErrorShape> {
+    let mut runtime = openclaw_browser_runtime().lock().await;
+    let entry = runtime
+        .profiles
+        .entry(profile.to_string())
+        .or_insert_with(OpenclawBrowserProfileRuntime::default);
+    if entry.browser.is_some() {
+        return Ok(());
+    }
+
+    let stored = load_openclaw_browser_profiles(state);
+    if let Some(ws_url) = stored
+        .profiles
+        .get(profile)
+        .and_then(|p| p.cdp_url.as_deref())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let browser = Browser::connect(ws_url).await.map_err(|e| {
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("browser connect failed: {}", e),
+            )
+        })?;
+        entry.ws_url = Some(ws_url.to_string());
+        entry.user_data_dir = None;
+        entry.browser = Some(browser);
+        return Ok(());
+    }
+
+    let user_data_dir = resolve_openclaw_browser_user_data_dir(state, profile);
+    let mut options = BrowserOptions::default();
+    options.user_data_dir = Some(user_data_dir.clone());
+
+    let browser = Browser::launch(options).await.map_err(|e| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("browser init failed: {}", e),
+        )
+    })?;
+    entry.ws_url = Some(browser.ws_url().to_string());
+    entry.user_data_dir = Some(user_data_dir);
+    entry.browser = Some(browser);
+    Ok(())
+}
+
+fn parse_cdp_port(ws_url: Option<&str>) -> u16 {
+    let Some(ws_url) = ws_url else {
+        return 0;
+    };
+    // Example: ws://127.0.0.1:9222/devtools/browser/...
+    let without_scheme = ws_url
+        .strip_prefix("ws://")
+        .or_else(|| ws_url.strip_prefix("wss://"))
+        .unwrap_or(ws_url);
+    let host_port = without_scheme.split('/').next().unwrap_or("");
+    let port = host_port.split(':').nth(1).unwrap_or("");
+    port.parse::<u16>().unwrap_or(0)
+}
+
+async fn resolve_openclaw_browser_target_id(
+    profile_state: &mut OpenclawBrowserProfileRuntime,
+) -> Result<String, ErrorShape> {
+    if let Some(active) = profile_state
+        .active_target_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(active.to_string());
+    }
+    let Some(browser) = profile_state.browser.as_ref() else {
+        return Err(ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            "browser is not running",
+        ));
+    };
+
+    let tabs = browser.pages().await.map_err(|e| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to list tabs: {}", e),
+        )
+    })?;
+
+    if let Some(first) = tabs.first() {
+        profile_state.active_target_id = Some(first.target_id.clone());
+        return Ok(first.target_id.clone());
+    }
+
+    let page = browser.new_page().await.map_err(|e| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to create tab: {}", e),
+        )
+    })?;
+    let target_id = page.target_id().to_string();
+    profile_state.pages.insert(target_id.clone(), page);
+    profile_state.active_target_id = Some(target_id.clone());
+    Ok(target_id)
+}
+
+async fn ensure_openclaw_browser_page(
+    profile_state: &mut OpenclawBrowserProfileRuntime,
+    target_id: &str,
+) -> Result<(), ErrorShape> {
+    if profile_state.pages.contains_key(target_id) {
+        return Ok(());
+    }
+    let Some(browser) = profile_state.browser.as_ref() else {
+        return Err(ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            "browser is not running",
+        ));
+    };
+
+    let page = browser.attach_page(target_id).await.map_err(|e| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to attach tab {}: {}", target_id, e),
+        )
+    })?;
+    profile_state.pages.insert(target_id.to_string(), page);
+    Ok(())
+}
+
+async fn openclaw_browser_snapshot_extract(
+    page: &Page,
+    limit: usize,
+) -> Result<(String, String, Vec<(String, String, String)>), ErrorShape> {
+    let js = r#"
+(() => {
+  const escapeCss = (s) => {
+    try {
+      // eslint-disable-next-line no-undef
+      if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
+    } catch (_) {}
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, (m) => `\\${m}`);
+  };
+
+  function selectorFor(el) {
+    if (!el || !(el instanceof Element)) return null;
+    if (el.id) return `#${escapeCss(el.id)}`;
+    const tag = el.tagName.toLowerCase();
+    const name = el.getAttribute('name');
+    if (name) return `${tag}[name="${String(name).replaceAll('"', '\\"')}"]`;
+    const aria = el.getAttribute('aria-label');
+    if (aria) return `${tag}[aria-label="${String(aria).replaceAll('"', '\\"')}"]`;
+
+    const parts = [];
+    let cur = el;
+    let guard = 0;
+    while (cur && cur.nodeType === 1 && cur !== document.body && guard++ < 8) {
+      const t = cur.tagName.toLowerCase();
+      if (cur.id) {
+        parts.unshift(`#${escapeCss(cur.id)}`);
+        break;
+      }
+      let idx = 1;
+      let sib = cur;
+      while ((sib = sib.previousElementSibling)) {
+        if (sib.tagName && sib.tagName.toLowerCase() === t) idx++;
+      }
+      parts.unshift(`${t}:nth-of-type(${idx})`);
+      cur = cur.parentElement;
+    }
+    return parts.join(' > ');
+  }
+
+  function nameFor(el) {
+    const aria = el.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    const title = el.getAttribute('title');
+    if (title) return title.trim();
+    const alt = el.getAttribute('alt');
+    if (alt) return alt.trim();
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      const ph = el.getAttribute('placeholder');
+      if (ph) return ph.trim();
+      if (el.value) return String(el.value).trim().slice(0, 80);
+    }
+    const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g,' ');
+    return text.slice(0, 80);
+  }
+
+  function roleFor(el) {
+    const role = el.getAttribute('role');
+    if (role) return role;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'a') return 'link';
+    if (tag === 'button') return 'button';
+    if (tag === 'input') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'submit') return 'button';
+      return 'textbox';
+    }
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'select') return 'combobox';
+    return tag;
+  }
+
+  const selectors = [
+    'a',
+    'button',
+    'input',
+    'textarea',
+    'select',
+    '[role="button"]',
+    '[role="link"]',
+    '[role="textbox"]',
+    '[role="checkbox"]',
+    '[role="radio"]',
+    '[onclick]',
+  ];
+  const candidates = Array.from(document.querySelectorAll(selectors.join(',')));
+  const out = [];
+  const seen = new Set();
+  for (const el of candidates) {
+    if (!(el instanceof Element)) continue;
+    const sel = selectorFor(el);
+    if (!sel || seen.has(sel)) continue;
+    seen.add(sel);
+    out.push({
+      selector: sel,
+      role: roleFor(el),
+      name: nameFor(el),
+    });
+    if (out.length >= 200) break;
+  }
+
+  return {
+    title: document.title || '',
+    url: String(window.location.href || ''),
+    elements: out,
+  };
+})()
+"#;
+
+    let payload = page.evaluate(js).await.map_err(|e| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("snapshot evaluate failed: {}", e),
+        )
+    })?;
+
+    let title = payload
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = payload
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut items: Vec<(String, String, String)> = Vec::new();
+    if let Some(elements) = payload.get("elements").and_then(|v| v.as_array()) {
+        for element in elements.iter().take(limit) {
+            let selector = element
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if selector.is_empty() {
+                continue;
+            }
+            let role = element
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let name = element
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            items.push((selector.to_string(), role, name));
+        }
+    }
+
+    Ok((title, url, items))
+}
+
+pub(crate) async fn handle_browser_request(
     state: &GatewayState,
     method: &str,
     path: &str,
@@ -4178,14 +10692,47 @@ async fn handle_browser_request(
         path = format!("/{}", path);
     }
 
+    // SSRF guard (OpenClaw hardening parity): block private-network URL targets by default.
+    if method == "POST" && (path == "/screenshot" || path == "/navigate" || path == "/tabs/open") {
+        let candidate_url = match path.as_str() {
+            "/screenshot" => query
+                .and_then(|q| q.get("url"))
+                .and_then(|v| v.as_str())
+                .or_else(|| body.and_then(|b| b.get("url")).and_then(|v| v.as_str())),
+            "/navigate" | "/tabs/open" => body.and_then(|b| b.get("url")).and_then(|v| v.as_str()),
+            _ => None,
+        };
+
+        if let Some(url) = candidate_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let policy = crate::ssrf::SsrfPolicy::from_env(
+                &[
+                    "DRBOT_OPENCLAW_BROWSER_ALLOW_PRIVATE",
+                    "DRBOT_BROWSER_ALLOW_PRIVATE",
+                ],
+                Some("DRBOT_OPENCLAW_BROWSER_ALLOWED_HOSTNAMES"),
+            );
+            crate::ssrf::ensure_url_allowed(url, &policy).await?;
+        }
+    }
+
     // OpenClaw parity: prefer proxying browser routes to a connected browser-capable node
     // (companion app or node host) when one is available.
     let timeout_ms = timeout_ms.unwrap_or(20_000).clamp(1, 900_000);
-    let requested_node = std::env::var("DRBOT_OPENCLAW_BROWSER_NODE")
-        .ok()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let requested_node_from_query = query
+        .and_then(|q| q.get("node").or_else(|| q.get("nodeId")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let requested_node = if !requested_node_from_query.is_empty() {
+        requested_node_from_query
+    } else {
+        std::env::var("DRBOT_OPENCLAW_BROWSER_NODE")
+            .ok()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
     let connected_nodes = state
         .list_openclaw_clients()
         .await
@@ -4201,9 +10748,7 @@ async fn handle_browser_request(
         }
         if requested_node.is_empty() {
             if connected_nodes.len() == 1 {
-                let c = connected_nodes
-                    .first()
-                    .expect("len checked");
+                let c = connected_nodes.first().expect("len checked");
                 let id = c
                     .device_id
                     .clone()
@@ -4349,8 +10894,12 @@ async fn handle_browser_request(
         let mut out = result;
         if !mapping.is_empty() {
             let apply_path = |obj: &mut serde_json::Map<String, serde_json::Value>, key: &str| {
-                let Some(v) = obj.get_mut(key) else { return; };
-                let Some(raw) = v.as_str() else { return; };
+                let Some(v) = obj.get_mut(key) else {
+                    return;
+                };
+                let Some(raw) = v.as_str() else {
+                    return;
+                };
                 if let Some(next) = mapping.get(raw) {
                     *v = json!(next);
                 }
@@ -4369,12 +10918,3847 @@ async fn handle_browser_request(
     }
 
     match (method.as_str(), path.as_str()) {
-        ("GET", "/") | ("GET", "/status") => Ok(json!({
-            "enabled": true,
-            "running": false,
-            "ts": now_ms(),
-        })),
+        ("GET", "/") | ("GET", "/status") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            let color = resolve_openclaw_browser_profile_color(state, &profile);
+
+            let runtime = openclaw_browser_runtime().lock().await;
+            let entry = runtime.profiles.get(&profile);
+            let running = entry.and_then(|e| e.browser.as_ref()).is_some();
+            let stored = load_openclaw_browser_profiles(state);
+            let configured_ws_url = stored
+                .profiles
+                .get(&profile)
+                .and_then(|p| p.cdp_url.as_deref())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let ws_url = entry
+                .and_then(|e| e.ws_url.as_deref())
+                .or(configured_ws_url);
+            let user_data_dir = entry.and_then(|e| e.user_data_dir.as_deref());
+
+            Ok(json!({
+                "enabled": true,
+                "profile": profile,
+                "running": running,
+                "cdpReady": running,
+                "cdpHttp": false,
+                "pid": serde_json::Value::Null,
+                "cdpPort": parse_cdp_port(ws_url),
+                "cdpUrl": ws_url,
+                "chosenBrowser": "chromium",
+                "detectedBrowser": serde_json::Value::Null,
+                "detectedExecutablePath": serde_json::Value::Null,
+                "detectError": serde_json::Value::Null,
+                "userDataDir": user_data_dir,
+                "color": color,
+                "headless": true,
+                "attachOnly": false,
+                "ts": now_ms(),
+            }))
+        }
+        ("POST", "/start") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+            Ok(json!({ "ok": true, "profile": profile }))
+        }
+        ("POST", "/stop") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            let browser_to_close = {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let Some(entry) = runtime.profiles.get_mut(&profile) else {
+                    return Ok(json!({ "ok": true, "profile": profile, "running": false }));
+                };
+                entry.pages.clear();
+                entry.refs_by_target.clear();
+                entry.active_target_id = None;
+                entry.ws_url = None;
+                entry.user_data_dir = None;
+                entry.browser.take()
+            };
+            if let Some(browser) = browser_to_close {
+                let _ = browser.close().await;
+            }
+            Ok(json!({ "ok": true, "profile": profile, "running": false }))
+        }
+        ("POST", "/reset-profile") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            let user_data_dir = resolve_openclaw_browser_user_data_dir(state, &profile);
+
+            let browser_to_close = {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                if let Some(entry) = runtime.profiles.get_mut(&profile) {
+                    entry.pages.clear();
+                    entry.refs_by_target.clear();
+                    entry.active_target_id = None;
+                    entry.ws_url = None;
+                    entry.user_data_dir = None;
+                    entry.browser.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(browser) = browser_to_close {
+                let _ = browser.close().await;
+            }
+
+            let from = std::path::PathBuf::from(&user_data_dir);
+            if !from.exists() {
+                return Ok(json!({
+                    "ok": true,
+                    "profile": profile,
+                    "moved": false,
+                    "from": user_data_dir,
+                }));
+            }
+
+            let to = from
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(format!("user-data.reset-{}", Uuid::new_v4()));
+            let mut moved = false;
+            let mut to_out: Option<String> = None;
+
+            match std::fs::rename(&from, &to) {
+                Ok(_) => {
+                    moved = true;
+                    to_out = Some(to.to_string_lossy().to_string());
+                }
+                Err(_) => {
+                    if std::fs::remove_dir_all(&from).is_ok() {
+                        moved = true;
+                    }
+                }
+            }
+
+            Ok(json!({
+                "ok": true,
+                "profile": profile,
+                "moved": moved,
+                "from": user_data_dir,
+                "to": to_out,
+            }))
+        }
+        ("GET", "/profiles") => {
+            let stored = load_openclaw_browser_profiles(state);
+            let mut names: Vec<String> = Vec::with_capacity(stored.profiles.len() + 1);
+            names.push(OPENCLAW_BROWSER_DEFAULT_PROFILE.to_string());
+            names.extend(stored.profiles.keys().cloned());
+            names.sort();
+            names.dedup();
+
+            let runtime = openclaw_browser_runtime().lock().await;
+            let mut profiles: Vec<serde_json::Value> = Vec::new();
+            for name in names {
+                let entry = runtime.profiles.get(&name);
+                let running = entry.and_then(|e| e.browser.as_ref()).is_some();
+                let record = stored.profiles.get(&name);
+                let configured_ws_url = record
+                    .and_then(|p| p.cdp_url.as_deref())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("");
+                let runtime_ws_url = entry.and_then(|e| e.ws_url.as_deref()).unwrap_or("");
+                let ws_url = if !runtime_ws_url.is_empty() {
+                    runtime_ws_url
+                } else {
+                    configured_ws_url
+                };
+                let cdp_port = if ws_url.is_empty() {
+                    0
+                } else {
+                    parse_cdp_port(Some(ws_url))
+                };
+                let tab_count = entry.map(|e| e.pages.len()).unwrap_or(0);
+                let color = if name == OPENCLAW_BROWSER_DEFAULT_PROFILE {
+                    OPENCLAW_BROWSER_DEFAULT_COLOR.to_string()
+                } else {
+                    stored
+                        .profiles
+                        .get(&name)
+                        .map(|p| p.color.clone())
+                        .unwrap_or_else(|| OPENCLAW_BROWSER_DEFAULT_COLOR.to_string())
+                };
+
+                let is_remote = record
+                    .and_then(|p| p.cdp_url.as_deref())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                profiles.push(json!({
+                    "name": name,
+                    "cdpPort": cdp_port,
+                    "cdpUrl": ws_url,
+                    "color": color,
+                    "running": running,
+                    "tabCount": tab_count,
+                    "isDefault": name == OPENCLAW_BROWSER_DEFAULT_PROFILE,
+                    "isRemote": is_remote,
+                }));
+            }
+            Ok(json!({ "profiles": profiles }))
+        }
+        ("POST", "/profiles/create") => {
+            let body = body.ok_or_else(|| {
+                ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "profiles.create requires body",
+                )
+            })?;
+            let name_raw = body
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if name_raw.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "name is required",
+                ));
+            }
+            let name = name_raw.to_ascii_lowercase();
+            if name == OPENCLAW_BROWSER_DEFAULT_PROFILE {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    format!("profile \"{}\" already exists", name),
+                ));
+            }
+            if !is_valid_openclaw_browser_profile_name(&name) {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "invalid profile name: use lowercase letters, numbers, and hyphens only",
+                ));
+            }
+
+            let raw_cdp_url = body
+                .get("cdpUrl")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let cdp_url = if let Some(raw_cdp_url) = raw_cdp_url {
+                let mut policy = crate::ssrf::SsrfPolicy::from_env(
+                    &[
+                        "DRBOT_OPENCLAW_BROWSER_ALLOW_PRIVATE",
+                        "DRBOT_BROWSER_ALLOW_PRIVATE",
+                    ],
+                    Some("DRBOT_OPENCLAW_BROWSER_ALLOWED_HOSTNAMES"),
+                );
+                let parsed = reqwest::Url::parse(raw_cdp_url).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        format!("invalid cdpUrl: {}", e),
+                    )
+                })?;
+                let host = parsed.host_str().unwrap_or("").trim().to_ascii_lowercase();
+                let loopback = host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| ip.is_loopback())
+                        .unwrap_or(false);
+                if loopback {
+                    policy.allow_private_network = true;
+                }
+                let validated =
+                    crate::ssrf::ensure_ws_url_allowed(parsed.as_str(), &policy).await?;
+                Some(validated.to_string())
+            } else {
+                None
+            };
+            let driver = body
+                .get("driver")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if driver == "extension" {
+                return Err(ErrorShape::new(
+                    error_codes::UNAVAILABLE,
+                    "driver=extension is not supported by this gateway",
+                ));
+            }
+
+            let is_hex_color = |value: &str| -> bool {
+                let value = value.trim();
+                if value.len() != 7 {
+                    return false;
+                }
+                let bytes = value.as_bytes();
+                if bytes[0] != b'#' {
+                    return false;
+                }
+                bytes[1..].iter().all(|b| b.is_ascii_hexdigit())
+            };
+            let color_raw = body
+                .get("color")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let mut stored = load_openclaw_browser_profiles(state);
+            if stored.profiles.contains_key(&name) {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    format!("profile \"{}\" already exists", name),
+                ));
+            }
+
+            let mut used_colors = HashSet::new();
+            used_colors.insert(OPENCLAW_BROWSER_DEFAULT_COLOR.to_uppercase());
+            for record in stored.profiles.values() {
+                used_colors.insert(record.color.to_uppercase());
+            }
+            let color = color_raw
+                .as_deref()
+                .filter(|c| is_hex_color(c))
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| allocate_openclaw_browser_profile_color(&used_colors));
+
+            stored.profiles.insert(
+                name.clone(),
+                OpenclawBrowserProfileRecord {
+                    color: color.clone(),
+                    cdp_url: cdp_url.clone(),
+                },
+            );
+            store_openclaw_browser_profiles(state, &stored)?;
+
+            let cdp_port = parse_cdp_port(cdp_url.as_deref());
+            let is_remote = cdp_url.is_some();
+            let cdp_url_out = cdp_url.clone().unwrap_or_default();
+
+            Ok(json!({
+                "ok": true,
+                "profile": name,
+                "cdpPort": cdp_port,
+                "cdpUrl": cdp_url_out,
+                "color": color,
+                "isRemote": is_remote,
+            }))
+        }
+        ("DELETE", p) if p.starts_with("/profiles/") => {
+            let name_raw = p.trim_start_matches("/profiles/").trim();
+            if name_raw.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "profile name is required",
+                ));
+            }
+            let name = name_raw.to_ascii_lowercase();
+            if name == OPENCLAW_BROWSER_DEFAULT_PROFILE {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "cannot delete the default profile \"openclaw\"",
+                ));
+            }
+            if !is_valid_openclaw_browser_profile_name(&name) {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "invalid profile name",
+                ));
+            }
+
+            let mut stored = load_openclaw_browser_profiles(state);
+            if stored.profiles.remove(&name).is_none() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    format!("profile \"{}\" not found", name),
+                ));
+            }
+            store_openclaw_browser_profiles(state, &stored)?;
+
+            let browser_to_close = {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                runtime.profiles.remove(&name).and_then(|mut entry| {
+                    entry.pages.clear();
+                    entry.refs_by_target.clear();
+                    entry.active_target_id = None;
+                    entry.ws_url = None;
+                    entry.user_data_dir = None;
+                    entry.browser.take()
+                })
+            };
+            if let Some(browser) = browser_to_close {
+                let _ = browser.close().await;
+            }
+
+            let user_data_dir = resolve_openclaw_browser_user_data_dir(state, &name);
+            let profile_dir = std::path::PathBuf::from(&user_data_dir)
+                .parent()
+                .map(|p| p.to_path_buf());
+            let mut deleted = false;
+            if let Some(profile_dir) = profile_dir {
+                if profile_dir.exists() {
+                    let to = profile_dir
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(format!("{}.deleted-{}", name, Uuid::new_v4()));
+                    if std::fs::rename(&profile_dir, &to).is_ok() {
+                        deleted = true;
+                    } else if std::fs::remove_dir_all(&profile_dir).is_ok() {
+                        deleted = true;
+                    }
+                }
+            }
+
+            Ok(json!({ "ok": true, "profile": name, "deleted": deleted }))
+        }
+        ("GET", "/tabs") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+
+            let mut runtime = openclaw_browser_runtime().lock().await;
+            let Some(entry) = runtime.profiles.get_mut(&profile) else {
+                return Ok(json!({ "running": false, "tabs": [] }));
+            };
+            let Some(browser) = entry.browser.as_ref() else {
+                return Ok(json!({ "running": false, "tabs": [] }));
+            };
+
+            let tabs = browser.pages().await.map_err(|e| {
+                ErrorShape::new(
+                    error_codes::UNAVAILABLE,
+                    format!("failed to list tabs: {}", e),
+                )
+            })?;
+
+            let out = tabs
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "targetId": t.target_id,
+                        "title": t.title,
+                        "url": t.url,
+                        "type": t.target_type,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "running": true, "tabs": out }))
+        }
+        ("POST", "/tabs/open") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let url = body
+                .and_then(|b| b.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if url.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "tabs.open requires url",
+                ));
+            }
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let browser = entry.browser.as_ref().expect("running");
+
+                let page = browser.new_page().await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("failed to create tab: {}", e),
+                    )
+                })?;
+                page.navigate(&url).await.map_err(|e| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, format!("navigate failed: {}", e))
+                })?;
+                let _ = page.wait_for_load().await;
+                let title = page.title().await.unwrap_or_default();
+                let current_url = page.url().await.unwrap_or_else(|_| url.clone());
+                let target_id = page.target_id().to_string();
+
+                entry.pages.insert(target_id.clone(), page);
+                entry.active_target_id = Some(target_id.clone());
+                Ok(json!({ "targetId": target_id, "title": title, "url": current_url }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/tabs/focus") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let target_id = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if target_id.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "tabs.focus requires targetId",
+                ));
+            }
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/tabs/action") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+
+            let action = body
+                .and_then(|b| b.get("action"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let index = body
+                .and_then(|b| b.get("index"))
+                .and_then(|v| v.as_i64())
+                .filter(|n| *n >= 0)
+                .map(|n| n as usize);
+
+            if action.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "tabs.action requires action",
+                ));
+            }
+
+            if action != "list" {
+                ensure_openclaw_browser_running(state, &profile).await?;
+            }
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime
+                    .profiles
+                    .entry(profile.to_string())
+                    .or_insert_with(OpenclawBrowserProfileRuntime::default);
+
+                if action == "list" {
+                    let Some(browser) = entry.browser.as_ref() else {
+                        return Ok(json!({ "ok": true, "tabs": [] }));
+                    };
+                    let tabs = browser.pages().await.map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("failed to list tabs: {}", e),
+                        )
+                    })?;
+                    let out = tabs
+                        .into_iter()
+                        .map(|t| {
+                            json!({
+                                "targetId": t.target_id,
+                                "title": t.title,
+                                "url": t.url,
+                                "type": t.target_type,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(json!({ "ok": true, "tabs": out }));
+                }
+
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                match action.as_str() {
+                    "new" => {
+                        let page = browser.new_page().await.map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!("failed to create tab: {}", e),
+                            )
+                        })?;
+                        let target_id = page.target_id().to_string();
+                        let title = page.title().await.unwrap_or_default();
+                        let url = page
+                            .url()
+                            .await
+                            .unwrap_or_else(|_| "about:blank".to_string());
+
+                        entry.pages.insert(target_id.clone(), page);
+                        entry.active_target_id = Some(target_id.clone());
+                        Ok(json!({
+                            "ok": true,
+                            "tab": {
+                                "targetId": target_id,
+                                "title": title,
+                                "url": url,
+                                "type": "page",
+                            }
+                        }))
+                    }
+                    "close" => {
+                        let tabs = browser.pages().await.map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!("failed to list tabs: {}", e),
+                            )
+                        })?;
+                        let target = if let Some(idx) = index {
+                            tabs.get(idx)
+                        } else {
+                            tabs.first()
+                        };
+                        let Some(target) = target else {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "tab not found",
+                            ));
+                        };
+                        let target_id = target.target_id.clone();
+                        let _ = browser.close_page(&target_id).await;
+                        entry.pages.remove(&target_id);
+                        entry.refs_by_target.remove(&target_id);
+                        if entry.active_target_id.as_deref() == Some(target_id.as_str()) {
+                            entry.active_target_id = None;
+                        }
+                        Ok(json!({ "ok": true, "targetId": target_id }))
+                    }
+                    "select" => {
+                        let Some(idx) = index else {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "index is required",
+                            ));
+                        };
+                        let tabs = browser.pages().await.map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!("failed to list tabs: {}", e),
+                            )
+                        })?;
+                        let Some(target) = tabs.get(idx) else {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "tab not found",
+                            ));
+                        };
+                        let target_id = target.target_id.clone();
+                        ensure_openclaw_browser_page(entry, &target_id).await?;
+                        entry.active_target_id = Some(target_id.clone());
+                        Ok(json!({ "ok": true, "targetId": target_id }))
+                    }
+                    other => Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        format!("unknown tab action: {}", other),
+                    )),
+                }
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("DELETE", p) if p.starts_with("/tabs/") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let target_id = p.trim_start_matches("/tabs/").trim();
+            if target_id.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "tabs.delete requires targetId",
+                ));
+            }
+            let target_id = target_id.to_string();
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                let _ = browser.close_page(&target_id).await;
+                entry.pages.remove(&target_id);
+                entry.refs_by_target.remove(&target_id);
+                if entry.active_target_id.as_deref() == Some(target_id.as_str()) {
+                    entry.active_target_id = None;
+                }
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/navigate") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let url = body
+                .and_then(|b| b.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if url.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "navigate requires url",
+                ));
+            }
+            let requested_target_id = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(target_id) = requested_target_id.as_deref() {
+                    target_id.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                let page = entry.pages.get(&target_id).expect("ensured");
+                page.navigate(&url).await.map_err(|e| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, format!("navigate failed: {}", e))
+                })?;
+                let _ = page.wait_for_load().await;
+                let current_url = page.url().await.unwrap_or_else(|_| url.clone());
+                entry.active_target_id = Some(target_id.clone());
+
+                Ok(json!({ "ok": true, "targetId": target_id, "url": current_url }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("GET", "/snapshot") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let format = query
+                .and_then(|q| q.get("format"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("ai")
+                .trim()
+                .to_ascii_lowercase();
+            let requested_target_id = query
+                .and_then(|q| q.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let limit = query
+                .and_then(|q| q.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(60)
+                .clamp(1, 200) as usize;
+            let max_chars = query
+                .and_then(|q| q.get("maxChars"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30_000)
+                .clamp(256, 500_000) as usize;
+            let labels = query
+                .and_then(|q| q.get("labels"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                let page = entry.pages.get(&target_id).expect("ensured");
+
+                let (title, url, elements) = openclaw_browser_snapshot_extract(page, limit).await?;
+
+                let mut refs: HashMap<String, serde_json::Value> = HashMap::new();
+                let mut ref_map: HashMap<String, String> = HashMap::new();
+                let mut lines: Vec<String> = Vec::new();
+                lines.push(format!("Title: {}", title));
+                lines.push(format!("URL: {}", url));
+                lines.push("".to_string());
+                lines.push("Interactive elements:".to_string());
+                for (idx, (selector, role, name)) in elements.iter().enumerate() {
+                    let r = format!("e{}", idx + 1);
+                    ref_map.insert(r.clone(), selector.clone());
+                    refs.insert(
+                        r.clone(),
+                        json!({
+                            "role": role,
+                            "name": name,
+                            "nth": idx + 1,
+                        }),
+                    );
+                    let label = if name.trim().is_empty() {
+                        role.clone()
+                    } else {
+                        format!("{} \"{}\"", role, name)
+                    };
+                    lines.push(format!("{} {}", r, label));
+                }
+
+                let mut snapshot = lines.join("\n");
+                let truncated = snapshot.len() > max_chars;
+                if truncated {
+                    snapshot.truncate(max_chars);
+                }
+
+                entry.refs_by_target.insert(target_id.clone(), ref_map);
+                entry.active_target_id = Some(target_id.clone());
+
+                if format == "aria" {
+                    let nodes = elements
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (_selector, role, name))| {
+                            json!({
+                                "ref": format!("e{}", idx + 1),
+                                "role": role,
+                                "name": name,
+                                "depth": 0,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(json!({
+                        "ok": true,
+                        "format": "aria",
+                        "targetId": target_id,
+                        "url": url,
+                        "nodes": nodes,
+                    }));
+                }
+
+                let mut image_path: Option<String> = None;
+                let mut image_type: Option<String> = None;
+                if labels {
+                    if let Ok(bytes) = page.screenshot(ScreenshotOptions::default()).await {
+                        let base = resolve_media_dir_fallback().join("browser");
+                        std::fs::create_dir_all(&base).map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!(
+                                    "failed to create media dir {}: {}",
+                                    base.to_string_lossy(),
+                                    e
+                                ),
+                            )
+                        })?;
+                        let path = base.join(format!("{}.png", Uuid::new_v4()));
+                        let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+                        std::fs::write(&tmp, &bytes).map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!(
+                                    "failed to write screenshot {}: {}",
+                                    tmp.to_string_lossy(),
+                                    e
+                                ),
+                            )
+                        })?;
+                        std::fs::rename(&tmp, &path).map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!(
+                                    "failed to move {} -> {}: {}",
+                                    tmp.to_string_lossy(),
+                                    path.to_string_lossy(),
+                                    e
+                                ),
+                            )
+                        })?;
+                        image_path = Some(path.to_string_lossy().to_string());
+                        image_type = Some("png".to_string());
+                    }
+                }
+
+                Ok(json!({
+                    "ok": true,
+                    "format": "ai",
+                    "targetId": target_id,
+                    "url": url,
+                    "snapshot": snapshot,
+                    "truncated": truncated,
+                    "refs": refs,
+                    "stats": {
+                        "lines": snapshot.lines().count(),
+                        "chars": snapshot.len(),
+                        "refs": refs.len(),
+                        "interactive": elements.len(),
+                    },
+                    "labels": labels,
+                    "imagePath": image_path,
+                    "imageType": image_type,
+                }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/act") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "act requires body",
+                ));
+            };
+
+            let kind = body
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if kind.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "act requires kind",
+                ));
+            }
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let act_timeout_ms = body
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(timeout_ms)
+                .clamp(1, 900_000);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                let page = entry.pages.get(&target_id).expect("ensured");
+
+                let resolve_selector = |entry: &OpenclawBrowserProfileRuntime,
+                                        target_id: &str,
+                                        raw: &str|
+                 -> Option<String> {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    if let Some(map) = entry.refs_by_target.get(target_id) {
+                        if let Some(selector) = map.get(trimmed) {
+                            return Some(selector.clone());
+                        }
+                    }
+                    Some(trimmed.to_string())
+                };
+
+                match kind.as_str() {
+                    "click" => {
+                        let raw_ref = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                        let selector =
+                            resolve_selector(entry, &target_id, raw_ref).ok_or_else(|| {
+                                ErrorShape::new(error_codes::INVALID_REQUEST, "click requires ref")
+                            })?;
+                        page.click(&selector).await.map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!("click failed: {}", e),
+                            )
+                        })?;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "type" => {
+                        let raw_ref = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                        let selector =
+                            resolve_selector(entry, &target_id, raw_ref).ok_or_else(|| {
+                                ErrorShape::new(error_codes::INVALID_REQUEST, "type requires ref")
+                            })?;
+                        let text = body
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        page.type_text(&selector, &text).await.map_err(|e| {
+                            ErrorShape::new(error_codes::UNAVAILABLE, format!("type failed: {}", e))
+                        })?;
+                        let submit = body
+                            .get("submit")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if submit {
+                            let _ = page
+                                .evaluate(&format!(
+                                    r#"(() => {{
+  const el = document.querySelector({});
+  if (!el) return false;
+  if (el.form) {{
+    el.form.submit();
+    return true;
+  }}
+  const ev = new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true }});
+  el.dispatchEvent(ev);
+  return true;
+}})()"#,
+                                    serde_json::to_string(&selector)
+                                        .unwrap_or_else(|_| "\"\"".to_string())
+                                ))
+                                .await;
+                        }
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "press" => {
+                        let key = body
+                            .get("key")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if key.is_empty() {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "press requires key",
+                            ));
+                        }
+                        let _ = page
+                            .evaluate(&format!(
+                                r#"(() => {{
+  const key = {};
+  const down = new KeyboardEvent('keydown', {{ key, bubbles: true }});
+  const up = new KeyboardEvent('keyup', {{ key, bubbles: true }});
+  (document.activeElement || document.body || document).dispatchEvent(down);
+  (document.activeElement || document.body || document).dispatchEvent(up);
+  return true;
+}})()"#,
+                                serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".to_string())
+                            ))
+                            .await;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "hover" => {
+                        let raw_ref = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                        let selector =
+                            resolve_selector(entry, &target_id, raw_ref).ok_or_else(|| {
+                                ErrorShape::new(error_codes::INVALID_REQUEST, "hover requires ref")
+                            })?;
+                        let _ = page
+                            .evaluate(&format!(
+                                r#"(() => {{
+  const el = document.querySelector({});
+  if (!el) throw new Error('Element not found');
+  try {{ el.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+  const rect = el.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const opts = {{ bubbles: true, cancelable: true, clientX: x, clientY: y }};
+  el.dispatchEvent(new MouseEvent('mouseover', opts));
+  el.dispatchEvent(new MouseEvent('mouseenter', opts));
+  el.dispatchEvent(new MouseEvent('mousemove', opts));
+  return true;
+}})()"#,
+                                serde_json::to_string(&selector)
+                                    .unwrap_or_else(|_| "\"\"".to_string())
+                            ))
+                            .await;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "scrollintoview" => {
+                        let raw_ref = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                        let selector =
+                            resolve_selector(entry, &target_id, raw_ref).ok_or_else(|| {
+                                ErrorShape::new(
+                                    error_codes::INVALID_REQUEST,
+                                    "scrollIntoView requires ref",
+                                )
+                            })?;
+                        let _ = page
+                            .evaluate(&format!(
+                                r#"(() => {{
+  const el = document.querySelector({});
+  if (!el) throw new Error('Element not found');
+  try {{ el.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+  return true;
+}})()"#,
+                                serde_json::to_string(&selector)
+                                    .unwrap_or_else(|_| "\"\"".to_string())
+                            ))
+                            .await;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "drag" => {
+                        let start_ref = body.get("startRef").and_then(|v| v.as_str()).unwrap_or("");
+                        let end_ref = body.get("endRef").and_then(|v| v.as_str()).unwrap_or("");
+                        let start_selector = resolve_selector(entry, &target_id, start_ref)
+                            .ok_or_else(|| {
+                                ErrorShape::new(
+                                    error_codes::INVALID_REQUEST,
+                                    "drag requires startRef",
+                                )
+                            })?;
+                        let end_selector = resolve_selector(entry, &target_id, end_ref)
+                            .ok_or_else(|| {
+                                ErrorShape::new(
+                                    error_codes::INVALID_REQUEST,
+                                    "drag requires endRef",
+                                )
+                            })?;
+
+                        let _ = page
+                            .evaluate(&format!(
+                                r#"(() => {{
+  const start = document.querySelector({});
+  const end = document.querySelector({});
+  if (!start) throw new Error('Start element not found');
+  if (!end) throw new Error('End element not found');
+  try {{ start.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+  try {{ end.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+  const s = start.getBoundingClientRect();
+  const e = end.getBoundingClientRect();
+  const sx = s.left + s.width / 2;
+  const sy = s.top + s.height / 2;
+  const ex = e.left + e.width / 2;
+  const ey = e.top + e.height / 2;
+  const mkMouse = (type, x, y) => new MouseEvent(type, {{ bubbles: true, cancelable: true, clientX: x, clientY: y, buttons: 1 }});
+  const mkPtr = (type, x, y) => new PointerEvent(type, {{ bubbles: true, cancelable: true, clientX: x, clientY: y, buttons: 1, pointerType: 'mouse', isPrimary: true }});
+  start.dispatchEvent(mkPtr('pointerover', sx, sy));
+  start.dispatchEvent(mkPtr('pointerenter', sx, sy));
+  start.dispatchEvent(mkPtr('pointermove', sx, sy));
+  start.dispatchEvent(mkPtr('pointerdown', sx, sy));
+  start.dispatchEvent(mkMouse('mousedown', sx, sy));
+  const steps = 10;
+  for (let i = 1; i <= steps; i++) {{
+    const x = sx + ((ex - sx) * i) / steps;
+    const y = sy + ((ey - sy) * i) / steps;
+    document.dispatchEvent(mkPtr('pointermove', x, y));
+    document.dispatchEvent(mkMouse('mousemove', x, y));
+  }}
+  document.dispatchEvent(mkPtr('pointerup', ex, ey));
+  document.dispatchEvent(mkMouse('mouseup', ex, ey));
+  return true;
+}})()"#,
+                                serde_json::to_string(&start_selector)
+                                    .unwrap_or_else(|_| "\"\"".to_string()),
+                                serde_json::to_string(&end_selector)
+                                    .unwrap_or_else(|_| "\"\"".to_string())
+                            ))
+                            .await;
+
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "select" => {
+                        let raw_ref = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                        let selector =
+                            resolve_selector(entry, &target_id, raw_ref).ok_or_else(|| {
+                                ErrorShape::new(error_codes::INVALID_REQUEST, "select requires ref")
+                            })?;
+                        let values = body
+                            .get("values")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if values.is_empty() {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "select requires values",
+                            ));
+                        }
+                        let _ = page
+                            .evaluate(&format!(
+                                r#"(() => {{
+  const el = document.querySelector({});
+  if (!el) throw new Error('Element not found');
+  if (!(el instanceof HTMLSelectElement)) throw new Error('Element is not a <select>');
+  const values = {};
+  const set = new Set(values.map(String));
+  let changed = false;
+  if (el.multiple) {{
+    for (const opt of Array.from(el.options)) {{
+      const should = set.has(opt.value) || set.has(opt.label) || set.has(opt.text);
+      if (opt.selected !== should) {{
+        opt.selected = should;
+        changed = true;
+      }}
+    }}
+  }} else {{
+    let chosen = null;
+    for (const opt of Array.from(el.options)) {{
+      if (set.has(opt.value) || set.has(opt.label) || set.has(opt.text)) {{
+        chosen = opt.value;
+        break;
+      }}
+    }}
+    if (chosen === null && values.length > 0) chosen = String(values[0]);
+    if (chosen !== null && el.value !== chosen) {{
+      el.value = chosen;
+      changed = true;
+    }}
+  }}
+  if (changed) {{
+    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  }}
+  return Array.from(el.selectedOptions).map(o => o.value);
+}})()"#,
+                                serde_json::to_string(&selector)
+                                    .unwrap_or_else(|_| "\"\"".to_string()),
+                                serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string()),
+                            ))
+                            .await;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "fill" => {
+                        let raw_fields = body
+                            .get("fields")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let mut fields: Vec<serde_json::Value> = Vec::new();
+                        for field in raw_fields {
+                            let Some(obj) = field.as_object() else {
+                                continue;
+                            };
+                            let raw_ref = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                            let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if raw_ref.trim().is_empty() || typ.trim().is_empty() {
+                                continue;
+                            }
+                            let selector =
+                                resolve_selector(entry, &target_id, raw_ref).unwrap_or_default();
+                            if selector.trim().is_empty() {
+                                continue;
+                            }
+                            let value = obj
+                                .get("value")
+                                .filter(|v| v.is_string() || v.is_number() || v.is_boolean())
+                                .cloned();
+                            fields.push(json!({
+                                "selector": selector,
+                                "type": typ,
+                                "value": value,
+                            }));
+                        }
+
+                        if fields.is_empty() {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "fill requires fields",
+                            ));
+                        }
+
+                        let _ = page
+                            .evaluate(&format!(
+                                r#"(() => {{
+  const fields = {};
+  const out = [];
+  for (const field of fields) {{
+    const sel = String(field.selector || '');
+    const el = sel ? document.querySelector(sel) : null;
+    if (!el) {{
+      out.push({{ selector: sel, ok: false, error: 'Element not found' }});
+      continue;
+    }}
+    try {{ el.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+    try {{ if (el.focus) el.focus(); }} catch (_) {{}}
+    const value = field.value;
+    try {{
+      if (el instanceof HTMLInputElement) {{
+        const t = (el.type || '').toLowerCase();
+        if (t === 'checkbox' || t === 'radio') {{
+          el.checked = value === undefined ? true : Boolean(value);
+          el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }} else {{
+          el.value = value === undefined ? '' : String(value);
+          el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+      }} else if (el instanceof HTMLTextAreaElement) {{
+        el.value = value === undefined ? '' : String(value);
+        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+      }} else if (el instanceof HTMLSelectElement) {{
+        if (value !== undefined) {{
+          el.value = String(value);
+        }}
+        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+      }} else if (el.isContentEditable) {{
+        el.innerText = value === undefined ? '' : String(value);
+        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+      }} else {{
+        // Best-effort fallback
+        el.textContent = value === undefined ? '' : String(value);
+      }}
+      out.push({{ selector: sel, ok: true }});
+    }} catch (err) {{
+      out.push({{ selector: sel, ok: false, error: String(err) }});
+    }}
+  }}
+  return out;
+}})()"#,
+                                serde_json::to_string(&fields).unwrap_or_else(|_| "[]".to_string())
+                            ))
+                            .await;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "resize" => {
+                        let width = body.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let height = body.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if width == 0 || height == 0 {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "resize requires width and height",
+                            ));
+                        }
+                        page.set_viewport(width as u32, height as u32)
+                            .await
+                            .map_err(|e| {
+                                ErrorShape::new(
+                                    error_codes::UNAVAILABLE,
+                                    format!("resize failed: {}", e),
+                                )
+                            })?;
+                        let url = page.url().await.ok();
+                        Ok(json!({ "ok": true, "targetId": target_id, "url": url }))
+                    }
+                    "wait" => {
+                        let time_ms = body.get("timeMs").and_then(|v| v.as_u64());
+                        let text = body
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        let text_gone = body
+                            .get("textGone")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        let selector_raw = body
+                            .get("selector")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        let url_match = body
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        let load_state = body
+                            .get("loadState")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_ascii_lowercase())
+                            .filter(|s| !s.is_empty());
+
+                        if time_ms.is_none()
+                            && text.is_none()
+                            && text_gone.is_none()
+                            && selector_raw.is_none()
+                            && url_match.is_none()
+                            && load_state.is_none()
+                        {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "wait requires at least one of: timeMs, text, textGone, selector, url, loadState",
+                            ));
+                        }
+
+                        let selector_json = selector_raw.as_deref().map(|s| {
+                            serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+                        });
+
+                        let started = tokio::time::Instant::now();
+                        let timeout_dur = Duration::from_millis(act_timeout_ms);
+
+                        if let Some(ms) = time_ms.filter(|v| *v > 0) {
+                            tokio::time::sleep(Duration::from_millis(ms.min(act_timeout_ms))).await;
+                            if text.is_none()
+                                && text_gone.is_none()
+                                && selector_json.is_none()
+                                && url_match.is_none()
+                                && load_state.is_none()
+                            {
+                                let url = page.url().await.ok();
+                                return Ok(
+                                    json!({ "ok": true, "targetId": target_id, "url": url }),
+                                );
+                            }
+                        }
+
+                        loop {
+                            if started.elapsed() >= timeout_dur {
+                                return Err(ErrorShape::new(
+                                    error_codes::UNAVAILABLE,
+                                    "wait timed out",
+                                ));
+                            }
+
+                            let expr = format!(
+                                r#"(() => {{
+  const wantText = {};
+  const wantGone = {};
+  const selector = {};
+  const urlNeedle = {};
+  const loadState = {};
+
+  const bodyText = String((document.body && (document.body.innerText || document.body.textContent)) || '');
+  const out = {{}};
+  out.textOk = !wantText || bodyText.includes(wantText);
+  out.textGoneOk = !wantGone || !bodyText.includes(wantGone);
+  out.selectorOk = !selector || Boolean(document.querySelector(selector));
+  out.urlOk = !urlNeedle || String(window.location.href || '').includes(urlNeedle);
+  if (!loadState) {{
+    out.loadOk = true;
+  }} else if (loadState === 'domcontentloaded') {{
+    out.loadOk = document.readyState === 'interactive' || document.readyState === 'complete';
+  }} else {{
+    // load/networkidle => best-effort
+    out.loadOk = document.readyState === 'complete';
+  }}
+  return out;
+}})()"#,
+                                text.as_deref()
+                                    .map(|s| serde_json::to_string(s)
+                                        .unwrap_or_else(|_| "\"\"".to_string()))
+                                    .unwrap_or_else(|| "null".to_string()),
+                                text_gone
+                                    .as_deref()
+                                    .map(|s| serde_json::to_string(s)
+                                        .unwrap_or_else(|_| "\"\"".to_string()))
+                                    .unwrap_or_else(|| "null".to_string()),
+                                selector_json.clone().unwrap_or_else(|| "null".to_string()),
+                                url_match
+                                    .as_deref()
+                                    .map(|s| serde_json::to_string(s)
+                                        .unwrap_or_else(|_| "\"\"".to_string()))
+                                    .unwrap_or_else(|| "null".to_string()),
+                                load_state
+                                    .as_deref()
+                                    .map(|s| serde_json::to_string(s)
+                                        .unwrap_or_else(|_| "\"\"".to_string()))
+                                    .unwrap_or_else(|| "null".to_string()),
+                            );
+
+                            if let Ok(res) = page.evaluate(&expr).await {
+                                let ok = res
+                                    .as_object()
+                                    .map(|o| {
+                                        o.get("textOk").and_then(|v| v.as_bool()).unwrap_or(true)
+                                            && o.get("textGoneOk")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(true)
+                                            && o.get("selectorOk")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(true)
+                                            && o.get("urlOk")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(true)
+                                            && o.get("loadOk")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(true)
+                                    })
+                                    .unwrap_or(false);
+                                if ok {
+                                    let url = page.url().await.ok();
+                                    return Ok(
+                                        json!({ "ok": true, "targetId": target_id, "url": url }),
+                                    );
+                                }
+                            }
+
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                    "evaluate" => {
+                        let fn_src = body
+                            .get("fn")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if fn_src.trim().is_empty() {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "evaluate requires fn",
+                            ));
+                        }
+                        let result = page.evaluate(&fn_src).await.map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!("evaluate failed: {}", e),
+                            )
+                        })?;
+                        let url = page.url().await.ok();
+                        Ok(
+                            json!({ "ok": true, "targetId": target_id, "url": url, "result": result }),
+                        )
+                    }
+                    "close" => {
+                        let target = target_id.clone();
+                        let Some(browser) = entry.browser.as_ref() else {
+                            return Err(ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                "browser is not running",
+                            ));
+                        };
+                        let _ = browser.close_page(&target).await;
+                        entry.pages.remove(&target);
+                        entry.refs_by_target.remove(&target);
+                        entry.active_target_id = None;
+                        Ok(json!({ "ok": true, "targetId": target }))
+                    }
+                    other => Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        format!("unsupported act kind: {}", other),
+                    )),
+                }
+            };
+
+            tokio::time::timeout(Duration::from_millis(act_timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("GET", "/console") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = query
+                .and_then(|q| q.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let level = query
+                .and_then(|q| q.get("level"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+
+            let mut runtime = openclaw_browser_runtime().lock().await;
+            let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+            let target_id = if let Some(t) = requested_target_id.as_deref() {
+                t.to_string()
+            } else {
+                resolve_openclaw_browser_target_id(entry).await?
+            };
+            ensure_openclaw_browser_page(entry, &target_id).await?;
+
+            let console_priority = |raw: &str| -> i32 {
+                match raw.trim().to_ascii_lowercase().as_str() {
+                    "error" => 3,
+                    "warning" | "warn" => 2,
+                    "info" | "log" => 1,
+                    "debug" => 0,
+                    _ => 1,
+                }
+            };
+            let min_priority = level.as_deref().map(console_priority);
+
+            let messages_raw = match entry.browser.as_ref() {
+                Some(b) => b.console_messages(&target_id).await,
+                None => Vec::new(),
+            };
+
+            let mut messages: Vec<serde_json::Value> = Vec::new();
+            for msg in messages_raw {
+                let typ = match msg.level {
+                    drbot_browser::LogLevel::Error => "error",
+                    drbot_browser::LogLevel::Warning => "warning",
+                    drbot_browser::LogLevel::Info => "log",
+                    drbot_browser::LogLevel::Verbose => "debug",
+                };
+                if let Some(min) = min_priority {
+                    if console_priority(typ) < min {
+                        continue;
+                    }
+                }
+
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(typ.to_string()),
+                );
+                obj.insert("text".to_string(), serde_json::Value::String(msg.text));
+                obj.insert(
+                    "timestamp".to_string(),
+                    serde_json::Value::String(msg.timestamp.to_rfc3339()),
+                );
+
+                let mut location = serde_json::Map::new();
+                if let Some(url) = msg.url {
+                    location.insert("url".to_string(), serde_json::Value::String(url));
+                }
+                if let Some(line) = msg.line {
+                    location.insert(
+                        "lineNumber".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(line as u64)),
+                    );
+                }
+                if let Some(col) = msg.column {
+                    location.insert(
+                        "columnNumber".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(col as u64)),
+                    );
+                }
+                if !location.is_empty() {
+                    obj.insert("location".to_string(), serde_json::Value::Object(location));
+                }
+
+                messages.push(serde_json::Value::Object(obj));
+            }
+
+            Ok(json!({ "ok": true, "targetId": target_id, "messages": messages }))
+        }
+        ("GET", "/errors") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = query
+                .and_then(|q| q.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let truthy = |value: Option<&serde_json::Value>| -> bool {
+                let Some(value) = value else {
+                    return false;
+                };
+                if let Some(b) = value.as_bool() {
+                    return b;
+                }
+                if let Some(n) = value.as_i64() {
+                    return n != 0;
+                }
+                let Some(s) = value.as_str() else {
+                    return false;
+                };
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            };
+            let clear = truthy(query.and_then(|q| q.get("clear")));
+
+            let mut runtime = openclaw_browser_runtime().lock().await;
+            let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+            let target_id = if let Some(t) = requested_target_id.as_deref() {
+                t.to_string()
+            } else {
+                resolve_openclaw_browser_target_id(entry).await?
+            };
+            ensure_openclaw_browser_page(entry, &target_id).await?;
+
+            let errors = match entry.browser.as_ref() {
+                Some(b) => b.page_errors(&target_id, clear).await,
+                None => Vec::new(),
+            };
+            let errors_value =
+                serde_json::to_value(&errors).unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+            Ok(json!({ "ok": true, "targetId": target_id, "errors": errors_value }))
+        }
+        ("GET", "/requests") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = query
+                .and_then(|q| q.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let filter = query
+                .and_then(|q| q.get("filter"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let truthy = |value: Option<&serde_json::Value>| -> bool {
+                let Some(value) = value else {
+                    return false;
+                };
+                if let Some(b) = value.as_bool() {
+                    return b;
+                }
+                if let Some(n) = value.as_i64() {
+                    return n != 0;
+                }
+                let Some(s) = value.as_str() else {
+                    return false;
+                };
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            };
+            let clear = truthy(query.and_then(|q| q.get("clear")));
+
+            let mut runtime = openclaw_browser_runtime().lock().await;
+            let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+            let target_id = if let Some(t) = requested_target_id.as_deref() {
+                t.to_string()
+            } else {
+                resolve_openclaw_browser_target_id(entry).await?
+            };
+            ensure_openclaw_browser_page(entry, &target_id).await?;
+
+            let requests = match entry.browser.as_ref() {
+                Some(b) => {
+                    b.network_requests(&target_id, filter.as_deref(), clear)
+                        .await
+                }
+                None => Vec::new(),
+            };
+            let requests_value = serde_json::to_value(&requests)
+                .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+            Ok(json!({ "ok": true, "targetId": target_id, "requests": requests_value }))
+        }
+        ("GET", "/cookies") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = query
+                .and_then(|q| q.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                let cookies = browser.cookies_get_all(&target_id).await.map_err(|e| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, format!("cookies failed: {}", e))
+                })?;
+
+                Ok(json!({ "ok": true, "targetId": target_id, "cookies": cookies }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/cookies/set") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let cookie_obj = body
+                .and_then(|b| b.get("cookie"))
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| {
+                    ErrorShape::new(error_codes::INVALID_REQUEST, "cookie is required")
+                })?;
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let name = cookie_obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let value = cookie_obj
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "cookie.name is required",
+                ));
+            }
+            let url = cookie_obj
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let domain = cookie_obj
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let path = cookie_obj
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let has_url = url.is_some();
+            let has_domain_path = domain.is_some() && path.is_some();
+            if !has_url && !has_domain_path {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "cookie requires url, or domain+path",
+                ));
+            }
+
+            let expires = cookie_obj
+                .get("expires")
+                .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)));
+            let http_only = cookie_obj.get("httpOnly").and_then(|v| v.as_bool());
+            let secure = cookie_obj.get("secure").and_then(|v| v.as_bool());
+            let same_site = cookie_obj
+                .get("sameSite")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| matches!(s.as_str(), "Lax" | "None" | "Strict"));
+
+            let cookie = drbot_browser::BrowserSetCookie {
+                name,
+                value,
+                url,
+                domain,
+                path,
+                expires,
+                http_only,
+                secure,
+                same_site,
+            };
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser.cookies_set(&target_id, cookie).await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("set cookie failed: {}", e),
+                    )
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/cookies/clear") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser.cookies_clear(&target_id).await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("clear cookies failed: {}", e),
+                    )
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("GET", "/storage/local") | ("GET", "/storage/session") => {
+            let kind = if path.ends_with("/session") {
+                "session"
+            } else {
+                "local"
+            };
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = query
+                .and_then(|q| q.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let key = query
+                .and_then(|q| q.get("key"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let page = entry.pages.get(&target_id).expect("ensured");
+                let key_json = match key.as_deref() {
+                    Some(k) => serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string()),
+                    None => "null".to_string(),
+                };
+                let kind_json =
+                    serde_json::to_string(kind).unwrap_or_else(|_| "\"local\"".to_string());
+                let expr = format!(
+                    r#"(() => {{
+  const kind = {};
+  const key = {};
+  const store = kind === 'session' ? window.sessionStorage : window.localStorage;
+  if (key) {{
+    const value = store.getItem(key);
+    return value === null ? {{}} : {{ [key]: value }};
+  }}
+  const out = {{}};
+  for (let i = 0; i < store.length; i += 1) {{
+    const k = store.key(i);
+    if (!k) continue;
+    const v = store.getItem(k);
+    if (v !== null) out[k] = v;
+  }}
+  return out;
+}})()"#,
+                    kind_json, key_json,
+                );
+                let values = page.evaluate(&expr).await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("storage get failed: {}", e),
+                    )
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id, "values": values }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/storage/local/set") | ("POST", "/storage/session/set") => {
+            let kind = if path.contains("/session/") {
+                "session"
+            } else {
+                "local"
+            };
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let key = body
+                .and_then(|b| b.get("key"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "key is required"))?;
+            let value = body
+                .and_then(|b| b.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let page = entry.pages.get(&target_id).expect("ensured");
+                let kind_json =
+                    serde_json::to_string(kind).unwrap_or_else(|_| "\"local\"".to_string());
+                let key_json = serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".to_string());
+                let value_json =
+                    serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".to_string());
+                let expr = format!(
+                    r#"(() => {{
+  const store = {} === 'session' ? window.sessionStorage : window.localStorage;
+  store.setItem({}, {});
+  return true;
+}})()"#,
+                    kind_json, key_json, value_json,
+                );
+                page.evaluate(&expr).await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("storage set failed: {}", e),
+                    )
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/storage/local/clear") | ("POST", "/storage/session/clear") => {
+            let kind = if path.contains("/session/") {
+                "session"
+            } else {
+                "local"
+            };
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let page = entry.pages.get(&target_id).expect("ensured");
+                let kind_json =
+                    serde_json::to_string(kind).unwrap_or_else(|_| "\"local\"".to_string());
+                let expr = format!(
+                    r#"(() => {{
+  const store = {} === 'session' ? window.sessionStorage : window.localStorage;
+  store.clear();
+  return true;
+}})()"#,
+                    kind_json,
+                );
+                page.evaluate(&expr).await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("storage clear failed: {}", e),
+                    )
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/offline") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let parse_bool = |value: Option<&serde_json::Value>| -> Option<bool> {
+                let Some(value) = value else {
+                    return None;
+                };
+                if let Some(b) = value.as_bool() {
+                    return Some(b);
+                }
+                if let Some(n) = value.as_i64() {
+                    return Some(n != 0);
+                }
+                let Some(s) = value.as_str() else {
+                    return None;
+                };
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => Some(true),
+                    "0" | "false" | "no" | "off" => Some(false),
+                    _ => None,
+                }
+            };
+
+            let offline = parse_bool(body.and_then(|b| b.get("offline"))).ok_or_else(|| {
+                ErrorShape::new(error_codes::INVALID_REQUEST, "offline is required")
+            })?;
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser
+                    .set_offline(&target_id, offline)
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, format!("offline failed: {}", e))
+                    })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/headers") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let headers_obj = body
+                .and_then(|b| b.get("headers"))
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| {
+                    ErrorShape::new(error_codes::INVALID_REQUEST, "headers is required")
+                })?;
+            let mut headers: HashMap<String, String> = HashMap::new();
+            for (k, v) in headers_obj {
+                if let Some(s) = v.as_str() {
+                    headers.insert(k.to_string(), s.to_string());
+                }
+            }
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser
+                    .set_extra_http_headers(&target_id, headers)
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, format!("headers failed: {}", e))
+                    })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/credentials") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let parse_bool = |value: Option<&serde_json::Value>| -> Option<bool> {
+                let Some(value) = value else {
+                    return None;
+                };
+                if let Some(b) = value.as_bool() {
+                    return Some(b);
+                }
+                if let Some(n) = value.as_i64() {
+                    return Some(n != 0);
+                }
+                let Some(s) = value.as_str() else {
+                    return None;
+                };
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => Some(true),
+                    "0" | "false" | "no" | "off" => Some(false),
+                    _ => None,
+                }
+            };
+
+            let clear = parse_bool(body.and_then(|b| b.get("clear"))).unwrap_or(false);
+            let username = body
+                .and_then(|b| b.get("username"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let password = body
+                .and_then(|b| b.get("password"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser
+                    .set_http_credentials(&target_id, username, password, clear)
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("credentials failed: {}", e),
+                        )
+                    })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/geolocation") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let parse_bool = |value: Option<&serde_json::Value>| -> Option<bool> {
+                let Some(value) = value else {
+                    return None;
+                };
+                if let Some(b) = value.as_bool() {
+                    return Some(b);
+                }
+                if let Some(n) = value.as_i64() {
+                    return Some(n != 0);
+                }
+                let Some(s) = value.as_str() else {
+                    return None;
+                };
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => Some(true),
+                    "0" | "false" | "no" | "off" => Some(false),
+                    _ => None,
+                }
+            };
+            let parse_f64 = |value: Option<&serde_json::Value>| -> Option<f64> {
+                let Some(value) = value else {
+                    return None;
+                };
+                if let Some(n) = value.as_f64() {
+                    return Some(n);
+                }
+                if let Some(n) = value.as_i64() {
+                    return Some(n as f64);
+                }
+                if let Some(n) = value.as_u64() {
+                    return Some(n as f64);
+                }
+                None
+            };
+
+            let clear = parse_bool(body.and_then(|b| b.get("clear"))).unwrap_or(false);
+            let latitude = parse_f64(body.and_then(|b| b.get("latitude")));
+            let longitude = parse_f64(body.and_then(|b| b.get("longitude")));
+            let accuracy = parse_f64(body.and_then(|b| b.get("accuracy")));
+            let origin_raw = body
+                .and_then(|b| b.get("origin"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                let origin = if origin_raw.is_some() {
+                    origin_raw
+                } else if let Some(page) = entry.pages.get(&target_id) {
+                    let url = page.url().await.unwrap_or_default();
+                    reqwest::Url::parse(&url)
+                        .ok()
+                        .map(|u| u.origin().ascii_serialization())
+                        .filter(|s| !s.is_empty() && s != "null")
+                } else {
+                    None
+                };
+
+                browser
+                    .set_geolocation(&target_id, latitude, longitude, accuracy, origin, clear)
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("geolocation failed: {}", e),
+                        )
+                    })?;
+
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/media") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let scheme_raw = body
+                .and_then(|b| b.get("colorScheme"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let color_scheme: Option<String> = match scheme_raw.as_str() {
+                "dark" => Some("dark".to_string()),
+                "light" => Some("light".to_string()),
+                "no-preference" => Some("no-preference".to_string()),
+                "none" => None,
+                _ => {
+                    return Err(ErrorShape::new(
+                        error_codes::INVALID_REQUEST,
+                        "colorScheme must be dark|light|no-preference|none",
+                    ));
+                }
+            };
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                browser
+                    .emulate_media(&target_id, color_scheme)
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("media emulation failed: {}", e),
+                        )
+                    })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/timezone") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let timezone_id = body
+                .and_then(|b| b.get("timezoneId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if timezone_id.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "timezoneId is required",
+                ));
+            }
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser
+                    .set_timezone(&target_id, &timezone_id)
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, format!("timezone failed: {}", e))
+                    })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/locale") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let locale = body
+                .and_then(|b| b.get("locale"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if locale.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "locale is required",
+                ));
+            }
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser.set_locale(&target_id, &locale).await.map_err(|e| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, format!("locale failed: {}", e))
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/set/device") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let name = body
+                .and_then(|b| b.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "name is required",
+                ));
+            }
+            let target_id_hint = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = target_id_hint.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                browser.set_device(&target_id, &name).await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("device emulation failed: {}", e),
+                    )
+                })?;
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/trace/start") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                browser.trace_start().await.map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("trace start failed: {}", e),
+                    )
+                })?;
+
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/trace/stop") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let out = body
+                .and_then(|b| b.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let trace_timeout_ms = body
+                .and_then(|b| b.get("timeoutMs"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120_000)
+                .clamp(500, 120_000);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                let trace_path = if out.is_empty() {
+                    let id = Uuid::new_v4();
+                    let dir = std::env::temp_dir().join("openclaw");
+                    std::fs::create_dir_all(&dir).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to create trace dir {}: {}",
+                                dir.to_string_lossy(),
+                                e
+                            ),
+                        )
+                    })?;
+                    dir.join(format!("browser-trace-{}.zip", id))
+                } else {
+                    let raw = std::path::PathBuf::from(out);
+                    if raw.is_absolute() {
+                        raw
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join(raw)
+                    }
+                };
+
+                if let Some(parent) = trace_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to create trace output dir {}: {}",
+                                parent.to_string_lossy(),
+                                e
+                            ),
+                        )
+                    })?;
+                }
+
+                let trace_json = browser
+                    .trace_stop(Duration::from_millis(trace_timeout_ms))
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("trace stop failed: {}", e),
+                        )
+                    })?;
+
+                use std::io::Write;
+                let file = std::fs::File::create(&trace_path).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to create trace file {}: {}",
+                            trace_path.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+                let mut zip = zip::ZipWriter::new(file);
+                let options = zip::write::FileOptions::<()>::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                zip.start_file("trace.json", options).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("failed to start trace zip entry: {}", e),
+                    )
+                })?;
+                let bytes = serde_json::to_vec(&trace_json)
+                    .unwrap_or_else(|_| br#"{"traceEvents":[]}"#.to_vec());
+                zip.write_all(&bytes).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("failed to write trace zip entry: {}", e),
+                    )
+                })?;
+                zip.finish().map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("failed to finalize trace zip: {}", e),
+                    )
+                })?;
+
+                Ok(json!({
+                    "ok": true,
+                    "targetId": target_id,
+                    "path": trace_path.to_string_lossy(),
+                }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(trace_timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/pdf") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                let page = entry.pages.get(&target_id).expect("ensured");
+
+                let bytes = page.pdf().await.map_err(|e| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, format!("pdf failed: {}", e))
+                })?;
+                let url = page.url().await.ok();
+
+                let base = resolve_media_dir_fallback().join("browser");
+                std::fs::create_dir_all(&base).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to create media dir {}: {}",
+                            base.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+                let path = base.join(format!("{}.pdf", Uuid::new_v4()));
+                let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+                std::fs::write(&tmp, &bytes).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!("failed to write pdf {}: {}", tmp.to_string_lossy(), e),
+                    )
+                })?;
+                std::fs::rename(&tmp, &path).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to move {} -> {}: {}",
+                            tmp.to_string_lossy(),
+                            path.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+
+                Ok(json!({
+                    "ok": true,
+                    "path": path.to_string_lossy(),
+                    "targetId": target_id,
+                    "url": url,
+                }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/hooks/file-chooser") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "file chooser hooks require body",
+                ));
+            };
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let raw_ref = body
+                .get("ref")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let input_ref = body
+                .get("inputRef")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let element = body
+                .get("element")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let paths = body
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "paths are required",
+                ));
+            }
+
+            if (input_ref.is_some() || element.is_some()) && raw_ref.is_some() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "ref cannot be combined with inputRef/element",
+                ));
+            }
+
+            // OpenClaw parity: arm timeouts clamp to 0.5s..120s and default to 120s.
+            let arm_timeout_ms = body
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120_000)
+                .clamp(500, 120_000);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                let resolve_selector = |entry: &OpenclawBrowserProfileRuntime,
+                                        target_id: &str,
+                                        raw: &str|
+                 -> Option<String> {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    if let Some(map) = entry.refs_by_target.get(target_id) {
+                        if let Some(selector) = map.get(trimmed) {
+                            return Some(selector.clone());
+                        }
+                    }
+                    Some(trimmed.to_string())
+                };
+
+                if let Some(selector) = element.as_deref().map(|s| s.to_string()).or_else(|| {
+                    input_ref
+                        .as_deref()
+                        .and_then(|r| resolve_selector(entry, &target_id, r))
+                }) {
+                    browser
+                        .set_input_files(&target_id, &selector, paths)
+                        .await
+                        .map_err(|e| {
+                            ErrorShape::new(
+                                error_codes::UNAVAILABLE,
+                                format!("set input files failed: {}", e),
+                            )
+                        })?;
+                    return Ok(json!({ "ok": true }));
+                }
+
+                browser
+                    .arm_file_upload(&target_id, paths, Duration::from_millis(arm_timeout_ms))
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("file chooser hook failed: {}", e),
+                        )
+                    })?;
+
+                if let Some(raw_ref) = raw_ref.as_deref() {
+                    let Some(page) = entry.pages.get(&target_id) else {
+                        return Err(ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            "tab is not available",
+                        ));
+                    };
+                    let selector =
+                        resolve_selector(entry, &target_id, raw_ref).ok_or_else(|| {
+                            ErrorShape::new(error_codes::INVALID_REQUEST, "ref is required")
+                        })?;
+                    let _ = page.click(&selector).await;
+                }
+
+                Ok(json!({ "ok": true }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/hooks/dialog") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "dialog hooks require body",
+                ));
+            };
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let accept = body
+                .get("accept")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| {
+                    ErrorShape::new(error_codes::INVALID_REQUEST, "accept is required")
+                })?;
+            let prompt_text = body
+                .get("promptText")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            // OpenClaw parity: arm timeouts clamp to 0.5s..120s and default to 120s.
+            let arm_timeout_ms = body
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120_000)
+                .clamp(500, 120_000);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                browser
+                    .arm_dialog(
+                        &target_id,
+                        accept,
+                        prompt_text,
+                        Duration::from_millis(arm_timeout_ms),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("dialog hook failed: {}", e),
+                        )
+                    })?;
+
+                Ok(json!({ "ok": true }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/wait/download") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "wait for download requires body",
+                ));
+            };
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let out = body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let download_timeout_ms = body
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120_000)
+                .clamp(500, 120_000);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                let id = Uuid::new_v4();
+                let out_path = out.as_deref().map(std::path::PathBuf::from);
+                let resolved_out = out_path.as_ref().map(|p| {
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join(p)
+                    }
+                });
+
+                let base_dir = if let Some(out) = resolved_out.as_ref() {
+                    out.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    })
+                } else {
+                    let base = resolve_media_dir_fallback()
+                        .join("browser")
+                        .join("downloads");
+                    std::fs::create_dir_all(&base).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to create downloads dir {}: {}",
+                                base.to_string_lossy(),
+                                e
+                            ),
+                        )
+                    })?;
+                    base
+                };
+
+                let tmp_dir = base_dir.join(format!("tmp-{}", id));
+                std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to create download tmp dir {}: {}",
+                            tmp_dir.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+
+                let download = browser
+                    .wait_for_download(
+                        &target_id,
+                        tmp_dir.clone(),
+                        Duration::from_millis(download_timeout_ms),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("wait for download failed: {}", e),
+                        )
+                    })?;
+
+                let safe_name = std::path::Path::new(download.suggested_filename.trim())
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("download.bin")
+                    .trim();
+                let safe_name = if safe_name.is_empty() {
+                    "download.bin"
+                } else {
+                    safe_name
+                };
+
+                let final_path = if let Some(out) = resolved_out.as_ref() {
+                    if out.is_dir() || out.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR) {
+                        out.join(safe_name)
+                    } else {
+                        out.to_path_buf()
+                    }
+                } else {
+                    base_dir.join(format!("{}-{}", id, safe_name))
+                };
+
+                if let Some(parent) = final_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to create download output dir {}: {}",
+                                parent.to_string_lossy(),
+                                e
+                            ),
+                        )
+                    })?;
+                }
+
+                let src_path = std::path::PathBuf::from(download.path);
+                if !src_path.exists() {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "download did not produce a file",
+                    ));
+                }
+
+                if let Err(err) = std::fs::rename(&src_path, &final_path) {
+                    std::fs::copy(&src_path, &final_path).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to move download (rename failed: {}; copy failed): {}",
+                                err, e
+                            ),
+                        )
+                    })?;
+                    let _ = std::fs::remove_file(&src_path);
+                }
+
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+
+                Ok(json!({
+                    "ok": true,
+                    "targetId": target_id,
+                    "download": {
+                        "url": download.url,
+                        "suggestedFilename": download.suggested_filename,
+                        "path": final_path.to_string_lossy(),
+                    }
+                }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(download_timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/download") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "download requires body",
+                ));
+            };
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let raw_ref = body
+                .get("ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if raw_ref.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "ref is required",
+                ));
+            }
+            let out = body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if out.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "path is required",
+                ));
+            }
+
+            let download_timeout_ms = body
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120_000)
+                .clamp(500, 120_000);
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+                let Some(page) = entry.pages.get(&target_id) else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "tab is not available",
+                    ));
+                };
+
+                let selector = if let Some(map) = entry.refs_by_target.get(&target_id) {
+                    map.get(&raw_ref).cloned().unwrap_or(raw_ref.clone())
+                } else {
+                    raw_ref.clone()
+                };
+
+                let out_path = std::path::PathBuf::from(out);
+                let resolved_out = if out_path.is_absolute() {
+                    out_path
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        .join(out_path)
+                };
+
+                if let Some(parent) = resolved_out.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to create download output dir {}: {}",
+                                parent.to_string_lossy(),
+                                e
+                            ),
+                        )
+                    })?;
+                }
+
+                let id = Uuid::new_v4();
+                let base_dir = resolved_out
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    });
+                let tmp_dir = base_dir.join(format!("tmp-{}", id));
+                std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to create download tmp dir {}: {}",
+                            tmp_dir.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+
+                let download = browser
+                    .download_via_click(
+                        page,
+                        &selector,
+                        tmp_dir.clone(),
+                        Duration::from_millis(download_timeout_ms),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, format!("download failed: {}", e))
+                    })?;
+
+                let src_path = std::path::PathBuf::from(download.path);
+                if !src_path.exists() {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "download did not produce a file",
+                    ));
+                }
+
+                if let Err(err) = std::fs::rename(&src_path, &resolved_out) {
+                    std::fs::copy(&src_path, &resolved_out).map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "failed to move download (rename failed: {}; copy failed): {}",
+                                err, e
+                            ),
+                        )
+                    })?;
+                    let _ = std::fs::remove_file(&src_path);
+                }
+
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+
+                Ok(json!({
+                    "ok": true,
+                    "targetId": target_id,
+                    "download": {
+                        "url": download.url,
+                        "suggestedFilename": download.suggested_filename,
+                        "path": resolved_out.to_string_lossy(),
+                    }
+                }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(download_timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/highlight") => {
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "highlight requires body",
+                ));
+            };
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let raw_ref = body
+                .get("ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if raw_ref.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "highlight requires ref",
+                ));
+            }
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+                let page = entry.pages.get(&target_id).expect("ensured");
+
+                let selector = if let Some(map) = entry.refs_by_target.get(&target_id) {
+                    map.get(&raw_ref).cloned().unwrap_or(raw_ref.clone())
+                } else {
+                    raw_ref.clone()
+                };
+
+                let _ = page
+                    .evaluate(&format!(
+                        r#"(() => {{
+  const sel = {};
+  const el = document.querySelector(sel);
+  if (!el) throw new Error('Element not found');
+  const id = '__drbot_highlight_overlay';
+  let overlay = document.getElementById(id);
+  if (!overlay) {{
+    overlay = document.createElement('div');
+    overlay.id = id;
+    overlay.style.position = 'fixed';
+    overlay.style.pointerEvents = 'none';
+    overlay.style.zIndex = '2147483647';
+    overlay.style.border = '2px solid #ff4500';
+    overlay.style.borderRadius = '4px';
+    overlay.style.boxShadow = '0 0 0 2px rgba(255,69,0,0.15)';
+    document.body.appendChild(overlay);
+  }}
+  try {{ el.scrollIntoView({{ block: 'center', inline: 'center' }}); }} catch (_) {{}}
+  const r = el.getBoundingClientRect();
+  overlay.style.left = `${{Math.max(0, r.left)}}px`;
+  overlay.style.top = `${{Math.max(0, r.top)}}px`;
+  overlay.style.width = `${{Math.max(0, r.width)}}px`;
+  overlay.style.height = `${{Math.max(0, r.height)}}px`;
+  return true;
+}})()"#,
+                        serde_json::to_string(&selector).unwrap_or_else(|_| "\"\"".to_string())
+                    ))
+                    .await;
+
+                Ok(json!({ "ok": true, "targetId": target_id }))
+            };
+
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
+        ("POST", "/response/body") => {
+            fn match_url_pattern(pattern: &str, url: &str) -> bool {
+                let p = pattern.trim();
+                if p.is_empty() {
+                    return false;
+                }
+                if p == url {
+                    return true;
+                }
+                if !p.contains('*') {
+                    return url.contains(p);
+                }
+                if p.chars().all(|ch| ch == '*') {
+                    return true;
+                }
+
+                let starts_wild = p.starts_with('*');
+                let ends_wild = p.ends_with('*');
+                let parts: Vec<&str> = p.split('*').filter(|s| !s.is_empty()).collect();
+                if parts.is_empty() {
+                    return true;
+                }
+                if !starts_wild && !url.starts_with(parts[0]) {
+                    return false;
+                }
+                if !ends_wild {
+                    if let Some(last) = parts.last() {
+                        if !url.ends_with(last) {
+                            return false;
+                        }
+                    }
+                }
+                let mut idx = 0usize;
+                for part in parts {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if let Some(found) = url.get(idx..).and_then(|s| s.find(part)) {
+                        idx += found + part.len();
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let Some(body) = body else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "response body requires body",
+                ));
+            };
+
+            let requested_target_id = body
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let pattern = body
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if pattern.is_empty() {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "url is required",
+                ));
+            }
+
+            let response_timeout_ms = body
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(timeout_ms)
+                .clamp(500, 120_000);
+
+            let max_chars_raw = body.get("maxChars").and_then(|v| v.as_f64());
+            let max_chars = if let Some(v) = max_chars_raw {
+                let v = v.floor() as i64;
+                (v.clamp(1, 5_000_000) as usize).max(1)
+            } else {
+                200_000
+            };
+
+            let fut = async {
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
+                } else {
+                    resolve_openclaw_browser_target_id(entry).await?
+                };
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                entry.active_target_id = Some(target_id.clone());
+
+                let Some(browser) = entry.browser.as_ref() else {
+                    return Err(ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        "browser is not running",
+                    ));
+                };
+
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(response_timeout_ms);
+                loop {
+                    let requests = browser.network_requests(&target_id, None, false).await;
+                    if let Some(req) = requests.iter().rev().find(|r| {
+                        r.status.is_some()
+                            && !r.url.trim().is_empty()
+                            && match_url_pattern(&pattern, &r.url)
+                    }) {
+                        let body_text =
+                            browser
+                                .response_body(&target_id, &req.id)
+                                .await
+                                .map_err(|e| {
+                                    ErrorShape::new(
+                                        error_codes::UNAVAILABLE,
+                                        format!(
+                                            "Failed to read response body for \"{}\": {}",
+                                            req.url, e
+                                        ),
+                                    )
+                                })?;
+
+                        let truncated = body_text.len() > max_chars;
+                        let trimmed = if truncated {
+                            body_text.chars().take(max_chars).collect::<String>()
+                        } else {
+                            body_text
+                        };
+
+                        let mut response = serde_json::Map::new();
+                        response.insert("url".to_string(), json!(req.url));
+                        if let Some(status) = req.status {
+                            response.insert("status".to_string(), json!(status));
+                        }
+                        response.insert("body".to_string(), json!(trimmed));
+                        if truncated {
+                            response.insert("truncated".to_string(), json!(true));
+                        }
+
+                        return Ok(json!({
+                            "ok": true,
+                            "targetId": target_id,
+                            "response": serde_json::Value::Object(response),
+                        }));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!(
+                                "Response not found for url pattern \"{}\". Run 'openclaw browser requests' to inspect recent network activity.",
+                                pattern
+                            ),
+                        ));
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            };
+
+            tokio::time::timeout(Duration::from_millis(response_timeout_ms), fut)
+                .await
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
+        }
         ("POST", "/screenshot") => {
+            // Back-compat: allow {url} one-shot screenshots when targetId isn't provided.
             let url = query
                 .and_then(|q| q.get("url"))
                 .and_then(|v| v.as_str())
@@ -4382,84 +14766,240 @@ async fn handle_browser_request(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            if url.is_empty() {
-                return Err(ErrorShape::new(
-                    error_codes::INVALID_REQUEST,
-                    "browser screenshot requires url",
-                ));
+            if !url.is_empty() {
+                let full_page = body
+                    .and_then(|b| b.get("fullPage"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let fut = async {
+                    let automation = BrowserAutomation::new().await.map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("browser init failed: {}", e),
+                        )
+                    })?;
+                    let bytes = if full_page {
+                        automation.screenshot_full_page(&url).await
+                    } else {
+                        automation.screenshot_url(&url).await
+                    };
+                    let _ = automation.close().await;
+                    bytes.map_err(|e| {
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            format!("screenshot failed: {}", e),
+                        )
+                    })
+                };
+
+                let bytes = tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+                    .await
+                    .map_err(|_| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                    })??;
+
+                let base = resolve_media_dir_fallback().join("browser");
+                std::fs::create_dir_all(&base).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to create media dir {}: {}",
+                            base.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+                let path = base.join(format!("{}.png", Uuid::new_v4()));
+                let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+                std::fs::write(&tmp, &bytes).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to write screenshot {}: {}",
+                            tmp.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+                std::fs::rename(&tmp, &path).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to move {} -> {}: {}",
+                            tmp.to_string_lossy(),
+                            path.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+
+                return Ok(json!({
+                    "ok": true,
+                    "path": path.to_string_lossy(),
+                    "url": url,
+                    "targetId": serde_json::Value::Null,
+                }));
             }
+
+            let profile_raw = query
+                .and_then(|q| q.get("profile"))
+                .and_then(|v| v.as_str());
+            let profile = resolve_openclaw_browser_profile(state, profile_raw)?;
+            ensure_openclaw_browser_running(state, &profile).await?;
+
+            let requested_target_id = body
+                .and_then(|b| b.get("targetId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let full_page = body
                 .and_then(|b| b.get("fullPage"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let raw_ref = body
+                .and_then(|b| b.get("ref"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let element = body
+                .and_then(|b| b.get("element"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let image_type = body
+                .and_then(|b| b.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("png")
+                .trim()
+                .to_ascii_lowercase();
+            let format = if image_type == "jpeg" {
+                ScreenshotFormat::Jpeg
+            } else {
+                ScreenshotFormat::Png
+            };
 
             let fut = async {
-                let automation = BrowserAutomation::new().await.map_err(|e| {
-                    ErrorShape::new(
-                        error_codes::UNAVAILABLE,
-                        format!("browser init failed: {}", e),
-                    )
-                })?;
-                let bytes = if full_page {
-                    automation.screenshot_full_page(&url).await
+                let mut runtime = openclaw_browser_runtime().lock().await;
+                let entry = runtime.profiles.get_mut(&profile).expect("profile started");
+                let target_id = if let Some(t) = requested_target_id.as_deref() {
+                    t.to_string()
                 } else {
-                    automation.screenshot_url(&url).await
+                    resolve_openclaw_browser_target_id(entry).await?
                 };
-                // Close best-effort (ignore errors).
-                let _ = automation.close().await;
-                bytes.map_err(|e| {
+                ensure_openclaw_browser_page(entry, &target_id).await?;
+                let page = entry.pages.get(&target_id).expect("ensured");
+
+                let selector = element.as_deref().map(|s| s.to_string()).or_else(|| {
+                    raw_ref.as_deref().and_then(|raw| {
+                        if let Some(map) = entry.refs_by_target.get(&target_id) {
+                            if let Some(sel) = map.get(raw) {
+                                return Some(sel.clone());
+                            }
+                        }
+                        Some(raw.to_string())
+                    })
+                });
+
+                let clip = if let Some(selector) = selector.as_deref() {
+                    let js = format!(
+                        r#"(() => {{
+  const el = document.querySelector({});
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
+}})()"#,
+                        serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string())
+                    );
+                    if let Ok(rect) = page.evaluate(&js).await {
+                        let x = rect.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y = rect.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let w = rect.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let h = rect.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        if w > 1.0 && h > 1.0 {
+                            Some(Viewport {
+                                x: x.max(0.0),
+                                y: y.max(0.0),
+                                width: w.min(10_000.0),
+                                height: h.min(10_000.0),
+                                scale: None,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let options = ScreenshotOptions {
+                    format,
+                    quality: None,
+                    full_page: full_page && clip.is_none(),
+                    clip,
+                };
+                let bytes = page.screenshot(options).await.map_err(|e| {
                     ErrorShape::new(
                         error_codes::UNAVAILABLE,
                         format!("screenshot failed: {}", e),
                     )
-                })
+                })?;
+                let url = page.url().await.ok();
+
+                let base = resolve_media_dir_fallback().join("browser");
+                std::fs::create_dir_all(&base).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to create media dir {}: {}",
+                            base.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+                let ext = match format {
+                    ScreenshotFormat::Jpeg => "jpeg",
+                    _ => "png",
+                };
+                let path = base.join(format!("{}.{}", Uuid::new_v4(), ext));
+                let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+                std::fs::write(&tmp, &bytes).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to write screenshot {}: {}",
+                            tmp.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+                std::fs::rename(&tmp, &path).map_err(|e| {
+                    ErrorShape::new(
+                        error_codes::UNAVAILABLE,
+                        format!(
+                            "failed to move {} -> {}: {}",
+                            tmp.to_string_lossy(),
+                            path.to_string_lossy(),
+                            e
+                        ),
+                    )
+                })?;
+
+                Ok(json!({
+                    "ok": true,
+                    "path": path.to_string_lossy(),
+                    "targetId": target_id,
+                    "url": url,
+                }))
             };
 
-            let bytes = tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
+            tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
                 .await
-                .map_err(|_| ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out"))??;
-
-            let base = resolve_media_dir_fallback().join("browser");
-            std::fs::create_dir_all(&base).map_err(|e| {
-                ErrorShape::new(
-                    error_codes::UNAVAILABLE,
-                    format!(
-                        "failed to create media dir {}: {}",
-                        base.to_string_lossy(),
-                        e
-                    ),
-                )
-            })?;
-            let path = base.join(format!("{}.png", Uuid::new_v4()));
-            let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-            std::fs::write(&tmp, &bytes).map_err(|e| {
-                ErrorShape::new(
-                    error_codes::UNAVAILABLE,
-                    format!(
-                        "failed to write screenshot {}: {}",
-                        tmp.to_string_lossy(),
-                        e
-                    ),
-                )
-            })?;
-            std::fs::rename(&tmp, &path).map_err(|e| {
-                ErrorShape::new(
-                    error_codes::UNAVAILABLE,
-                    format!(
-                        "failed to move {} -> {}: {}",
-                        tmp.to_string_lossy(),
-                        path.to_string_lossy(),
-                        e
-                    ),
-                )
-            })?;
-
-            Ok(json!({
-                "ok": true,
-                "path": path.to_string_lossy(),
-                "url": url,
-                "targetId": serde_json::Value::Null,
-            }))
+                .map_err(|_| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "browser request timed out")
+                })?
         }
         _ => Err(ErrorShape::new(
             error_codes::INVALID_REQUEST,
@@ -4490,39 +15030,30 @@ async fn handle_sessions_preview(
             continue;
         }
 
-        let store_key = openclaw_session_key_to_store_key(raw_key);
-        let mut candidates: Vec<&str> = Vec::new();
-        candidates.push(store_key.as_str());
-        if store_key != raw_key {
-            candidates.push(raw_key);
-        }
-
         let mut session = None;
         let mut had_error = false;
 
-        'outer: for candidate in candidates {
-            // Try legacy "openclaw" first, then fall back to split keys.
+        let (canonical_key, openclaw_candidates) =
+            openclaw_session_store_key_candidates(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+        let store_key = openclaw_session_key_to_store_key(&canonical_key);
+
+        for candidate in &openclaw_candidates {
             match store.get_by_channel("openclaw", candidate).await {
                 Ok(Some(s)) => {
                     session = Some(s);
-                    break 'outer;
+                    break;
                 }
                 Ok(None) => {}
-                Err(_) => {
-                    had_error = true;
-                }
+                Err(_) => had_error = true,
             }
+        }
 
-            let (channel_type, channel_id) = session_key_to_channel(candidate);
+        if session.is_none() {
+            let (channel_type, channel_id) = session_key_to_channel(&store_key);
             match store.get_by_channel(&channel_type, &channel_id).await {
-                Ok(Some(s)) => {
-                    session = Some(s);
-                    break 'outer;
-                }
+                Ok(Some(s)) => session = Some(s),
                 Ok(None) => {}
-                Err(_) => {
-                    had_error = true;
-                }
+                Err(_) => had_error = true,
             }
         }
 
@@ -4586,11 +15117,14 @@ async fn handle_sessions_reset(
 ) -> Result<serde_json::Value, ErrorShape> {
     let raw_key = key.trim();
     if raw_key.is_empty() {
-        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "key required",
+        ));
     }
 
-    let canonical_key =
-        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+    let (canonical_key, openclaw_candidates) =
+        openclaw_session_store_key_candidates(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
     let store_key = openclaw_session_key_to_store_key(&canonical_key);
 
     let store = state
@@ -4598,13 +15132,7 @@ async fn handle_sessions_reset(
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
 
     let mut session = None;
-    let mut candidates: Vec<&str> = Vec::new();
-    candidates.push(store_key.as_str());
-    if store_key != raw_key {
-        candidates.push(raw_key);
-    }
-
-    for candidate in candidates {
+    for candidate in &openclaw_candidates {
         session = store
             .get_by_channel("openclaw", candidate)
             .await
@@ -4612,14 +15140,13 @@ async fn handle_sessions_reset(
         if session.is_some() {
             break;
         }
-        let (channel_type, channel_id) = session_key_to_channel(candidate);
+    }
+    if session.is_none() {
+        let (channel_type, channel_id) = session_key_to_channel(&store_key);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-        if session.is_some() {
-            break;
-        }
     }
     let mut session =
         session.ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "unknown session"))?;
@@ -4654,11 +15181,14 @@ async fn handle_sessions_compact(
 ) -> Result<serde_json::Value, ErrorShape> {
     let raw_key = key.trim();
     if raw_key.is_empty() {
-        return Err(ErrorShape::new(error_codes::INVALID_REQUEST, "key required"));
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "key required",
+        ));
     }
 
-    let canonical_key =
-        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
+    let (canonical_key, openclaw_candidates) =
+        openclaw_session_store_key_candidates(crate::openclaw_paths::DEFAULT_AGENT_ID, raw_key);
     let store_key = openclaw_session_key_to_store_key(&canonical_key);
 
     let store = state
@@ -4666,13 +15196,7 @@ async fn handle_sessions_compact(
         .ok_or_else(|| ErrorShape::new(error_codes::UNAVAILABLE, "session store not configured"))?;
 
     let mut session = None;
-    let mut candidates: Vec<&str> = Vec::new();
-    candidates.push(store_key.as_str());
-    if store_key != raw_key {
-        candidates.push(raw_key);
-    }
-
-    for candidate in candidates {
+    for candidate in &openclaw_candidates {
         session = store
             .get_by_channel("openclaw", candidate)
             .await
@@ -4680,14 +15204,13 @@ async fn handle_sessions_compact(
         if session.is_some() {
             break;
         }
-        let (channel_type, channel_id) = session_key_to_channel(candidate);
+    }
+    if session.is_none() {
+        let (channel_type, channel_id) = session_key_to_channel(&store_key);
         session = store
             .get_by_channel(&channel_type, &channel_id)
             .await
             .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-        if session.is_some() {
-            break;
-        }
     }
     let mut session =
         session.ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "unknown session"))?;
@@ -4701,8 +15224,172 @@ async fn handle_sessions_compact(
         }));
     }
 
-    let start = session.messages.len().saturating_sub(max_lines);
-    session.messages = session.messages[start..].to_vec();
+    // If the caller sets maxLines=1, we cannot safely insert a summary message.
+    // Fall back to truncation-only in that case.
+    if max_lines < 2 {
+        let start = session.messages.len().saturating_sub(max_lines);
+        session.messages = session.messages[start..].to_vec();
+        session.metadata.message_count = session.messages.len();
+        session.update_timestamp();
+
+        store
+            .update(&session)
+            .await
+            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+
+        return Ok(json!({
+            "ok": true,
+            "key": canonical_key,
+            "compacted": true,
+            "archived": null,
+            "kept": session.messages.len(),
+        }));
+    }
+
+    let keep_tail = max_lines.saturating_sub(1).max(1);
+    let start = session.messages.len().saturating_sub(keep_tail);
+    let archived_messages = session.messages[..start].to_vec();
+    let kept_messages = session.messages[start..].to_vec();
+
+    let archived_path = {
+        let dir = resolve_openclaw_state_dir(state)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("sessions")
+            .join("archive");
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            warn!(
+                error = %e,
+                path = %dir.to_string_lossy(),
+                "sessions.compact: failed to create archive dir"
+            );
+            None
+        } else {
+            let file = dir.join(format!("{}-{}.jsonl", session.id, now_ms()));
+            match tokio::fs::File::create(&file).await {
+                Ok(mut f) => {
+                    let mut ok = true;
+                    for msg in &archived_messages {
+                        let line = serde_json::to_string(msg).unwrap_or_else(|_| "{}".to_string());
+                        if f.write_all(line.as_bytes()).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                        if f.write_all(b"\n").await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        let _ = f.flush().await;
+                        Some(file.to_string_lossy().to_string())
+                    } else {
+                        let _ = tokio::fs::remove_file(&file).await;
+                        None
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %file.to_string_lossy(),
+                        "sessions.compact: failed to create archive file"
+                    );
+                    None
+                }
+            }
+        }
+    };
+
+    let summary_text = {
+        let mut transcript = String::new();
+        const MAX_TRANSCRIPT_CHARS: usize = 50_000;
+        for msg in &archived_messages {
+            let label = match msg.role {
+                Role::System => "System",
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+            };
+            let text = msg.text_content();
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            transcript.push_str(label);
+            transcript.push_str(": ");
+            transcript.push_str(text);
+            transcript.push('\n');
+            if transcript.len() >= MAX_TRANSCRIPT_CHARS {
+                transcript.truncate(MAX_TRANSCRIPT_CHARS);
+                transcript.push_str("\n...[truncated]\n");
+                break;
+            }
+        }
+
+        let summary = if transcript.trim().is_empty() {
+            None
+        } else if let Some(provider) = state.provider() {
+            let prompt = format!(
+                "Summarize the following transcript for future context.\n\
+Focus on: goals, key facts, decisions, TODOs, and any important constraints.\n\
+Keep it concise.\n\nTranscript:\n{}",
+                transcript
+            );
+            let req = vec![
+                Message::system("You are a concise summarizer."),
+                Message::user(prompt),
+            ];
+            let opts = ChatOptions {
+                max_tokens: Some(600),
+                temperature: Some(0.2),
+                ..Default::default()
+            };
+            match provider.chat(&req, opts).await {
+                Ok(res) => {
+                    let text = res.content.trim().to_string();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "sessions.compact: summary model call failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut out = String::new();
+        out.push_str("Session compacted.\n");
+        out.push_str(&format!(
+            "Archived {} messages; kept {}.\n",
+            archived_messages.len(),
+            kept_messages.len()
+        ));
+        if let Some(path) = archived_path.as_deref() {
+            out.push_str("Archive file: ");
+            out.push_str(path);
+            out.push('\n');
+        }
+        if let Some(summary) = summary.as_deref() {
+            out.push('\n');
+            out.push_str("Summary:\n");
+            out.push_str(summary.trim());
+            out.push('\n');
+        }
+        out
+    };
+
+    let mut next_messages = Vec::with_capacity(kept_messages.len().saturating_add(1));
+    let mut summary_message = Message::assistant(summary_text);
+    if let Some(first_kept) = kept_messages.first() {
+        summary_message.created_at = first_kept.created_at - chrono::Duration::milliseconds(1);
+    }
+    next_messages.push(summary_message);
+    next_messages.extend(kept_messages);
+
+    session.messages = next_messages;
     session.metadata.message_count = session.messages.len();
     session.update_timestamp();
 
@@ -4715,105 +15402,18 @@ async fn handle_sessions_compact(
         "ok": true,
         "key": canonical_key,
         "compacted": true,
-        "archived": null,
+        "archived": archived_path,
+        "archivedCount": archived_messages.len(),
         "kept": session.messages.len(),
     }))
 }
 
 async fn handle_usage_status(state: &GatewayState) -> serde_json::Value {
-    let (provider, display_name) = match state
-        .config()
-        .providers
-        .default_provider
-        .as_deref()
-        .unwrap_or("auto")
-    {
-        "anthropic" | "claude" => ("anthropic", "Anthropic"),
-        "openai" | "gpt" => ("openai-codex", "OpenAI"),
-        "ollama" | "local" => ("openai-codex", "Local"),
-        _ => ("openai-codex", "Provider"),
-    };
-
-    json!({
-        "updatedAt": now_ms(),
-        "providers": [{
-            "provider": provider,
-            "displayName": display_name,
-            "windows": [{
-                "label": "quota",
-                "usedPercent": 0,
-                "resetAt": null
-            }]
-        }]
-    })
+    crate::openclaw_usage::usage_status_summary(state).await
 }
 
 async fn handle_usage_cost(state: &GatewayState, days: usize) -> serde_json::Value {
-    use chrono::{Duration as ChronoDuration, Local};
-
-    let days = days.max(1).min(365);
-    let today = Local::now().date_naive();
-    let start = today - ChronoDuration::days((days - 1) as i64);
-
-    let mut by_date: HashMap<String, (u64, u64)> = HashMap::new();
-    if let Some(store) = state.session_store() {
-        let list = store
-            .list(drbot_sessions::ListOptions {
-                include_archived: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap_or_default();
-
-        for s in list {
-            let d = s.updated_at.with_timezone(&Local).date_naive();
-            if d < start || d > today {
-                continue;
-            }
-            let key = d.format("%Y-%m-%d").to_string();
-            let entry = by_date.entry(key).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(s.metadata.total_input_tokens as u64);
-            entry.1 = entry
-                .1
-                .saturating_add(s.metadata.total_output_tokens as u64);
-        }
-    }
-
-    let mut daily: Vec<serde_json::Value> = Vec::new();
-    let mut totals_input: u64 = 0;
-    let mut totals_output: u64 = 0;
-    for i in 0..days {
-        let d = start + ChronoDuration::days(i as i64);
-        let date = d.format("%Y-%m-%d").to_string();
-        let (input, output) = by_date.get(&date).copied().unwrap_or((0, 0));
-        totals_input = totals_input.saturating_add(input);
-        totals_output = totals_output.saturating_add(output);
-        daily.push(json!({
-            "date": date,
-            "input": input,
-            "output": output,
-            "cacheRead": 0,
-            "cacheWrite": 0,
-            "totalTokens": input + output,
-            "totalCost": 0,
-            "missingCostEntries": 0,
-        }));
-    }
-
-    json!({
-        "updatedAt": now_ms(),
-        "days": days,
-        "daily": daily,
-        "totals": {
-            "input": totals_input,
-            "output": totals_output,
-            "cacheRead": 0,
-            "cacheWrite": 0,
-            "totalTokens": totals_input + totals_output,
-            "totalCost": 0,
-            "missingCostEntries": 0,
-        }
-    })
+    crate::openclaw_usage::usage_cost_summary(state, days).await
 }
 
 const PAIRING_PENDING_TTL_MS: u64 = 5 * 60 * 1000;
@@ -5189,7 +15789,11 @@ fn update_paired_node_last_connected(
     Ok(())
 }
 
-fn update_paired_node_metadata(state: &GatewayState, node_id: &str, client: &OpenclawClient) -> Result<(), ErrorShape> {
+fn update_paired_node_metadata(
+    state: &GatewayState,
+    node_id: &str,
+    client: &OpenclawClient,
+) -> Result<(), ErrorShape> {
     let node_id = node_id.trim();
     if node_id.is_empty() {
         return Ok(());
@@ -5205,7 +15809,10 @@ fn update_paired_node_metadata(state: &GatewayState, node_id: &str, client: &Ope
         platform: Some(client.platform.clone()),
         version: Some(client.client_version.clone()),
         device_family: client.device_family.clone().or(existing.device_family),
-        model_identifier: client.model_identifier.clone().or(existing.model_identifier),
+        model_identifier: client
+            .model_identifier
+            .clone()
+            .or(existing.model_identifier),
         caps: if client.caps.is_empty() {
             existing.caps
         } else {
@@ -5231,7 +15838,11 @@ fn update_paired_node_metadata(state: &GatewayState, node_id: &str, client: &Ope
     Ok(())
 }
 
-fn update_paired_node_bins(state: &GatewayState, node_id: &str, bins: Vec<String>) -> Result<bool, ErrorShape> {
+fn update_paired_node_bins(
+    state: &GatewayState,
+    node_id: &str,
+    bins: Vec<String>,
+) -> Result<bool, ErrorShape> {
     let node_id = node_id.trim();
     if node_id.is_empty() {
         return Ok(false);
@@ -5583,7 +16194,10 @@ fn scopes_allow(requested: &[String], allowed: &[String]) -> bool {
     requested.iter().all(|s| allowed.contains(s.as_str()))
 }
 
-fn get_paired_device(state: &GatewayState, device_id: &str) -> Result<Option<PairedDevice>, ErrorShape> {
+fn get_paired_device(
+    state: &GatewayState,
+    device_id: &str,
+) -> Result<Option<PairedDevice>, ErrorShape> {
     let device_id = device_id.trim();
     if device_id.is_empty() {
         return Ok(None);
@@ -5592,8 +16206,16 @@ fn get_paired_device(state: &GatewayState, device_id: &str) -> Result<Option<Pai
     Ok(paired.get(device_id).cloned())
 }
 
-fn update_paired_device_metadata(state: &GatewayState, meta: &OpenclawClient) -> Result<(), ErrorShape> {
-    let Some(device_id) = meta.device_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+fn update_paired_device_metadata(
+    state: &GatewayState,
+    meta: &OpenclawClient,
+) -> Result<(), ErrorShape> {
+    let Some(device_id) = meta
+        .device_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    else {
         return Ok(());
     };
     let (pending, mut paired) = load_device_pairing_state(state);
@@ -5875,7 +16497,11 @@ fn rotate_device_token(
     });
     let scopes = normalize_scopes(&scopes);
     if scopes_provided {
-        device.scopes = if scopes.is_empty() { None } else { Some(scopes.clone()) };
+        device.scopes = if scopes.is_empty() {
+            None
+        } else {
+            Some(scopes.clone())
+        };
     }
     let next = DeviceAuthToken {
         token: new_pairing_token(),
@@ -5978,6 +16604,505 @@ const AGENT_BOOTSTRAP_FILE_NAMES: &[&str] = &[
 const AGENT_MEMORY_FILENAME: &str = "MEMORY.md";
 const AGENT_MEMORY_ALT_FILENAME: &str = "memory.md";
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawSubagentsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenclawModelListConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawAgentsDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagents: Option<OpenclawSubagentsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_model: Option<OpenclawModelListConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawAgentsFile {
+    version: u32,
+    #[serde(default)]
+    defaults: OpenclawAgentsDefaults,
+    #[serde(default)]
+    agents: Vec<OpenclawAgentConfig>,
+}
+
+impl Default for OpenclawAgentsFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            defaults: OpenclawAgentsDefaults::default(),
+            agents: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawExecToolConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawToolsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allow: Vec<String>,
+    #[serde(default, rename = "alsoAllow", skip_serializing_if = "Vec::is_empty")]
+    also_allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec: Option<OpenclawExecToolConfig>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawAgentConfig {
+    #[serde(rename = "agentId")]
+    agent_id: String,
+    name: String,
+    workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_model: Option<OpenclawModelListConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools: Option<OpenclawToolsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagents: Option<OpenclawSubagentsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    emoji: Option<String>,
+}
+
+fn resolve_openclaw_agents_path(state: &GatewayState) -> PathBuf {
+    resolve_openclaw_state_dir(state)
+        .map(|dir| dir.join("agents.json"))
+        .unwrap_or_else(|| PathBuf::from("agents.json"))
+}
+
+fn load_openclaw_agents_file(state: &GatewayState) -> OpenclawAgentsFile {
+    let path = resolve_openclaw_agents_path(state);
+    read_json_file::<OpenclawAgentsFile>(&path).unwrap_or_default()
+}
+
+pub(crate) fn resolve_openclaw_agents_defaults_image_model_refs(state: &GatewayState) -> Vec<String> {
+    let file = load_openclaw_agents_file(state);
+    collect_openclaw_model_list_refs(file.defaults.image_model.as_ref())
+}
+
+pub(crate) fn resolve_openclaw_agent_image_model_refs(
+    state: &GatewayState,
+    agent_id: &str,
+) -> Vec<String> {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let file = load_openclaw_agents_file(state);
+    let agent_cfg = file
+        .agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+    let agent_image_model = agent_cfg.and_then(|a| a.image_model.as_ref());
+    if let Some(cfg) = agent_image_model {
+        if cfg.primary.is_some() || !cfg.fallbacks.is_empty() {
+            return collect_openclaw_model_list_refs(Some(cfg));
+        }
+    }
+    collect_openclaw_model_list_refs(file.defaults.image_model.as_ref())
+}
+
+fn collect_openclaw_model_list_refs(cfg: Option<&OpenclawModelListConfig>) -> Vec<String> {
+    let Some(cfg) = cfg else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let clipped = trimmed.chars().take(200).collect::<String>();
+        if seen.insert(clipped.clone()) {
+            out.push(clipped);
+        }
+    };
+
+    if let Some(primary) = cfg.primary.as_deref() {
+        push(primary);
+    }
+    for fallback in &cfg.fallbacks {
+        push(fallback);
+    }
+
+    out
+}
+
+fn store_openclaw_agents_file(
+    state: &GatewayState,
+    file: &OpenclawAgentsFile,
+) -> Result<(), ErrorShape> {
+    let path = resolve_openclaw_agents_path(state);
+    write_json_atomic(&path, file)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawToolsConfigFile {
+    version: u32,
+    #[serde(default)]
+    tools: OpenclawToolsConfig,
+}
+
+impl Default for OpenclawToolsConfigFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            tools: OpenclawToolsConfig::default(),
+        }
+    }
+}
+
+fn resolve_openclaw_tools_config_path(state: &GatewayState) -> PathBuf {
+    resolve_openclaw_state_dir(state)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("openclaw_tools.json")
+}
+
+fn load_openclaw_tools_config_file(state: &GatewayState) -> OpenclawToolsConfigFile {
+    let path = resolve_openclaw_tools_config_path(state);
+    read_json_file::<OpenclawToolsConfigFile>(&path).unwrap_or_default()
+}
+
+fn store_openclaw_tools_config_file(
+    state: &GatewayState,
+    file: &OpenclawToolsConfigFile,
+) -> Result<(), ErrorShape> {
+    let path = resolve_openclaw_tools_config_path(state);
+    write_json_atomic(&path, file)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawMemoryQmdSessionsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_messages: Option<u64>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenclawMemoryQmdPathSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenclawMemoryQmdPathEntry {
+    String(String),
+    Object(OpenclawMemoryQmdPathSpec),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawMemoryQmdConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<OpenclawMemoryQmdPathEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sessions: Option<OpenclawMemoryQmdSessionsConfig>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawMemoryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    citations: Option<String>,
+    #[serde(default)]
+    qmd: OpenclawMemoryQmdConfig,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenclawMemoryConfigFile {
+    version: u32,
+    #[serde(default)]
+    memory: OpenclawMemoryConfig,
+}
+
+impl Default for OpenclawMemoryConfigFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            memory: OpenclawMemoryConfig::default(),
+        }
+    }
+}
+
+fn resolve_openclaw_memory_config_path(state: &GatewayState) -> PathBuf {
+    resolve_openclaw_state_dir(state)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("openclaw_memory.json")
+}
+
+fn load_openclaw_memory_config_file(state: &GatewayState) -> OpenclawMemoryConfigFile {
+    let path = resolve_openclaw_memory_config_path(state);
+    read_json_file::<OpenclawMemoryConfigFile>(&path).unwrap_or_default()
+}
+
+fn store_openclaw_memory_config_file(
+    state: &GatewayState,
+    file: &OpenclawMemoryConfigFile,
+) -> Result<(), ErrorShape> {
+    let path = resolve_openclaw_memory_config_path(state);
+    write_json_atomic(&path, file)
+}
+
+pub(crate) fn resolve_openclaw_memory_backend(state: &GatewayState) -> String {
+    let cfg = load_openclaw_memory_config_file(state);
+    cfg.memory
+        .backend
+        .as_deref()
+        .unwrap_or("sqlite")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+pub(crate) fn resolve_openclaw_memory_citations_mode(state: &GatewayState) -> String {
+    let cfg = load_openclaw_memory_config_file(state);
+    cfg.memory
+        .citations
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+pub(crate) fn resolve_openclaw_memory_qmd_paths(
+    state: &GatewayState,
+) -> Vec<OpenclawMemoryQmdPathSpec> {
+    let cfg = load_openclaw_memory_config_file(state);
+    cfg.memory
+        .qmd
+        .paths
+        .into_iter()
+        .filter_map(|entry| match entry {
+            OpenclawMemoryQmdPathEntry::String(path) => {
+                let path = path.trim().to_string();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(OpenclawMemoryQmdPathSpec {
+                        name: None,
+                        path,
+                        pattern: None,
+                        extra: HashMap::new(),
+                    })
+                }
+            }
+            OpenclawMemoryQmdPathEntry::Object(mut spec) => {
+                spec.path = spec.path.trim().to_string();
+                spec.name = spec
+                    .name
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                spec.pattern = spec
+                    .pattern
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if spec.path.is_empty() {
+                    None
+                } else {
+                    Some(spec)
+                }
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_openclaw_memory_qmd_sessions_enabled(state: &GatewayState) -> bool {
+    let cfg = load_openclaw_memory_config_file(state);
+    cfg.memory
+        .qmd
+        .sessions
+        .as_ref()
+        .and_then(|s| s.enabled)
+        .unwrap_or(false)
+}
+
+pub(crate) fn resolve_openclaw_memory_qmd_sessions_max_messages(state: &GatewayState) -> usize {
+    let cfg = load_openclaw_memory_config_file(state);
+    cfg.memory
+        .qmd
+        .sessions
+        .as_ref()
+        .and_then(|s| s.max_messages)
+        .unwrap_or(200)
+        .clamp(10, 2000) as usize
+}
+
+fn default_agent_workspace_dir(state: &GatewayState, agent_id: &str) -> PathBuf {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    if let Some(dir) = resolve_openclaw_state_dir(state) {
+        dir.join("agents").join(&agent_id)
+    } else {
+        PathBuf::from("agents").join(agent_id)
+    }
+}
+
+pub(crate) fn resolve_agent_workspace_dir_for_state(
+    state: &GatewayState,
+    agent_id: &str,
+) -> PathBuf {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let file = load_openclaw_agents_file(state);
+    if let Some(entry) = file
+        .agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+    {
+        let workspace = entry.workspace.trim();
+        if !workspace.is_empty() {
+            return crate::openclaw_paths::resolve_user_path(workspace);
+        }
+    }
+    default_agent_workspace_dir(state, &agent_id)
+}
+
+pub(crate) fn resolve_openclaw_agent_default_model(
+    state: &GatewayState,
+    agent_id: &str,
+) -> Option<String> {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let file = load_openclaw_agents_file(state);
+    file.agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+        .and_then(|a| a.model.as_ref())
+        .and_then(extract_openclaw_model_primary)
+}
+
+pub(crate) fn resolve_openclaw_agent_skills_filter(
+    state: &GatewayState,
+    agent_id: &str,
+) -> Option<Vec<String>> {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let file = load_openclaw_agents_file(state);
+    let skills = file
+        .agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+        .and_then(|a| a.skills.clone())?;
+    Some(
+        skills
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
+pub(crate) fn resolve_openclaw_agent_default_subagent_thinking(
+    state: &GatewayState,
+    agent_id: &str,
+) -> Option<String> {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let file = load_openclaw_agents_file(state);
+
+    let per_agent = file
+        .agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+        .and_then(|a| a.subagents.as_ref())
+        .and_then(|s| s.thinking.clone());
+    let global = file
+        .defaults
+        .subagents
+        .as_ref()
+        .and_then(|s| s.thinking.clone());
+    let resolved = per_agent.or(global)?;
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn list_agent_ids_for_state(state: &GatewayState) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    ids.insert(crate::openclaw_paths::DEFAULT_AGENT_ID.to_string());
+
+    let file = load_openclaw_agents_file(state);
+    for agent in file.agents {
+        let id = crate::openclaw_paths::normalize_agent_id(&agent.agent_id);
+        ids.insert(id);
+    }
+
+    if let Some(dir) = resolve_openclaw_state_dir(state) {
+        let base = dir.join("agents");
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                ids.insert(crate::openclaw_paths::normalize_agent_id(&name));
+            }
+        }
+    }
+
+    ids.into_iter().collect()
+}
+
 fn is_allowed_agent_workspace_filename(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -6002,10 +17127,75 @@ fn stat_agent_workspace_file(path: &PathBuf) -> Option<(u64, u64)> {
     Some((meta.len(), updated_at_ms))
 }
 
-async fn handle_agents_files_list(agent_id: &str) -> serde_json::Value {
+fn default_agent_workspace_file_content(filename: &str, name: &str, emoji: Option<&str>) -> String {
+    let title = match filename {
+        "AGENTS.md" => "Agent Instructions",
+        "SOUL.md" => "Soul",
+        "TOOLS.md" => "Tools",
+        "IDENTITY.md" => "Identity",
+        "USER.md" => "User",
+        "HEARTBEAT.md" => "Heartbeat",
+        "BOOTSTRAP.md" => "Bootstrap",
+        "MEMORY.md" | "memory.md" => "Memory",
+        _ => filename,
+    };
+
+    if filename == "IDENTITY.md" {
+        let name = name.trim();
+        if let Some(emoji) = emoji.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return format!("# {} {}\n", emoji, name);
+        }
+        return format!("# {}\n", name);
+    }
+
+    format!("# {}\n", title)
+}
+
+fn ensure_agent_workspace_bootstrap(
+    workspace: &PathBuf,
+    name: &str,
+    emoji: Option<&str>,
+) -> Result<(), ErrorShape> {
+    if let Err(e) = std::fs::create_dir_all(workspace) {
+        return Err(ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to create workspace dir: {}", e),
+        ));
+    }
+
+    for filename in AGENT_BOOTSTRAP_FILE_NAMES {
+        let path = workspace.join(filename);
+        if path.exists() {
+            continue;
+        }
+        let content = default_agent_workspace_file_content(filename, name, emoji);
+        if let Err(e) = std::fs::write(&path, content) {
+            return Err(ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to bootstrap {}: {}", filename, e),
+            ));
+        }
+    }
+
+    let memory_path = workspace.join(AGENT_MEMORY_FILENAME);
+    let memory_alt_path = workspace.join(AGENT_MEMORY_ALT_FILENAME);
+    if !memory_path.exists() && !memory_alt_path.exists() {
+        let content = default_agent_workspace_file_content(AGENT_MEMORY_FILENAME, name, emoji);
+        if let Err(e) = std::fs::write(&memory_path, content) {
+            return Err(ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to bootstrap {}: {}", AGENT_MEMORY_FILENAME, e),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_agents_files_list(state: &GatewayState, agent_id: &str) -> serde_json::Value {
     // OpenClaw parity: agent IDs are normalized to be path-safe + shell-friendly.
     let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
-    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
+    let workspace = resolve_agent_workspace_dir_for_state(state, &agent_id);
     let mut files: Vec<serde_json::Value> = Vec::new();
 
     for name in AGENT_BOOTSTRAP_FILE_NAMES {
@@ -6063,6 +17253,7 @@ async fn handle_agents_files_list(agent_id: &str) -> serde_json::Value {
 }
 
 async fn handle_agents_files_get(
+    state: &GatewayState,
     agent_id: &str,
     name: &str,
 ) -> Result<serde_json::Value, ErrorShape> {
@@ -6074,7 +17265,7 @@ async fn handle_agents_files_get(
         ));
     }
     let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
-    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
+    let workspace = resolve_agent_workspace_dir_for_state(state, &agent_id);
     let path = workspace.join(name);
     let missing = !path.exists();
     let content = if missing {
@@ -6105,6 +17296,7 @@ async fn handle_agents_files_get(
 }
 
 async fn handle_agents_files_set(
+    state: &GatewayState,
     agent_id: &str,
     name: &str,
     content: &str,
@@ -6117,7 +17309,7 @@ async fn handle_agents_files_set(
         ));
     }
     let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
-    let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
+    let workspace = resolve_agent_workspace_dir_for_state(state, &agent_id);
     if let Err(e) = std::fs::create_dir_all(&workspace) {
         return Err(ErrorShape::new(
             error_codes::UNAVAILABLE,
@@ -6154,7 +17346,10 @@ async fn handle_agents_files_set(
     }))
 }
 
-fn cap_array_by_json_bytes(items: Vec<serde_json::Value>, max_bytes: usize) -> Vec<serde_json::Value> {
+fn cap_array_by_json_bytes(
+    items: Vec<serde_json::Value>,
+    max_bytes: usize,
+) -> Vec<serde_json::Value> {
     if items.is_empty() {
         return items;
     }
@@ -6188,26 +17383,52 @@ async fn handle_chat_history(
 ) -> serde_json::Value {
     let limit = limit.unwrap_or(200).min(1000) as usize;
     if let Some(store) = state.session_store() {
-        let store_key = openclaw_session_key_to_store_key(session_key);
-        let mut candidates: Vec<&str> = Vec::new();
-        candidates.push(store_key.as_str());
-        if store_key != session_key {
-            candidates.push(session_key);
-        }
+        let (canonical_key, candidates) = openclaw_session_store_key_candidates(
+            crate::openclaw_paths::DEFAULT_AGENT_ID,
+            session_key,
+        );
 
         let mut session = None;
-        for candidate in candidates {
-            session = store.get_by_channel("openclaw", candidate).await.ok().flatten();
+        let mut found_openclaw_key: Option<String> = None;
+        for candidate in &candidates {
+            session = store
+                .get_by_channel("openclaw", candidate)
+                .await
+                .ok()
+                .flatten();
             if session.is_some() {
+                found_openclaw_key = Some(candidate.clone());
                 break;
             }
             let (channel_type, channel_id) = session_key_to_channel(candidate);
-            session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
+            session = store
+                .get_by_channel(&channel_type, &channel_id)
+                .await
+                .ok()
+                .flatten();
             if session.is_some() {
                 break;
             }
         }
-        if let Some(session) = session {
+        if let Some(mut session) = session {
+            if let Some(found_key) = found_openclaw_key.as_deref() {
+                if found_key != canonical_key {
+                    if store
+                        .get_by_channel("openclaw", &canonical_key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        let previous = session.channel_id.clone();
+                        session.channel_type = "openclaw".to_string();
+                        session.channel_id = canonical_key.clone();
+                        if store.update(&session).await.is_err() {
+                            session.channel_id = previous;
+                        }
+                    }
+                }
+            }
             let total = session.messages.len();
             let slice = if total > limit {
                 &session.messages[total - limit..]
@@ -6216,9 +17437,10 @@ async fn handle_chat_history(
             };
             let messages: Vec<serde_json::Value> =
                 slice.iter().map(drbot_message_to_openclaw).collect();
-            let messages = cap_array_by_json_bytes(messages, resolve_openclaw_max_chat_history_bytes());
+            let messages =
+                cap_array_by_json_bytes(messages, resolve_openclaw_max_chat_history_bytes());
             return json!({
-                "sessionKey": session_key,
+                "sessionKey": canonical_key,
                 "sessionId": session.id.to_string(),
                 "messages": messages,
                 "thinkingLevel": null
@@ -6226,11 +17448,22 @@ async fn handle_chat_history(
         }
     }
     json!({
-        "sessionKey": session_key,
+        "sessionKey": canonicalize_openclaw_session_key(
+            crate::openclaw_paths::DEFAULT_AGENT_ID,
+            session_key,
+        ),
         "sessionId": null,
         "messages": [],
         "thinkingLevel": null
     })
+}
+
+pub(crate) async fn openclaw_chat_history_for_tool(
+    state: &GatewayState,
+    session_key: &str,
+    limit: Option<u64>,
+) -> serde_json::Value {
+    handle_chat_history(state, session_key, limit).await
 }
 
 struct OpenclawMainLaneGuard {
@@ -6256,8 +17489,14 @@ async fn spawn_chat_run(
     run_id: String,
     session_key: String,
     user_msg: Message,
+    response_prefix: Option<String>,
     mut cancel_rx: watch::Receiver<Option<String>>,
 ) {
+    let session_key =
+        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, &session_key);
+    let agent_id =
+        openclaw_session_key_agent_id(&session_key, crate::openclaw_paths::DEFAULT_AGENT_ID);
+    let user_text_raw = user_msg.text_content();
     let dedupe_key = chat_send_dedupe_key(&session_key, &run_id);
     let _lane = OpenclawMainLaneGuard::new(ctx.state.clone());
 
@@ -6294,34 +17533,14 @@ async fn spawn_chat_run(
     let mut messages: Vec<Message> = Vec::new();
     let mut persisted_session = None;
     if let Some(store) = ctx.state.session_store() {
-        let store_session_key = openclaw_session_key_to_store_key(&session_key);
+        let (canonical_key, candidates) = openclaw_session_store_key_candidates(
+            crate::openclaw_paths::DEFAULT_AGENT_ID,
+            &session_key,
+        );
         // Stable operator user id.
         let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-        let mut session = store
-            .get_by_channel("openclaw", &store_session_key)
-            .await
-            .ok()
-            .flatten();
-        if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
-            session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
-        }
-        if session.is_none() && store_session_key != session_key {
-            // Fall back to the raw key mapping (legacy).
-            session = store
-                .get_by_channel("openclaw", &session_key)
-                .await
-                .ok()
-                .flatten();
-            if session.is_none() {
-                let (channel_type, channel_id) = session_key_to_channel(&session_key);
-                session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
-            }
-        }
-        if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
-            session = store.get_or_create(user_id, &channel_type, &channel_id).await.ok();
-        }
+        let session =
+            get_or_create_openclaw_session(store, user_id, &canonical_key, &candidates).await;
         if let Some(s) = session {
             messages.extend(s.messages.clone());
             persisted_session = Some(s);
@@ -6332,8 +17551,15 @@ async fn spawn_chat_run(
     messages.push(stamp_user_message_for_agent(&user_msg));
 
     // Prefix any queued system events for this session (ephemeral queue).
-    let store_session_key = openclaw_session_key_to_store_key(&session_key);
-    let queued_system_events = ctx.state.openclaw_peek_system_events(&store_session_key).await;
+    let legacy_system_key = openclaw_session_key_to_store_key(&session_key);
+    let mut queued_system_events = ctx.state.openclaw_peek_system_events(&session_key).await;
+    if legacy_system_key != session_key {
+        queued_system_events.extend(
+            ctx.state
+                .openclaw_peek_system_events(&legacy_system_key)
+                .await,
+        );
+    }
     let has_system_events = !queued_system_events.is_empty();
     if has_system_events {
         let mut block = String::new();
@@ -6362,22 +17588,45 @@ async fn spawn_chat_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
-    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir("default");
-    let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
+    let workspace_dir = resolve_agent_workspace_dir_for_state(&ctx.state, &agent_id);
+    let workspace_context =
+        crate::openclaw_workspace_prompt::build_workspace_context_prompt(&workspace_dir);
+    let skills_filter = resolve_openclaw_agent_skills_filter(&ctx.state, &agent_id);
+    let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
         &workspace_dir,
         ctx.state.config(),
         remote.as_ref(),
+        skills_filter.as_deref(),
     );
-    let system_prompt = {
-        let trimmed = skills_prompt.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+    let recall =
+        crate::openclaw_memory::recall_prompt(&ctx.state, &session_key, &user_text_raw).await;
+
+    let mut system_sections: Vec<String> = Vec::new();
+    let workspace_trimmed = workspace_context.trim();
+    if !workspace_trimmed.is_empty() {
+        system_sections.push(workspace_trimmed.to_string());
+    }
+    if let Some(recall) = recall.as_deref() {
+        let trimmed = recall.trim();
+        if !trimmed.is_empty() {
+            system_sections.push(trimmed.to_string());
         }
+    }
+    let skills_trimmed = skills_prompt.trim();
+    if !skills_trimmed.is_empty() {
+        system_sections.push(skills_trimmed.to_string());
+    }
+    let system_prompt = if system_sections.is_empty() {
+        None
+    } else {
+        Some(system_sections.join("\n\n---\n\n"))
     };
 
     let model_override = resolve_openclaw_session_model_override(&ctx.state, &session_key);
+    let model_override = model_override
+        .clone()
+        .or_else(|| resolve_openclaw_agent_default_model(&ctx.state, &agent_id));
+    let model_override_for_record = model_override.clone();
     let options = ChatOptions {
         model: model_override,
         max_tokens: None,
@@ -6388,9 +17637,21 @@ async fn spawn_chat_run(
         tools: None,
     };
 
+    let response_prefix = response_prefix.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let mut response_prefix_decided = response_prefix.is_none();
+    let mut response_prefix_buffer = String::new();
+
     let mut full = String::new();
     let mut final_usage: Option<Usage> = None;
     let mut stop_reason: Option<String> = None;
+    let mut stream_model: Option<String> = None;
     let mut last_delta_sent_at_ms: u64 = 0;
 
     let stream_res = provider.stream(&messages, options).await;
@@ -6411,7 +17672,8 @@ async fn spawn_chat_run(
                 "errorMessage": error_message,
             });
             broadcast_openclaw_event(&ctx.state, "chat", payload, None).await;
-            let dedupe_payload = json!({"runId": run_id, "status": "error", "summary": error_message.clone() });
+            let dedupe_payload =
+                json!({"runId": run_id, "status": "error", "summary": error_message.clone() });
             let err_shape = ErrorShape::new(error_codes::UNAVAILABLE, error_message);
             openclaw_dedupe_put(
                 &dedupe_key,
@@ -6466,8 +17728,29 @@ async fn spawn_chat_run(
                 };
 
                 match evt {
+                    ProviderStreamEvent::Start { model } => {
+                        stream_model = Some(model);
+                    }
                     ProviderStreamEvent::Delta { content } => {
-                        full.push_str(&content);
+                        if let Some(prefix) = response_prefix.as_deref() {
+                            if !response_prefix_decided {
+                                response_prefix_buffer.push_str(&content);
+                                if response_prefix_buffer.chars().count() < prefix.chars().count() {
+                                    continue;
+                                }
+                                if response_prefix_buffer.starts_with(prefix) {
+                                    full = response_prefix_buffer.clone();
+                                } else {
+                                    full = format!("{}{}", prefix, response_prefix_buffer);
+                                }
+                                response_prefix_decided = true;
+                                response_prefix_buffer.clear();
+                            } else {
+                                full.push_str(&content);
+                            }
+                        } else {
+                            full.push_str(&content);
+                        }
                         let now = now_ms();
                         if now.saturating_sub(last_delta_sent_at_ms) < OPENCLAW_CHAT_DELTA_THROTTLE_MS
                         {
@@ -6478,6 +17761,7 @@ async fn spawn_chat_run(
                             let mut run_seq = ctx.run_seq.lock().await;
                             next_run_seq(&mut run_seq, &run_id)
                         };
+                        let rendered = strip_openclaw_media_path_lines(&full);
                         let payload = json!({
                             "runId": run_id,
                             "sessionKey": session_key,
@@ -6485,7 +17769,7 @@ async fn spawn_chat_run(
                             "state": "delta",
                             "message": {
                                 "role": "assistant",
-                                "content": [{ "type": "text", "text": full }],
+                                "content": [{ "type": "text", "text": rendered }],
                                 "timestamp": now
                             }
                         });
@@ -6530,6 +17814,15 @@ async fn spawn_chat_run(
         }
     }
 
+    if let Some(prefix) = response_prefix.as_deref() {
+        if !response_prefix_decided {
+            full = format!("{}{}", prefix, response_prefix_buffer);
+            response_prefix_buffer.clear();
+        }
+    }
+
+    let final_text = strip_openclaw_media_path_lines(&full).into_owned();
+
     let seq = {
         let mut run_seq = ctx.run_seq.lock().await;
         next_run_seq(&mut run_seq, &run_id)
@@ -6541,7 +17834,7 @@ async fn spawn_chat_run(
         "state": "final",
         "message": {
             "role": "assistant",
-            "content": [{ "type": "text", "text": full }],
+            "content": [{ "type": "text", "text": final_text.as_str() }],
             "timestamp": now_ms()
         },
         "stopReason": stop_reason,
@@ -6562,15 +17855,22 @@ async fn spawn_chat_run(
 
     // Clear system events only after we successfully produced a final response.
     if has_system_events {
+        let legacy_key = openclaw_session_key_to_store_key(&session_key);
         let _ = ctx
             .state
-            .openclaw_drain_system_event_entries(&openclaw_session_key_to_store_key(&session_key))
+            .openclaw_drain_system_event_entries(&session_key)
             .await;
+        if legacy_key != session_key {
+            let _ = ctx
+                .state
+                .openclaw_drain_system_event_entries(&legacy_key)
+                .await;
+        }
     }
 
     if let (Some(store), Some(mut session)) = (ctx.state.session_store(), persisted_session) {
         session.add_message(user_msg);
-        session.add_message(assistant_message_from_text(&full));
+        session.add_message(assistant_message_from_text(&final_text));
         if let Some(usage) = &final_usage {
             session.add_token_usage(usage.input_tokens, usage.output_tokens);
         }
@@ -6579,6 +17879,28 @@ async fn spawn_chat_run(
             warn!(error = %e, "failed to persist openclaw chat session");
         }
     }
+
+    if let Some(usage) = final_usage.as_ref() {
+        let model_for_record = stream_model.clone().or(model_override_for_record.clone());
+        let record = crate::openclaw_usage::record_from_stream(
+            &ctx.state,
+            provider.name(),
+            model_for_record,
+            Some(session_key.clone()),
+            Some(run_id.clone()),
+            usage,
+        );
+        crate::openclaw_usage::append_usage_record_best_effort(&ctx.state, record).await;
+    }
+
+    crate::openclaw_memory::store_turn_best_effort(
+        &ctx.state,
+        &session_key,
+        &run_id,
+        &user_text_raw,
+        &final_text,
+    )
+    .await;
 
     // Run completed; any in-flight abort handle is removed in the global registry above.
 }
@@ -6593,14 +17915,363 @@ async fn emit_agent_event(ctx: &ConnCtx, run_id: &str, stream: &str, data: serde
     } else {
         json!({ "value": data })
     };
-    let payload = json!({
-        "runId": run_id,
-        "seq": seq,
-        "stream": stream,
-        "ts": now_ms(),
-        "data": data,
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert("runId".to_string(), json!(run_id));
+    payload.insert("seq".to_string(), json!(seq));
+    payload.insert("stream".to_string(), json!(stream));
+    payload.insert("ts".to_string(), json!(now_ms()));
+    payload.insert("runtimeShell".to_string(), json!(resolve_runtime_shell()));
+    payload.insert("data".to_string(), data);
+    let payload = serde_json::Value::Object(payload);
     broadcast_openclaw_event(&ctx.state, "agent", payload, None).await;
+}
+
+async fn register_openclaw_toolset_for_agent(
+    state: &GatewayState,
+    agent: &mut DrbotAgent,
+    agent_id: &str,
+    session_key: &str,
+    workspace_dir: &PathBuf,
+    transcript: &[Message],
+) -> std::result::Result<(), String> {
+    // Register a conservative baseline toolset (avoid generic HTTP; prefer allowlisted API tools).
+    let exec_ask = resolve_openclaw_session_exec_ask_mode(state, session_key);
+    let inferred_sender_id = transcript.iter().rev().find_map(|m| {
+        if !matches!(m.role, Role::User) {
+            return None;
+        }
+        m.metadata
+            .get("senderId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let tool_filter = resolve_openclaw_effective_tool_filter(
+        state,
+        session_key,
+        inferred_sender_id.as_deref(),
+        agent_id,
+    );
+
+    let mut builtin_options = BuiltinToolsOptions::default();
+    if crate::openclaw_exec_approvals::exec_approvals_auto_allow_skills(Some(agent_id)) {
+        let platform = crate::openclaw_skills::resolve_runtime_platform();
+        let dirs = [workspace_dir.clone()];
+        let bins = crate::openclaw_skills::collect_required_skill_bins_for_platform(
+            &dirs,
+            state.config(),
+            platform,
+        );
+        builtin_options.bash_extra_allowed_prefixes = bins;
+    }
+
+    let builtin = BuiltinTools::all_with_options(workspace_dir.clone(), builtin_options)
+        .map_err(|e| format!("failed to initialize agent tools: {}", e))?;
+    for tool in builtin {
+        if tool.name() == "http" || tool.name() == "exec" {
+            continue;
+        }
+        if !tool_filter.is_allowed(tool.name()) {
+            continue;
+        }
+        let tool_name = tool.name();
+        let tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, tool_name)
+            .unwrap_or(OpenclawExecAskMode::Allow);
+        let baseline = if matches!(
+            tool_name,
+            "bash" | "exec" | "write_file" | "write" | "edit" | "apply_patch" | "http"
+        ) {
+            exec_ask
+        } else {
+            OpenclawExecAskMode::Allow
+        };
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, baseline);
+        let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+            mode,
+            tool,
+        ) else {
+            continue;
+        };
+        agent.register_tool(tool);
+    }
+
+    // OpenClaw-native + integration tools (safe by default).
+    for tool in [
+        Arc::new(crate::openclaw_agent_tools::AgentsListTool) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::WebFetchTool::new())
+            as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::WebSearchTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::McpTool::new(state.clone()))
+            as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::BrowserTool::new(state.clone()))
+            as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::CanvasTool::new(
+            state.clone(),
+            workspace_dir.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::NodesTool::new_with_context(
+            state.clone(),
+            workspace_dir.clone(),
+            agent_id,
+            Some(session_key),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::ImageTool::new_with_context(
+            state.clone(),
+            workspace_dir.clone(),
+            agent_id,
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::ColosseumRequestTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookRequestTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookPostTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookFeedTool) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookCommentTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookVoteTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookIdentityTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookSearchTool)
+            as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookFollowTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookSubscribeTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MoltbookDmTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::SessionsListTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::SessionsHistoryTool::new(
+            state.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(
+            crate::openclaw_agent_tools::SessionsSendTool::new_with_context(
+                state.clone(),
+                agent_id,
+                session_key,
+            ),
+        ) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(
+            crate::openclaw_agent_tools::SessionsSpawnTool::new_with_context(
+                state.clone(),
+                agent_id,
+                session_key,
+            ),
+        ) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(
+            crate::openclaw_agent_tools::SessionStatusTool::new_with_context(
+                state.clone(),
+                agent_id,
+                session_key,
+            ),
+        ) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MemorySearchTool::new(
+            state.clone(),
+            agent_id,
+            workspace_dir.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::MemoryGetTool::new(
+            state.clone(),
+            agent_id,
+            workspace_dir.clone(),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+    ] {
+        if !tool_filter.is_allowed(tool.name()) {
+            continue;
+        }
+        let tool_policy =
+            resolve_openclaw_session_tool_policy_mode(state, session_key, tool.name())
+                .unwrap_or(OpenclawExecAskMode::Allow);
+        let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+            tool_policy,
+            tool,
+        ) else {
+            continue;
+        };
+        agent.register_tool(tool);
+    }
+
+    // OpenClaw `exec` tool: supports background sessions (integrated with `process`).
+    if tool_filter.is_allowed("exec") {
+        let tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "exec")
+            .unwrap_or(OpenclawExecAskMode::Allow);
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, exec_ask);
+        if !matches!(mode, OpenclawExecAskMode::Deny) {
+            let tool = Arc::new(crate::openclaw_agent_tools::ExecTool::new(
+                state.clone(),
+                Some(agent_id.to_string()),
+                workspace_dir.clone(),
+                Some(session_key.to_string()),
+            )) as Arc<dyn drbot_agents::AgentTool>;
+            if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+                state.clone(),
+                agent_id,
+                Some(session_key),
+                mode,
+                tool,
+            ) {
+                agent.register_tool(tool);
+            }
+        }
+    }
+
+    // `process` is treated like `exec` for baseline approvals.
+    if tool_filter.is_allowed("process") {
+        let tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "process")
+            .unwrap_or(OpenclawExecAskMode::Allow);
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, exec_ask);
+        if !matches!(mode, OpenclawExecAskMode::Deny) {
+            let tool = Arc::new(crate::openclaw_agent_tools::ProcessTool::new(
+                workspace_dir.clone(),
+                Some(session_key.to_string()),
+            )) as Arc<dyn drbot_agents::AgentTool>;
+            if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+                state.clone(),
+                agent_id,
+                Some(session_key),
+                mode,
+                tool,
+            ) {
+                agent.register_tool(tool);
+            }
+        }
+    }
+
+    // `message` is OpenClaw's canonical messaging tool; it maps onto drbot's channels.
+    let send_policy = resolve_openclaw_session_send_policy_mode(state, session_key);
+    let message_tool_policy =
+        resolve_openclaw_session_tool_policy_mode(state, session_key, "message")
+            .unwrap_or(OpenclawExecAskMode::Allow);
+    if tool_filter.is_allowed("message")
+        && !matches!(send_policy, OpenclawSendPolicyMode::Deny)
+        && !matches!(message_tool_policy, OpenclawExecAskMode::Deny)
+    {
+        let tool = Arc::new(crate::openclaw_agent_tools::MessageTool::new_with_context(
+            state.clone(),
+            agent_id,
+            session_key,
+        )) as Arc<dyn drbot_agents::AgentTool>;
+        let wrapper_mode = if matches!(send_policy, OpenclawSendPolicyMode::Ask) {
+            OpenclawExecAskMode::Allow
+        } else {
+            message_tool_policy
+        };
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+            wrapper_mode,
+            tool,
+        ) {
+            agent.register_tool(tool);
+        }
+    }
+
+    let send_tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "send")
+        .unwrap_or(OpenclawExecAskMode::Allow);
+    if tool_filter.is_allowed("send")
+        && !matches!(send_policy, OpenclawSendPolicyMode::Deny)
+        && !matches!(send_tool_policy, OpenclawExecAskMode::Deny)
+    {
+        let tool = Arc::new(crate::openclaw_agent_tools::SendTool::new_with_context(
+            state.clone(),
+            agent_id,
+            session_key,
+        )) as Arc<dyn drbot_agents::AgentTool>;
+        let wrapper_mode = if matches!(send_policy, OpenclawSendPolicyMode::Ask) {
+            OpenclawExecAskMode::Allow
+        } else {
+            send_tool_policy
+        };
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+            wrapper_mode,
+            tool,
+        ) {
+            agent.register_tool(tool);
+        }
+    }
+
+    let poll_tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "poll")
+        .unwrap_or(OpenclawExecAskMode::Allow);
+    if tool_filter.is_allowed("poll")
+        && !matches!(send_policy, OpenclawSendPolicyMode::Deny)
+        && !matches!(poll_tool_policy, OpenclawExecAskMode::Deny)
+    {
+        let tool = Arc::new(crate::openclaw_agent_tools::PollTool::new_with_context(
+            state.clone(),
+            agent_id,
+            session_key,
+        )) as Arc<dyn drbot_agents::AgentTool>;
+        let wrapper_mode = if matches!(send_policy, OpenclawSendPolicyMode::Ask) {
+            OpenclawExecAskMode::Allow
+        } else {
+            poll_tool_policy
+        };
+        if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+            wrapper_mode,
+            tool,
+        ) {
+            agent.register_tool(tool);
+        }
+    }
+
+    for tool in [
+        Arc::new(crate::openclaw_agent_tools::CronTool::new(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+        Arc::new(crate::openclaw_agent_tools::GatewayTool::new(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+        )) as Arc<dyn drbot_agents::AgentTool>,
+    ] {
+        if !tool_filter.is_allowed(tool.name()) {
+            continue;
+        }
+        let tool_policy =
+            resolve_openclaw_session_tool_policy_mode(state, session_key, tool.name())
+                .unwrap_or(OpenclawExecAskMode::Allow);
+        let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
+            state.clone(),
+            agent_id,
+            Some(session_key),
+            tool_policy,
+            tool,
+        ) else {
+            continue;
+        };
+        agent.register_tool(tool);
+    }
+
+    Ok(())
 }
 
 async fn spawn_agent_run(
@@ -6615,6 +18286,7 @@ async fn spawn_agent_run(
     extra_system_prompt: Option<String>,
     delivery_target: Option<AgentDeliveryTarget>,
 ) {
+    let session_key = canonicalize_openclaw_session_key(&agent_id, &session_key);
     let started_at = now_ms();
     let _lane = OpenclawMainLaneGuard::new(ctx.state.clone());
     emit_agent_event(
@@ -6629,34 +18301,12 @@ async fn spawn_agent_run(
     let mut messages: Vec<Message> = Vec::new();
     let mut persisted_session = None;
     if let Some(store) = ctx.state.session_store() {
-        let store_session_key = openclaw_session_key_to_store_key(&session_key);
+        let (canonical_key, candidates) =
+            openclaw_session_store_key_candidates(&agent_id, &session_key);
         // Stable operator user id.
         let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-        let mut session = store
-            .get_by_channel("openclaw", &store_session_key)
-            .await
-            .ok()
-            .flatten();
-        if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
-            session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
-        }
-        if session.is_none() && store_session_key != session_key {
-            // Fall back to the raw key mapping (legacy).
-            session = store
-                .get_by_channel("openclaw", &session_key)
-                .await
-                .ok()
-                .flatten();
-            if session.is_none() {
-                let (channel_type, channel_id) = session_key_to_channel(&session_key);
-                session = store.get_by_channel(&channel_type, &channel_id).await.ok().flatten();
-            }
-        }
-        if session.is_none() {
-            let (channel_type, channel_id) = session_key_to_channel(&store_session_key);
-            session = store.get_or_create(user_id, &channel_type, &channel_id).await.ok();
-        }
+        let session =
+            get_or_create_openclaw_session(store, user_id, &canonical_key, &candidates).await;
         if let Some(s) = session {
             messages.extend(s.messages.clone());
             persisted_session = Some(s);
@@ -6664,6 +18314,7 @@ async fn spawn_agent_run(
     }
 
     let user_msg = user_msg.clone();
+    let user_text_raw = user_msg.text_content();
 
     // Best-effort: keep remote skills' docs up to date (no-op unless configured).
     tokio::join!(
@@ -6673,13 +18324,57 @@ async fn spawn_agent_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
-    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir(&agent_id);
-    let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
+    let workspace_dir = resolve_agent_workspace_dir_for_state(&ctx.state, &agent_id);
+    let workspace_context =
+        crate::openclaw_workspace_prompt::build_workspace_context_prompt(&workspace_dir);
+    let skills_filter = resolve_openclaw_agent_skills_filter(&ctx.state, &agent_id);
+    let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
         &workspace_dir,
         ctx.state.config(),
         remote.as_ref(),
+        skills_filter.as_deref(),
     );
-    let mut base_system_prompt = skills_prompt.trim().to_string();
+    let recall =
+        crate::openclaw_memory::recall_prompt(&ctx.state, &session_key, user_text_raw.as_str())
+            .await;
+    let session_model = resolve_openclaw_session_model_override(&ctx.state, &session_key);
+    let session_thinking_level = resolve_openclaw_session_thinking_level(&ctx.state, &session_key);
+    let agent_default_model = resolve_openclaw_agent_default_model(&ctx.state, &agent_id);
+    let default_model_for_runtime = agent_default_model
+        .as_deref()
+        .or_else(|| ctx.state.config().providers.default_model.as_deref());
+    let agent_model = session_model
+        .clone()
+        .or_else(|| agent_default_model.clone());
+
+    let runtime_line = build_openclaw_runtime_line(
+        &agent_id,
+        agent_model.as_deref(),
+        default_model_for_runtime,
+        session_thinking_level.as_deref(),
+    );
+    let mut base_system_prompt = runtime_line;
+    let workspace_trimmed = workspace_context.trim();
+    if !workspace_trimmed.is_empty() {
+        base_system_prompt.push_str("\n\n");
+        base_system_prompt.push_str(workspace_trimmed);
+    }
+    if let Some(recall) = recall.as_deref() {
+        let trimmed = recall.trim();
+        if !trimmed.is_empty() {
+            if !base_system_prompt.is_empty() {
+                base_system_prompt.push_str("\n\n---\n\n");
+            }
+            base_system_prompt.push_str(trimmed);
+        }
+    }
+    let skills_trimmed = skills_prompt.trim();
+    if !skills_trimmed.is_empty() {
+        if !base_system_prompt.is_empty() {
+            base_system_prompt.push_str("\n\n---\n\n");
+        }
+        base_system_prompt.push_str(skills_trimmed);
+    }
     if let Some(extra) = extra_system_prompt.as_deref() {
         let trimmed = extra.trim();
         if !trimmed.is_empty() {
@@ -6697,7 +18392,7 @@ async fn spawn_agent_run(
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v >= 1)
             .unwrap_or(10),
-        model: resolve_openclaw_session_model_override(&ctx.state, &session_key),
+        model: agent_model.clone(),
         system_prompt: base_system_prompt,
         use_planning: false,
         iteration_timeout_secs: std::env::var("DRBOT_OPENCLAW_AGENT_ITERATION_TIMEOUT_SECS")
@@ -6707,78 +18402,51 @@ async fn spawn_agent_run(
             .unwrap_or(60),
     };
 
-    let mut agent = DrbotAgent::new(provider.clone(), agent_cfg);
+    let provider = Arc::new(crate::openclaw_usage::UsageLoggingProvider::new(
+        ctx.state.clone(),
+        provider.clone(),
+        Some(session_key.clone()),
+        Some(run_id.clone()),
+    )) as Arc<dyn Provider>;
+    let mut agent = DrbotAgent::new(provider, agent_cfg);
 
-    // Register a conservative baseline toolset (avoid generic HTTP; prefer allowlisted API tools).
-    let builtin = match BuiltinTools::all(workspace_dir) {
-        Ok(v) => v,
-        Err(err) => {
-            let ended_at = now_ms();
-            let message = format!("failed to initialize agent tools: {}", err);
-            let _ = finish_agent_run(&run_id, "error", Some(message.clone())).await;
-            emit_agent_event(
-                &ctx,
-                &run_id,
-                "lifecycle",
-                json!({ "phase": "error", "startedAt": started_at, "endedAt": ended_at, "error": message }),
-            )
-            .await;
-            let payload = json!({
-                "runId": run_id,
-                "status": "error",
-                "summary": "tool initialization failed",
-            });
-            let frame = GatewayFrame::Res(ResponseFrame {
-                id: req_id,
-                ok: false,
-                payload: Some(payload),
-                error: Some(ErrorShape::new(error_codes::UNAVAILABLE, "tool initialization failed")),
-            });
-            send_frame(&ctx.tx, &ctx.queued_bytes, &ctx.closing, &frame).await;
-            return;
-        }
-    };
-    for tool in builtin {
-        if tool.name() == "http" {
-            continue;
-        }
-        agent.register_tool(tool);
+    if let Err(err) = register_openclaw_toolset_for_agent(
+        &ctx.state,
+        &mut agent,
+        &agent_id,
+        &session_key,
+        &workspace_dir,
+        &messages,
+    )
+    .await
+    {
+        let ended_at = now_ms();
+        let message = err;
+        let _ = finish_agent_run(&run_id, "error", Some(message.clone())).await;
+        emit_agent_event(
+            &ctx,
+            &run_id,
+            "lifecycle",
+            json!({ "phase": "error", "startedAt": started_at, "endedAt": ended_at, "error": message }),
+        )
+        .await;
+        let payload = json!({
+            "runId": run_id,
+            "status": "error",
+            "summary": "tool initialization failed",
+        });
+        let frame = GatewayFrame::Res(ResponseFrame {
+            id: req_id,
+            ok: false,
+            payload: Some(payload),
+            error: Some(ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                "tool initialization failed",
+            )),
+        });
+        send_frame(&ctx.tx, &ctx.queued_bytes, &ctx.closing, &frame).await;
+        return;
     }
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::ColosseumRequestTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookRequestTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookPostTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(crate::openclaw_agent_tools::MoltbookFeedTool));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookCommentTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookVoteTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookIdentityTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(crate::openclaw_agent_tools::MoltbookSearchTool));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookFollowTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookSubscribeTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(
-        crate::openclaw_agent_tools::MoltbookDmTool::new(ctx.state.clone()),
-    ));
-    agent.register_tool(Arc::new(crate::openclaw_agent_tools::SendTool::new(
-        ctx.state.clone(),
-    )));
-    agent.register_tool(Arc::new(crate::openclaw_agent_tools::PollTool::new(
-        ctx.state.clone(),
-    )));
 
     // Seed prior transcript (best-effort) so the agent can keep continuity.
     for msg in &messages {
@@ -6883,12 +18551,16 @@ async fn spawn_agent_run(
     });
 
     // Inject timestamp for the agent runtime only (do not mutate/persist the transcript message).
-    let user_text_raw = user_msg.text_content();
-    let user_text = openclaw_inject_timestamp_prefix(&user_text_raw);
-    let queued_system_events = ctx
-        .state
-        .openclaw_peek_system_events(&openclaw_session_key_to_store_key(&session_key))
-        .await;
+    let user_text = openclaw_inject_timestamp_prefix(user_text_raw.as_str());
+    let legacy_system_key = openclaw_session_key_to_store_key(&session_key);
+    let mut queued_system_events = ctx.state.openclaw_peek_system_events(&session_key).await;
+    if legacy_system_key != session_key {
+        queued_system_events.extend(
+            ctx.state
+                .openclaw_peek_system_events(&legacy_system_key)
+                .await,
+        );
+    }
     let has_system_events = !queued_system_events.is_empty();
     let user_input = if has_system_events {
         let mut block = String::new();
@@ -6947,12 +18619,21 @@ async fn spawn_agent_run(
         }
     };
 
+    let final_text = strip_openclaw_media_path_lines(&full).into_owned();
+
     // Clear system events only after a successful agent run.
     if has_system_events {
+        let legacy_key = openclaw_session_key_to_store_key(&session_key);
         let _ = ctx
             .state
-            .openclaw_drain_system_event_entries(&openclaw_session_key_to_store_key(&session_key))
+            .openclaw_drain_system_event_entries(&session_key)
             .await;
+        if legacy_key != session_key {
+            let _ = ctx
+                .state
+                .openclaw_drain_system_event_entries(&legacy_key)
+                .await;
+        }
     }
 
     let final_usage: Option<Usage> = None;
@@ -6970,7 +18651,7 @@ async fn spawn_agent_run(
 
     if let (Some(store), Some(mut session)) = (ctx.state.session_store(), persisted_session) {
         session.add_message(user_msg);
-        session.add_message(assistant_message_from_text(&full));
+        session.add_message(assistant_message_from_text(&final_text));
         if let Some(usage) = &final_usage {
             session.add_token_usage(usage.input_tokens, usage.output_tokens);
         }
@@ -6980,50 +18661,66 @@ async fn spawn_agent_run(
         }
     }
 
+    crate::openclaw_memory::store_turn_best_effort(
+        &ctx.state,
+        &session_key,
+        &run_id,
+        user_text_raw.as_str(),
+        final_text.as_str(),
+    )
+    .await;
+
     // Optional outbound delivery of the agent output (OpenClaw `deliver`).
     let mut delivery_report: Option<serde_json::Value> = None;
     if let Some(target) = delivery_target.as_ref() {
         let mut ok = false;
         let mut err_msg: Option<String> = None;
-        let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_SEND_WRITE")
-            .ok()
-            .as_deref()
-            == Some("1");
-        if !allow_write_by_env {
-            let approval = ExecApprovalRequestPayload {
-                command: format!("send {} {}", target.channel, target.to),
-                cwd: None,
-                host: Some("channels".to_string()),
-                security: Some("channel-send".to_string()),
-                ask: Some(format!(
-                    "Allow sending an outbound message via {} to {}?",
-                    target.channel, target.to
-                )),
-                agent_id: Some("default".to_string()),
-                resolved_path: None,
-                session_key: Some(session_key.clone()),
-            };
-            if let Err(e) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                &ctx.state,
-                "send",
-                approval,
-                120_000,
-            )
-            .await
-            {
-                err_msg = Some(format!("{}: {}", e.code, e.message));
-            }
-        }
-        if err_msg.is_none() {
-            let outgoing = OutgoingMessage::text(full.clone());
-            match ctx
-                .state
-                .channel_manager()
-                .send(&target.channel, &target.to, outgoing)
+        let send_policy = resolve_openclaw_session_send_policy_mode(&ctx.state, &session_key);
+        if matches!(send_policy, OpenclawSendPolicyMode::Deny) {
+            err_msg = Some("blocked by sendPolicy: deny".to_string());
+        } else {
+            let allow_write_by_env =
+                std::env::var("DRBOT_OPENCLAW_SEND_WRITE").ok().as_deref() == Some("1");
+            if matches!(send_policy, OpenclawSendPolicyMode::Ask) && !allow_write_by_env {
+                let approval = ExecApprovalRequestPayload {
+                    command: format!("send {} {}", target.channel, target.to),
+                    cwd: None,
+                    host: Some("channels".to_string()),
+                    security: Some("channel-send".to_string()),
+                    ask: Some(format!(
+                        "Allow sending an outbound message via {} to {}?",
+                        target.channel, target.to
+                    )),
+                    agent_id: Some(agent_id.clone()),
+                    resolved_path: None,
+                    session_key: Some(session_key.clone()),
+                };
+                if let Err(e) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
+                    &ctx.state, "send", approval, 120_000,
+                )
                 .await
-            {
-                Ok(()) => ok = true,
-                Err(e) => err_msg = Some(e.to_string()),
+                {
+                    err_msg = Some(format!("{}: {}", e.code, e.message));
+                }
+            }
+            if err_msg.is_none() {
+                let delivered = apply_openclaw_outbound_response_prefix(
+                    &ctx.state,
+                    &agent_id,
+                    Some(&target.channel),
+                    None,
+                    &final_text,
+                );
+                let outgoing = OutgoingMessage::text(delivered);
+                match ctx
+                    .state
+                    .channel_manager()
+                    .send(&target.channel, &target.to, outgoing)
+                    .await
+                {
+                    Ok(()) => ok = true,
+                    Err(e) => err_msg = Some(e.to_string()),
+                }
             }
         }
 
@@ -7042,7 +18739,7 @@ async fn spawn_agent_run(
         "summary": "completed",
         "delivery": delivery_report,
         "result": {
-            "text": full,
+            "text": final_text.as_str(),
             "stopReason": stop_reason,
             "usage": final_usage.as_ref().map(|u| json!({"input": u.input_tokens, "output": u.output_tokens})),
         }
@@ -7056,19 +18753,322 @@ async fn spawn_agent_run(
     send_frame(&ctx.tx, &ctx.queued_bytes, &ctx.closing, &frame).await;
 }
 
+async fn openclaw_spawn_agent_run_for_tool_task(
+    state: GatewayState,
+    provider: Arc<dyn Provider>,
+    run_id: String,
+    agent_id: String,
+    session_key: String,
+    user_msg: Message,
+    timeout_ms: Option<u64>,
+    extra_system_prompt: Option<String>,
+) {
+    let session_key = canonicalize_openclaw_session_key(&agent_id, &session_key);
+    let started_at = now_ms();
+    let _lane = OpenclawMainLaneGuard::new(state.clone());
+
+    // Load session messages from store (if configured).
+    let mut messages: Vec<Message> = Vec::new();
+    let mut persisted_session = None;
+    if let Some(store) = state.session_store() {
+        let (canonical_key, candidates) =
+            openclaw_session_store_key_candidates(&agent_id, &session_key);
+        // Stable operator user id.
+        let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
+        let session =
+            get_or_create_openclaw_session(store, user_id, &canonical_key, &candidates).await;
+        if let Some(s) = session {
+            messages.extend(s.messages.clone());
+            persisted_session = Some(s);
+        }
+    }
+
+    let user_msg = user_msg.clone();
+    let user_text_raw = user_msg.text_content();
+
+    // Best-effort: keep remote skills' docs up to date (no-op unless configured).
+    tokio::join!(
+        crate::colosseum::sync_colosseum_docs_best_effort(state.config()),
+        crate::moltbook::sync_moltbook_docs_best_effort(state.config()),
+        crate::agentwallet::sync_agentwallet_docs_best_effort(state.config()),
+    );
+
+    let remote = resolve_remote_skill_eligibility(&state).await;
+    let workspace_dir = resolve_agent_workspace_dir_for_state(&state, &agent_id);
+    let workspace_context =
+        crate::openclaw_workspace_prompt::build_workspace_context_prompt(&workspace_dir);
+    let skills_filter = resolve_openclaw_agent_skills_filter(&state, &agent_id);
+    let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
+        &workspace_dir,
+        state.config(),
+        remote.as_ref(),
+        skills_filter.as_deref(),
+    );
+    let recall =
+        crate::openclaw_memory::recall_prompt(&state, &session_key, user_text_raw.as_str()).await;
+    let session_model = resolve_openclaw_session_model_override(&state, &session_key);
+    let session_thinking_level = resolve_openclaw_session_thinking_level(&state, &session_key);
+    let agent_default_model = resolve_openclaw_agent_default_model(&state, &agent_id);
+    let default_model_for_runtime = agent_default_model
+        .as_deref()
+        .or_else(|| state.config().providers.default_model.as_deref());
+    let agent_model = session_model
+        .clone()
+        .or_else(|| agent_default_model.clone());
+
+    let runtime_line = build_openclaw_runtime_line(
+        &agent_id,
+        agent_model.as_deref(),
+        default_model_for_runtime,
+        session_thinking_level.as_deref(),
+    );
+    let mut base_system_prompt = runtime_line;
+    let workspace_trimmed = workspace_context.trim();
+    if !workspace_trimmed.is_empty() {
+        base_system_prompt.push_str("\n\n");
+        base_system_prompt.push_str(workspace_trimmed);
+    }
+    if let Some(recall) = recall.as_deref() {
+        let trimmed = recall.trim();
+        if !trimmed.is_empty() {
+            if !base_system_prompt.is_empty() {
+                base_system_prompt.push_str("\n\n---\n\n");
+            }
+            base_system_prompt.push_str(trimmed);
+        }
+    }
+    let skills_trimmed = skills_prompt.trim();
+    if !skills_trimmed.is_empty() {
+        if !base_system_prompt.is_empty() {
+            base_system_prompt.push_str("\n\n---\n\n");
+        }
+        base_system_prompt.push_str(skills_trimmed);
+    }
+    if let Some(extra) = extra_system_prompt.as_deref() {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() {
+            if !base_system_prompt.is_empty() {
+                base_system_prompt.push_str("\n\n---\n");
+            }
+            base_system_prompt.push_str("Extra system prompt:\n");
+            base_system_prompt.push_str(trimmed);
+        }
+    }
+
+    let agent_cfg = DrbotAgentConfig {
+        max_iterations: std::env::var("DRBOT_OPENCLAW_AGENT_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(10),
+        model: agent_model.clone(),
+        system_prompt: base_system_prompt,
+        use_planning: false,
+        iteration_timeout_secs: std::env::var("DRBOT_OPENCLAW_AGENT_ITERATION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(60),
+    };
+
+    let provider = Arc::new(crate::openclaw_usage::UsageLoggingProvider::new(
+        state.clone(),
+        provider.clone(),
+        Some(session_key.clone()),
+        Some(run_id.clone()),
+    )) as Arc<dyn Provider>;
+    let mut agent = DrbotAgent::new(provider, agent_cfg);
+
+    if let Err(err) = register_openclaw_toolset_for_agent(
+        &state,
+        &mut agent,
+        &agent_id,
+        &session_key,
+        &workspace_dir,
+        &messages,
+    )
+    .await
+    {
+        let _ = finish_agent_run(&run_id, "error", Some(err.clone())).await;
+        warn!(run_id = %run_id, error = %err, "tool initialization failed for tool-started agent run");
+        return;
+    }
+
+    // Seed prior transcript (best-effort) so the agent can keep continuity.
+    for msg in &messages {
+        let text = msg.text_content();
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let role = match msg.role {
+            Role::System => continue,
+            Role::User => DrbotAgentRole::User,
+            Role::Assistant => DrbotAgentRole::Assistant,
+        };
+        agent.push_message(DrbotAgentMessage {
+            role,
+            content: text.to_string(),
+            tool_calls: None,
+            tool_result: None,
+        });
+    }
+
+    // Inject timestamp for the agent runtime only (do not mutate/persist the transcript message).
+    let user_text = openclaw_inject_timestamp_prefix(user_text_raw.as_str());
+    let legacy_system_key = openclaw_session_key_to_store_key(&session_key);
+    let mut queued_system_events = state.openclaw_peek_system_events(&session_key).await;
+    if legacy_system_key != session_key {
+        queued_system_events.extend(state.openclaw_peek_system_events(&legacy_system_key).await);
+    }
+    let has_system_events = !queued_system_events.is_empty();
+    let user_input = if has_system_events {
+        let mut block = String::new();
+        for evt in &queued_system_events {
+            let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(evt.ts_ms as i64)
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339();
+            let text = evt.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            block.push_str(&format!("System: [{}] {}\n", ts, text));
+        }
+        format!("{}\n{}", block.trim_end(), user_text.trim())
+    } else {
+        user_text
+    };
+
+    let run_fut = agent.run(user_input.as_str());
+    let res = if let Some(ms) = timeout_ms.filter(|v| *v > 0) {
+        tokio::time::timeout(Duration::from_millis(ms), run_fut)
+            .await
+            .map_err(|_| "timeout".to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
+    } else {
+        run_fut.await.map_err(|e| e.to_string())
+    };
+
+    let full = match res {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = finish_agent_run(&run_id, "error", Some(e.clone())).await;
+            warn!(run_id = %run_id, error = %e, started_at = started_at, "tool-started agent run failed");
+            return;
+        }
+    };
+
+    let final_text = strip_openclaw_media_path_lines(&full).into_owned();
+
+
+    // Clear system events only after a successful agent run.
+    if has_system_events {
+        let legacy_key = openclaw_session_key_to_store_key(&session_key);
+        let _ = state
+            .openclaw_drain_system_event_entries(&session_key)
+            .await;
+        if legacy_key != session_key {
+            let _ = state.openclaw_drain_system_event_entries(&legacy_key).await;
+        }
+    }
+
+    let _ = finish_agent_run(&run_id, "ok", None).await;
+
+    if let (Some(store), Some(mut session)) = (state.session_store(), persisted_session) {
+        session.add_message(user_msg);
+        session.add_message(assistant_message_from_text(&final_text));
+        session.update_timestamp();
+        if let Err(e) = store.update(&session).await {
+            warn!(error = %e, "failed to persist openclaw agent session (tool-started)");
+        }
+    }
+
+    crate::openclaw_memory::store_turn_best_effort(
+        &state,
+        &session_key,
+        &run_id,
+        user_text_raw.as_str(),
+        final_text.as_str(),
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Cron (OpenClaw v3)
 // ---------------------------------------------------------------------------
 
 const CRON_STUCK_RUN_MS: u64 = 2 * 60 * 60 * 1000;
+const CRON_ERROR_BACKOFF_SCHEDULE_MS: [u64; 5] = [
+    30_000,      // 1st error → 30s
+    60_000,      // 2nd error → 1m
+    5 * 60_000,  // 3rd error → 5m
+    15 * 60_000, // 4th error → 15m
+    60 * 60_000, // 5th+ error → 60m
+];
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CronDeliveryMode {
+    None,
+    Announce,
+}
+
+impl<'de> Deserialize<'de> for CronDeliveryMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "none" => Ok(CronDeliveryMode::None),
+            "announce" | "deliver" => Ok(CronDeliveryMode::Announce),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid cron delivery mode: {}",
+                other
+            ))),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CronDelivery {
+    mode: CronDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    best_effort: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CronDeliveryPatch {
+    #[serde(default)]
+    mode: Option<CronDeliveryMode>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    best_effort: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct CronDeliveryPlan {
+    requested: bool,
+    channel: Option<String>,
+    to: Option<String>,
+    best_effort: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum CronSchedule {
-    At {
-        #[serde(rename = "atMs")]
-        at_ms: u64,
-    },
+    /// One-shot at an absolute time (UTC ISO-8601 string).
+    At { at: String },
     Every {
         #[serde(rename = "everyMs")]
         every_ms: u64,
@@ -7080,6 +19080,190 @@ enum CronSchedule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
+}
+
+fn cron_error_backoff_ms(consecutive_errors: u64) -> u64 {
+    if consecutive_errors == 0 {
+        return 0;
+    }
+    let idx = consecutive_errors.saturating_sub(1) as usize;
+    let capped = idx.min(CRON_ERROR_BACKOFF_SCHEDULE_MS.len().saturating_sub(1));
+    CRON_ERROR_BACKOFF_SCHEDULE_MS[capped]
+}
+
+fn cron_has_tz_suffix(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    if raw.ends_with('Z') || raw.ends_with('z') {
+        return true;
+    }
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    // "+0200" / "-0530"
+    if len >= 5 {
+        let sign = bytes[len - 5];
+        if (sign == b'+' || sign == b'-') && bytes[len - 4..len].iter().all(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // "+02:00" / "-05:30"
+    if len >= 6 {
+        let sign = bytes[len - 6];
+        if (sign == b'+' || sign == b'-')
+            && bytes[len - 5].is_ascii_digit()
+            && bytes[len - 4].is_ascii_digit()
+            && bytes[len - 3] == b':'
+            && bytes[len - 2].is_ascii_digit()
+            && bytes[len - 1].is_ascii_digit()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn cron_is_iso_date(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.len() != 10 {
+        return false;
+    }
+    let b = raw.as_bytes();
+    b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[4] == b'-'
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[7] == b'-'
+        && b[8..10].iter().all(|c| c.is_ascii_digit())
+}
+
+fn cron_is_iso_date_time(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.len() >= 11 && cron_is_iso_date(&raw[..10]) && raw.as_bytes()[10] == b'T'
+}
+
+fn cron_normalize_utc_iso(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if cron_has_tz_suffix(trimmed) {
+        return trimmed.to_string();
+    }
+    if cron_is_iso_date(trimmed) {
+        return format!("{}T00:00:00Z", trimmed);
+    }
+    if cron_is_iso_date_time(trimmed) {
+        return format!("{}Z", trimmed);
+    }
+    trimmed.to_string()
+}
+
+fn cron_parse_absolute_time_ms(input: &str) -> Option<u64> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = raw.parse::<u64>() {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
+    let normalized = cron_normalize_utc_iso(raw);
+    let dt = chrono::DateTime::parse_from_rfc3339(&normalized).ok()?;
+    let ms = dt.timestamp_millis();
+    if ms <= 0 {
+        return None;
+    }
+    u64::try_from(ms).ok()
+}
+
+fn cron_iso_from_ms(ms: u64) -> Option<String> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).ok()?)?;
+    Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+fn cron_parse_u64_value(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for CronSchedule {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(obj) = value.as_object() else {
+            return Err(serde::de::Error::custom("cron schedule must be an object"));
+        };
+        let kind = obj
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match kind.as_str() {
+            "at" => {
+                if let Some(at_raw) = obj.get("at").and_then(|v| v.as_str()) {
+                    let normalized = cron_normalize_utc_iso(at_raw);
+                    return Ok(CronSchedule::At { at: normalized });
+                }
+                if let Some(at_ms_val) = obj.get("atMs") {
+                    if let Some(ms) = cron_parse_u64_value(at_ms_val).or_else(|| {
+                        at_ms_val
+                            .as_str()
+                            .and_then(|s| cron_parse_absolute_time_ms(s))
+                    }) {
+                        if let Some(at) = cron_iso_from_ms(ms) {
+                            return Ok(CronSchedule::At { at });
+                        }
+                    }
+                    return Err(serde::de::Error::custom(
+                        "invalid cron schedule.atMs (expected positive ms or ISO string)",
+                    ));
+                }
+                Err(serde::de::Error::custom("cron schedule.at required"))
+            }
+            "every" => {
+                let Some(every_ms) = obj.get("everyMs").and_then(cron_parse_u64_value) else {
+                    return Err(serde::de::Error::custom("cron schedule.everyMs required"));
+                };
+                let anchor_ms = obj.get("anchorMs").and_then(cron_parse_u64_value);
+                Ok(CronSchedule::Every {
+                    every_ms,
+                    anchor_ms,
+                })
+            }
+            "cron" => {
+                let expr = obj
+                    .get("expr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if expr.is_empty() {
+                    return Err(serde::de::Error::custom("cron schedule.expr required"));
+                }
+                let tz = obj
+                    .get("tz")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                Ok(CronSchedule::Cron { expr, tz })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown cron schedule kind: {}",
+                other
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7097,6 +19281,9 @@ enum CronPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[serde(rename = "timeoutSeconds")]
         timeout_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "allowUnsafeExternalContent")]
+        allow_unsafe_external_content: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deliver: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7125,6 +19312,8 @@ enum CronPayloadPatch {
         thinking: Option<String>,
         #[serde(rename = "timeoutSeconds", default)]
         timeout_seconds: Option<u64>,
+        #[serde(rename = "allowUnsafeExternalContent", default)]
+        allow_unsafe_external_content: Option<bool>,
         #[serde(default)]
         deliver: Option<bool>,
         #[serde(default)]
@@ -7181,6 +19370,8 @@ struct CronJobState {
     last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consecutive_errors: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7212,6 +19403,8 @@ struct CronJob {
     session_target: CronSessionTarget,
     wake_mode: CronWakeMode,
     payload: CronPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<CronDelivery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isolation: Option<CronIsolation>,
     #[serde(default)]
@@ -7250,6 +19443,8 @@ struct CronAddParams {
     wake_mode: CronWakeMode,
     payload: CronPayload,
     #[serde(default)]
+    delivery: Option<CronDelivery>,
+    #[serde(default)]
     isolation: Option<CronIsolation>,
 }
 
@@ -7274,6 +19469,8 @@ struct CronJobPatch {
     wake_mode: Option<CronWakeMode>,
     #[serde(default)]
     payload: Option<CronPayloadPatch>,
+    #[serde(default)]
+    delivery: Option<CronDeliveryPatch>,
     #[serde(default)]
     isolation: Option<CronIsolation>,
     #[serde(default)]
@@ -7445,15 +19642,209 @@ fn assert_supported_job_spec(job: &CronJob) -> Result<(), ErrorShape> {
     }
 }
 
+fn assert_delivery_support(job: &CronJob) -> Result<(), ErrorShape> {
+    if job.delivery.is_some() && !matches!(job.session_target, CronSessionTarget::Isolated) {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            r#"cron delivery config is only supported for sessionTarget="isolated""#,
+        ));
+    }
+    Ok(())
+}
+
+fn cron_normalize_channel(raw: Option<&str>) -> Option<String> {
+    let raw = raw.unwrap_or("").trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_ascii_lowercase())
+    }
+}
+
+fn cron_normalize_to(raw: Option<&str>) -> Option<String> {
+    let raw = raw.unwrap_or("").trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn cron_has_legacy_delivery_hints(payload: &CronPayload) -> bool {
+    let CronPayload::AgentTurn {
+        deliver,
+        to,
+        best_effort_deliver,
+        ..
+    } = payload
+    else {
+        return false;
+    };
+    if deliver.is_some() {
+        return true;
+    }
+    if best_effort_deliver.is_some() {
+        return true;
+    }
+    if to.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        return true;
+    }
+    false
+}
+
+fn cron_delivery_from_legacy_payload(payload: &CronPayload) -> Option<CronDelivery> {
+    let CronPayload::AgentTurn {
+        deliver,
+        channel,
+        to,
+        best_effort_deliver,
+        ..
+    } = payload
+    else {
+        return None;
+    };
+    let mode = if deliver == &Some(false) {
+        CronDeliveryMode::None
+    } else {
+        CronDeliveryMode::Announce
+    };
+    Some(CronDelivery {
+        mode,
+        channel: cron_normalize_channel(channel.as_deref()),
+        to: cron_normalize_to(to.as_deref()),
+        best_effort: *best_effort_deliver,
+    })
+}
+
+fn cron_delivery_patch_from_legacy_payload_patch(
+    payload: &CronPayloadPatch,
+) -> Option<CronDeliveryPatch> {
+    let CronPayloadPatch::AgentTurn {
+        deliver,
+        channel,
+        to,
+        best_effort_deliver,
+        ..
+    } = payload
+    else {
+        return None;
+    };
+
+    let to_raw = to.as_deref().unwrap_or("").trim();
+    let has_legacy_hints = deliver.is_some() || best_effort_deliver.is_some() || !to_raw.is_empty();
+    if !has_legacy_hints {
+        return None;
+    }
+
+    let mut patch = CronDeliveryPatch {
+        mode: None,
+        channel: None,
+        to: None,
+        best_effort: None,
+    };
+    let mut has_patch = false;
+
+    if *deliver == Some(false) {
+        patch.mode = Some(CronDeliveryMode::None);
+        has_patch = true;
+    } else if *deliver == Some(true) || !to_raw.is_empty() {
+        patch.mode = Some(CronDeliveryMode::Announce);
+        has_patch = true;
+    }
+
+    if let Some(ch) = channel.as_deref() {
+        patch.channel = Some(ch.trim().to_ascii_lowercase());
+        has_patch = true;
+    }
+    if let Some(to) = to.as_deref() {
+        patch.to = Some(to.trim().to_string());
+        has_patch = true;
+    }
+    if let Some(be) = best_effort_deliver {
+        patch.best_effort = Some(*be);
+        has_patch = true;
+    }
+
+    if has_patch {
+        Some(patch)
+    } else {
+        None
+    }
+}
+
+fn merge_cron_delivery(existing: Option<CronDelivery>, patch: CronDeliveryPatch) -> CronDelivery {
+    let mut next = existing.unwrap_or(CronDelivery {
+        mode: CronDeliveryMode::None,
+        channel: None,
+        to: None,
+        best_effort: None,
+    });
+    if let Some(mode) = patch.mode {
+        next.mode = mode;
+    }
+    if let Some(channel) = patch.channel {
+        next.channel = cron_normalize_channel(Some(channel.as_str()));
+    }
+    if let Some(to) = patch.to {
+        next.to = cron_normalize_to(Some(to.as_str()));
+    }
+    if let Some(best_effort) = patch.best_effort {
+        next.best_effort = Some(best_effort);
+    }
+    next
+}
+
+fn resolve_cron_delivery_plan(job: &CronJob) -> CronDeliveryPlan {
+    let payload = match &job.payload {
+        CronPayload::AgentTurn {
+            deliver,
+            channel,
+            to,
+            best_effort_deliver,
+            ..
+        } => Some((deliver, channel, to, best_effort_deliver)),
+        _ => None,
+    };
+
+    if let Some(delivery) = job.delivery.as_ref() {
+        let requested = matches!(delivery.mode, CronDeliveryMode::Announce);
+        let payload_channel = payload.and_then(|(_, ch, _, _)| ch.as_deref());
+        let payload_to = payload.and_then(|(_, _, to, _)| to.as_deref());
+
+        return CronDeliveryPlan {
+            requested,
+            channel: cron_normalize_channel(delivery.channel.as_deref().or(payload_channel)),
+            to: cron_normalize_to(delivery.to.as_deref().or(payload_to)),
+            best_effort: delivery.best_effort.unwrap_or(false),
+        };
+    }
+
+    let Some((deliver, channel, to, best_effort_deliver)) = payload else {
+        return CronDeliveryPlan {
+            requested: false,
+            channel: None,
+            to: None,
+            best_effort: false,
+        };
+    };
+
+    let legacy_requested = match deliver {
+        Some(true) => true,
+        Some(false) => false,
+        None => to.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false),
+    };
+
+    CronDeliveryPlan {
+        requested: legacy_requested,
+        channel: cron_normalize_channel(channel.as_deref()),
+        to: cron_normalize_to(to.as_deref()),
+        best_effort: best_effort_deliver.unwrap_or(false),
+    }
+}
+
 fn compute_next_run_at_ms(schedule: &CronSchedule, now_ms: u64) -> Option<u64> {
     match schedule {
-        CronSchedule::At { at_ms } => {
-            if *at_ms > now_ms {
-                Some(*at_ms)
-            } else {
-                None
-            }
-        }
+        CronSchedule::At { at } => cron_parse_absolute_time_ms(at).filter(|ms| *ms > now_ms),
         CronSchedule::Every {
             every_ms,
             anchor_ms,
@@ -7536,15 +19927,28 @@ fn compute_job_next_run_at_ms(job: &CronJob, now_ms: u64) -> Option<u64> {
     }
 
     match &job.schedule {
-        CronSchedule::At { at_ms } => {
+        CronSchedule::At { at } => {
             // One-shot jobs stay due until they successfully finish.
             if job.state.last_status == Some(CronRunStatus::Ok)
                 && job.state.last_run_at_ms.is_some()
             {
                 None
             } else {
-                Some(*at_ms)
+                cron_parse_absolute_time_ms(at)
             }
+        }
+        CronSchedule::Every {
+            every_ms,
+            anchor_ms,
+        } => {
+            let every = (*every_ms).max(1);
+            let anchor = anchor_ms.unwrap_or(job.created_at_ms);
+            if now_ms < anchor {
+                return Some(anchor);
+            }
+            let elapsed = now_ms.saturating_sub(anchor);
+            let steps = ((elapsed.saturating_add(every.saturating_sub(1))) / every).max(1);
+            Some(anchor.saturating_add(steps.saturating_mul(every)))
         }
         _ => compute_next_run_at_ms(&job.schedule, now_ms),
     }
@@ -7583,6 +19987,7 @@ fn merge_cron_payload(
                 model,
                 thinking,
                 timeout_seconds,
+                allow_unsafe_external_content,
                 deliver,
                 channel,
                 to,
@@ -7593,6 +19998,7 @@ fn merge_cron_payload(
                 model: patch_model,
                 thinking: patch_thinking,
                 timeout_seconds: patch_timeout_seconds,
+                allow_unsafe_external_content: patch_allow_unsafe_external_content,
                 deliver: patch_deliver,
                 channel: patch_channel,
                 to: patch_to,
@@ -7603,6 +20009,8 @@ fn merge_cron_payload(
             model: patch_model.or_else(|| model.clone()),
             thinking: patch_thinking.or_else(|| thinking.clone()),
             timeout_seconds: patch_timeout_seconds.or(*timeout_seconds),
+            allow_unsafe_external_content: patch_allow_unsafe_external_content
+                .or(*allow_unsafe_external_content),
             deliver: patch_deliver.or(*deliver),
             channel: patch_channel.or_else(|| channel.clone()),
             to: patch_to.or_else(|| to.clone()),
@@ -7631,6 +20039,7 @@ fn merge_cron_payload(
                 model,
                 thinking,
                 timeout_seconds,
+                allow_unsafe_external_content,
                 deliver,
                 channel,
                 to,
@@ -7654,6 +20063,7 @@ fn merge_cron_payload(
                 model,
                 thinking,
                 timeout_seconds,
+                allow_unsafe_external_content,
                 deliver,
                 channel,
                 to,
@@ -7741,6 +20151,39 @@ impl OpenclawCronService {
         st.loaded = true;
 
         let now = now_ms();
+        // Best-effort migration for OpenClaw parity:
+        // - Ensure "every" schedules have a stable anchorMs (avoids drift across restarts).
+        // - Ensure isolated agentTurn jobs have a delivery object (OpenClaw defaults to announce).
+        for job in &mut st.store.jobs {
+            if let CronSchedule::Every { anchor_ms, .. } = &mut job.schedule {
+                if anchor_ms.is_none() {
+                    *anchor_ms = Some(job.created_at_ms);
+                }
+            }
+
+            let is_isolated_agent_turn = matches!(job.session_target, CronSessionTarget::Isolated)
+                && matches!(&job.payload, CronPayload::AgentTurn { .. });
+            if is_isolated_agent_turn {
+                if job.delivery.is_none() {
+                    job.delivery = if cron_has_legacy_delivery_hints(&job.payload) {
+                        cron_delivery_from_legacy_payload(&job.payload)
+                    } else {
+                        Some(CronDelivery {
+                            mode: CronDeliveryMode::Announce,
+                            channel: None,
+                            to: None,
+                            best_effort: None,
+                        })
+                    };
+                }
+                if let Some(delivery) = job.delivery.as_mut() {
+                    delivery.channel = cron_normalize_channel(delivery.channel.as_deref());
+                    delivery.to = cron_normalize_to(delivery.to.as_deref());
+                }
+            } else {
+                job.delivery = None;
+            }
+        }
         recompute_next_runs(&mut st.store.jobs, now);
         let _ = write_json_atomic(&self.store_path, &st.store);
     }
@@ -7836,24 +20279,74 @@ impl OpenclawCronService {
             }
         });
         let enabled = input.enabled.unwrap_or(true);
+
+        let mut schedule = input.schedule;
+        if let CronSchedule::Every { anchor_ms, .. } = &mut schedule {
+            if anchor_ms.is_none() {
+                *anchor_ms = Some(now);
+            }
+        }
+
+        let delete_after_run = match input.delete_after_run {
+            Some(v) => Some(v),
+            None => {
+                if matches!(schedule, CronSchedule::At { .. }) {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+        };
+
+        let payload = input.payload;
+        let session_target = input.session_target;
+        let mut delivery = input.delivery;
+        if matches!(session_target, CronSessionTarget::Isolated)
+            && matches!(&payload, CronPayload::AgentTurn { .. })
+        {
+            if delivery.is_none() {
+                delivery = if cron_has_legacy_delivery_hints(&payload) {
+                    cron_delivery_from_legacy_payload(&payload)
+                } else {
+                    Some(CronDelivery {
+                        mode: CronDeliveryMode::Announce,
+                        channel: None,
+                        to: None,
+                        best_effort: None,
+                    })
+                };
+            }
+            if let Some(delivery) = delivery.as_mut() {
+                delivery.channel = cron_normalize_channel(delivery.channel.as_deref());
+                delivery.to = cron_normalize_to(delivery.to.as_deref());
+            }
+        } else if delivery.is_some() {
+            return Err(ErrorShape::new(
+                error_codes::INVALID_REQUEST,
+                r#"cron delivery config is only supported for sessionTarget="isolated""#,
+            ));
+        }
+
         let job = CronJob {
             id: Uuid::new_v4().to_string(),
             agent_id,
             name: name.to_string(),
             description,
             enabled,
-            delete_after_run: input.delete_after_run,
+            delete_after_run,
             created_at_ms: now,
             updated_at_ms: now,
-            schedule: input.schedule,
-            session_target: input.session_target,
+            schedule,
+            session_target,
             wake_mode: input.wake_mode,
-            payload: input.payload,
+            payload,
+            delivery,
             isolation: input.isolation,
             state: CronJobState::default(),
         };
 
         assert_supported_job_spec(&job)?;
+        assert_delivery_support(&job)?;
 
         let mut st = self.state.lock().await;
         self.ensure_loaded_locked(&mut st).await;
@@ -7899,6 +20392,11 @@ impl OpenclawCronService {
                 )
             })?;
 
+        let payload_patch_for_delivery = patch.payload.clone();
+        let has_delivery_patch = patch.delivery.is_some();
+        let schedule_changed = patch.schedule.is_some();
+        let enabled_changed = patch.enabled.is_some();
+
         if let Some(name) = patch.name.as_deref() {
             let trimmed = name.trim();
             if trimmed.is_empty() {
@@ -7923,8 +20421,22 @@ impl OpenclawCronService {
         if let Some(delete_after_run) = patch.delete_after_run {
             job.delete_after_run = Some(delete_after_run);
         }
-        if let Some(schedule) = patch.schedule {
+        if let Some(mut schedule) = patch.schedule {
+            if let CronSchedule::Every { anchor_ms, .. } = &mut schedule {
+                if anchor_ms.is_none() {
+                    *anchor_ms = Some(now);
+                }
+            }
             job.schedule = schedule;
+        }
+        if let CronSchedule::Every { anchor_ms, .. } = &mut job.schedule {
+            if anchor_ms.is_none() {
+                *anchor_ms = Some(if schedule_changed {
+                    now
+                } else {
+                    job.created_at_ms
+                });
+            }
         }
         if let Some(session_target) = patch.session_target {
             job.session_target = session_target;
@@ -7934,6 +20446,23 @@ impl OpenclawCronService {
         }
         if let Some(payload_patch) = patch.payload {
             job.payload = merge_cron_payload(&job.payload, payload_patch)?;
+        }
+        if !has_delivery_patch {
+            if let Some(payload_patch) = payload_patch_for_delivery.as_ref() {
+                if let Some(legacy_patch) =
+                    cron_delivery_patch_from_legacy_payload_patch(payload_patch)
+                {
+                    if matches!(job.session_target, CronSessionTarget::Isolated)
+                        && matches!(&job.payload, CronPayload::AgentTurn { .. })
+                    {
+                        job.delivery =
+                            Some(merge_cron_delivery(job.delivery.clone(), legacy_patch));
+                    }
+                }
+            }
+        }
+        if let Some(delivery_patch) = patch.delivery {
+            job.delivery = Some(merge_cron_delivery(job.delivery.clone(), delivery_patch));
         }
         if let Some(isolation) = patch.isolation {
             job.isolation = Some(isolation);
@@ -7957,6 +20486,9 @@ impl OpenclawCronService {
             if let Some(v) = state_patch.last_duration_ms {
                 job.state.last_duration_ms = Some(v);
             }
+            if let Some(v) = state_patch.consecutive_errors {
+                job.state.consecutive_errors = Some(v);
+            }
         }
         if let Some(agent_field) = patch.agent_id {
             job.agent_id = agent_field.and_then(|s| {
@@ -7969,14 +20501,41 @@ impl OpenclawCronService {
             });
         }
 
+        // Normalize delivery config (OpenClaw parity).
+        let is_isolated_agent_turn = matches!(job.session_target, CronSessionTarget::Isolated)
+            && matches!(&job.payload, CronPayload::AgentTurn { .. });
+        if is_isolated_agent_turn {
+            if job.delivery.is_none() {
+                job.delivery = if cron_has_legacy_delivery_hints(&job.payload) {
+                    cron_delivery_from_legacy_payload(&job.payload)
+                } else {
+                    Some(CronDelivery {
+                        mode: CronDeliveryMode::Announce,
+                        channel: None,
+                        to: None,
+                        best_effort: None,
+                    })
+                };
+            }
+            if let Some(delivery) = job.delivery.as_mut() {
+                delivery.channel = cron_normalize_channel(delivery.channel.as_deref());
+                delivery.to = cron_normalize_to(delivery.to.as_deref());
+            }
+        } else {
+            job.delivery = None;
+        }
+
         assert_supported_job_spec(job)?;
+        assert_delivery_support(job)?;
         job.updated_at_ms = now;
 
-        if job.enabled {
-            job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now);
-        } else {
-            job.state.next_run_at_ms = None;
-            job.state.running_at_ms = None;
+        if schedule_changed || enabled_changed {
+            if job.enabled {
+                job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now);
+            } else {
+                job.state.next_run_at_ms = None;
+                job.state.running_at_ms = None;
+            }
         }
 
         let updated = job.clone();
@@ -8099,9 +20658,94 @@ impl OpenclawCronService {
     }
 }
 
+pub(crate) async fn openclaw_cron_status_for_tool(state: &GatewayState) -> serde_json::Value {
+    let svc = cron_service_for_state(state).await;
+    svc.status().await
+}
+
+pub(crate) async fn openclaw_cron_list_for_tool(
+    state: &GatewayState,
+    include_disabled: bool,
+) -> serde_json::Value {
+    let svc = cron_service_for_state(state).await;
+    let jobs = svc.list(include_disabled).await;
+    json!({ "jobs": jobs })
+}
+
+pub(crate) async fn openclaw_cron_add_for_tool(
+    state: &GatewayState,
+    job: serde_json::Value,
+) -> Result<serde_json::Value, ErrorShape> {
+    let params: CronAddParams = serde_json::from_value(job).map_err(|e| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            format!("invalid cron.add params: {}", e),
+        )
+    })?;
+    let svc = cron_service_for_state(state).await;
+    let job = svc.add(state, params).await?;
+    Ok(json!(job))
+}
+
+pub(crate) async fn openclaw_cron_update_for_tool(
+    state: &GatewayState,
+    job_id: &str,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, ErrorShape> {
+    let patch: CronJobPatch = serde_json::from_value(patch).map_err(|e| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            format!("invalid cron.update patch: {}", e),
+        )
+    })?;
+    let svc = cron_service_for_state(state).await;
+    let job = svc.update(state, job_id, patch).await?;
+    Ok(json!(job))
+}
+
+pub(crate) async fn openclaw_cron_remove_for_tool(
+    state: &GatewayState,
+    job_id: &str,
+) -> Result<serde_json::Value, ErrorShape> {
+    let svc = cron_service_for_state(state).await;
+    svc.remove(state, job_id).await
+}
+
+pub(crate) async fn openclaw_cron_run_for_tool(
+    state: &GatewayState,
+    job_id: &str,
+    mode: Option<&str>,
+) -> Result<serde_json::Value, ErrorShape> {
+    let svc = cron_service_for_state(state).await;
+    svc.run(state, job_id, mode).await
+}
+
+pub(crate) async fn openclaw_cron_runs_for_tool(
+    state: &GatewayState,
+    job_id: &str,
+    limit: Option<u64>,
+) -> Result<serde_json::Value, ErrorShape> {
+    let limit = limit.unwrap_or(200).max(1).min(5000) as usize;
+    let svc = cron_service_for_state(state).await;
+    let log_path = resolve_cron_run_log_path(&svc.store_path, job_id);
+    let entries = read_cron_run_log_entries(&log_path, job_id, limit);
+    Ok(json!({ "entries": entries }))
+}
+
 fn recompute_next_runs(jobs: &mut [CronJob], now: u64) {
     for job in jobs {
         if !job.enabled {
+            job.state.next_run_at_ms = None;
+            job.state.running_at_ms = None;
+            continue;
+        }
+        // OpenClaw parity: one-shot jobs are disabled after ANY terminal status to
+        // avoid tight-loop rescheduling when their at-time is in the past.
+        if matches!(job.schedule, CronSchedule::At { .. })
+            && job.state.last_status.is_some()
+            && job.state.last_run_at_ms.is_some()
+        {
+            job.enabled = false;
             job.state.next_run_at_ms = None;
             job.state.running_at_ms = None;
             continue;
@@ -8112,7 +20756,9 @@ fn recompute_next_runs(jobs: &mut [CronJob], now: u64) {
                 job.state.running_at_ms = None;
             }
         }
-        job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now);
+        if job.state.next_run_at_ms.is_none() {
+            job.state.next_run_at_ms = compute_job_next_run_at_ms(job, now);
+        }
     }
 }
 
@@ -8127,7 +20773,7 @@ async fn execute_cron_job(
     store_path: &PathBuf,
     store: &mut CronStoreFile,
     job_id: &str,
-    forced: bool,
+    _forced: bool,
 ) {
     let started_at = now_ms();
 
@@ -8139,6 +20785,8 @@ async fn execute_cron_job(
     }) else {
         return;
     };
+
+    let delivery_plan = resolve_cron_delivery_plan(&snapshot);
     broadcast_openclaw_event(
         state,
         "cron",
@@ -8232,8 +20880,10 @@ async fn execute_cron_job(
                 }
             };
 
+            let delivery_requested = delivery_plan.requested;
+
             if status != CronRunStatus::Skipped {
-                let provider = match state.provider().cloned() {
+                let provider = match state.provider() {
                     Some(p) => Some(p),
                     None => {
                         status = CronRunStatus::Error;
@@ -8248,9 +20898,9 @@ async fn execute_cron_job(
                     let run_fut = async {
                         let mut messages: Vec<Message> = Vec::new();
                         let mut persisted_session = None;
+                        let session_key = format!("cron:{}", job_id);
                         if let Some(store) = state.session_store() {
                             let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-                            let session_key = format!("cron:{}", job_id);
                             if let Ok(s) =
                                 store.get_or_create(user_id, "openclaw", &session_key).await
                             {
@@ -8259,8 +20909,19 @@ async fn execute_cron_job(
                             }
                         }
 
-                        let user_msg = Message::user(message.clone());
+                        let mut user_text = message.clone();
+                        if delivery_requested {
+                            let suffix = "Return your summary as plain text; it will be delivered automatically. If the task explicitly calls for messaging a specific external recipient, note who/where it should go instead of sending it yourself.";
+                            let base = user_text.trim();
+                            user_text = if base.is_empty() {
+                                suffix.to_string()
+                            } else {
+                                format!("{}\n\n{}", base, suffix)
+                            };
+                        }
+                        let user_msg = Message::user(user_text);
                         messages.push(user_msg.clone());
+                        let model_for_record = model.clone();
                         let options = ChatOptions {
                             model,
                             max_tokens: None,
@@ -8274,6 +20935,7 @@ async fn execute_cron_job(
                         let mut full = String::new();
                         let mut final_usage: Option<Usage> = None;
                         let mut stop_reason: Option<String> = None;
+                        let mut stream_model: Option<String> = None;
 
                         let mut stream = provider
                             .stream(&messages, options)
@@ -8281,6 +20943,7 @@ async fn execute_cron_job(
                             .map_err(|e| e.to_string())?;
                         while let Some(evt) = stream.next().await {
                             match evt {
+                                ProviderStreamEvent::Start { model } => stream_model = Some(model),
                                 ProviderStreamEvent::Delta { content } => full.push_str(&content),
                                 ProviderStreamEvent::Stop { reason, usage } => {
                                     stop_reason = Some(reason);
@@ -8291,11 +20954,28 @@ async fn execute_cron_job(
                             }
                         }
 
+                        if let Some(usage) = final_usage.as_ref() {
+                            let model_for_record =
+                                stream_model.clone().or(model_for_record.clone());
+                            let record = crate::openclaw_usage::record_from_stream(
+                                state,
+                                provider.name(),
+                                model_for_record,
+                                Some(session_key.clone()),
+                                Some(job_id.to_string()),
+                                usage,
+                            );
+                            crate::openclaw_usage::append_usage_record_best_effort(state, record)
+                                .await;
+                        }
+
+                        let final_text = strip_openclaw_media_path_lines(&full).into_owned();
+
                         if let (Some(store), Some(mut session)) =
                             (state.session_store(), persisted_session)
                         {
                             session.add_message(user_msg);
-                            session.add_message(assistant_message_from_text(&full));
+                            session.add_message(assistant_message_from_text(&final_text));
                             if let Some(usage) = &final_usage {
                                 session.add_token_usage(usage.input_tokens, usage.output_tokens);
                             }
@@ -8303,7 +20983,7 @@ async fn execute_cron_job(
                             let _ = store.update(&session).await;
                         }
 
-                        Ok::<_, String>((full, stop_reason, final_usage))
+                        Ok::<_, String>((final_text, stop_reason, final_usage))
                     };
 
                     let res = if let Some(secs) = timeout_seconds {
@@ -8337,6 +21017,80 @@ async fn execute_cron_job(
         }
     }
 
+    // Optional outbound "announce" delivery (OpenClaw `job.delivery`).
+    if matches!(snapshot.session_target, CronSessionTarget::Isolated) && delivery_plan.requested {
+        let channel_raw = delivery_plan.channel.as_deref().unwrap_or("").trim();
+        let channel = channel_raw.to_ascii_lowercase();
+        let to = delivery_plan.to.as_deref().unwrap_or("").trim().to_string();
+
+        let mut text = summary
+            .clone()
+            .or_else(|| err.clone())
+            .or_else(|| output_text.clone())
+            .unwrap_or_else(|| "completed".to_string())
+            .trim()
+            .to_string();
+        if text.chars().count() > 4000 {
+            text = text.chars().take(3997).collect::<String>() + "...";
+        }
+
+        text = strip_openclaw_media_path_lines(&text).into_owned();
+        text = text.trim().to_string();
+
+        text = apply_openclaw_outbound_response_prefix(
+            state,
+            crate::openclaw_paths::DEFAULT_AGENT_ID,
+            Some(&channel),
+            None,
+            &text,
+        );
+
+        let has_any_hint = !channel_raw.is_empty() || !to.is_empty();
+        let has_complete_target = !channel_raw.is_empty() && channel != "last" && !to.is_empty();
+        if !has_any_hint || (channel == "last" && to.is_empty()) {
+            debug!(
+                job_id = %job_id,
+                "cron: delivery requested but no explicit target; skipping outbound announce"
+            );
+        } else if !has_complete_target {
+            let msg = "cron delivery target is missing".to_string();
+            if delivery_plan.best_effort {
+                warn!(job_id = %job_id, "{}", msg);
+            } else {
+                status = CronRunStatus::Error;
+                err = Some(msg.clone());
+                summary = Some(msg);
+            }
+        } else {
+            match state
+                .channel_manager()
+                .send(&channel, &to, OutgoingMessage::text(text))
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = format!("cron announce delivery failed: {}", e);
+                    if delivery_plan.best_effort {
+                        warn!(job_id = %job_id, error = %e, "{}", msg);
+                    } else {
+                        status = CronRunStatus::Error;
+                        err = Some(match err {
+                            Some(prev) => format!("{}\n{}", prev, msg),
+                            None => msg.clone(),
+                        });
+                        if summary
+                            .as_ref()
+                            .map(|s| s.trim().is_empty())
+                            .unwrap_or(true)
+                        {
+                            summary = Some(msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Finish.
     let ended_at = now_ms();
     let duration_ms = ended_at.saturating_sub(started_at);
@@ -8357,15 +21111,42 @@ async fn execute_cron_job(
         j.state.last_error = err.clone();
         j.updated_at_ms = ended_at;
 
-        should_delete = matches!(j.schedule, CronSchedule::At { .. })
-            && status == CronRunStatus::Ok
-            && j.delete_after_run == Some(true);
+        if status == CronRunStatus::Error {
+            j.state.consecutive_errors =
+                Some(j.state.consecutive_errors.unwrap_or(0).saturating_add(1));
+        } else {
+            j.state.consecutive_errors = Some(0);
+        }
+
+        let is_one_shot = matches!(j.schedule, CronSchedule::At { .. });
+        should_delete =
+            is_one_shot && status == CronRunStatus::Ok && j.delete_after_run == Some(true);
 
         if !should_delete {
-            if matches!(j.schedule, CronSchedule::At { .. }) && status == CronRunStatus::Ok {
-                // One-shot job completed successfully; disable it.
+            if is_one_shot {
+                // One-shot jobs are disabled after ANY terminal status
+                // (ok, error, or skipped). This prevents tight-loop rescheduling.
                 j.enabled = false;
                 j.state.next_run_at_ms = None;
+            } else if status == CronRunStatus::Error && j.enabled {
+                // Apply exponential backoff to avoid retry storms.
+                let errors = j.state.consecutive_errors.unwrap_or(1).max(1);
+                let backoff = cron_error_backoff_ms(errors);
+                let normal_next = compute_job_next_run_at_ms(j, ended_at);
+                let backoff_next = ended_at.saturating_add(backoff);
+                let picked = match normal_next {
+                    Some(n) => n.max(backoff_next),
+                    None => backoff_next,
+                };
+                next_run_at_ms = Some(picked);
+                j.state.next_run_at_ms = Some(picked);
+                info!(
+                    job_id = %job_id,
+                    consecutive_errors = errors,
+                    backoff_ms = backoff,
+                    next_run_at_ms = picked,
+                    "cron: applying error backoff"
+                );
             } else if j.enabled {
                 next_run_at_ms = compute_job_next_run_at_ms(j, ended_at);
                 j.state.next_run_at_ms = next_run_at_ms;
@@ -8428,7 +21209,7 @@ async fn execute_cron_job(
         .await;
     }
 
-    if let CronSessionTarget::Isolated = snapshot.session_target {
+    if matches!(snapshot.session_target, CronSessionTarget::Isolated) && delivery_plan.requested {
         let prefix = snapshot
             .isolation
             .as_ref()
@@ -8461,28 +21242,19 @@ async fn execute_cron_job(
             }
         }
 
-        let status_prefix = if status == CronRunStatus::Ok {
-            prefix.to_string()
-        } else {
-            format!("{} ({})", prefix, status_str)
+        let label = match status {
+            CronRunStatus::Ok => format!("{}: {}", prefix, body),
+            CronRunStatus::Error => format!("{} (error): {}", prefix, body),
+            CronRunStatus::Skipped => format!("{} (skipped): {}", prefix, body),
         };
-        enqueue_openclaw_system_event(state, &format!("{}: {}", status_prefix, body)).await;
+        enqueue_openclaw_system_event(state, &label).await;
 
         if matches!(snapshot.wake_mode, CronWakeMode::Now) {
             crate::openclaw_heartbeat::request_heartbeat_now(
                 state,
-                Some(format!("cron:{}:post", job_id)),
+                Some(format!("cron:{}", job_id)),
             )
             .await;
-        }
-    }
-
-    // Keep nextRunAtMs in sync in case schedule advanced during a long run.
-    if !forced && !should_delete {
-        if let Some(j) = store.jobs.iter_mut().find(|j| j.id == job_id) {
-            if j.enabled {
-                j.state.next_run_at_ms = compute_job_next_run_at_ms(j, now_ms());
-            }
         }
     }
 }
@@ -8504,55 +21276,53 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 "peer": ctx.peer.to_string(),
             }),
         ),
-        "logs.tail" => ok_response(
-            &req.id,
-            {
-                let params = req.params.clone().unwrap_or_else(|| json!({}));
-                let cursor = params
+        "logs.tail" => ok_response(&req.id, {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let cursor = params.get("cursor").and_then(|v| v.as_u64()).or_else(|| {
+                params
                     .get("cursor")
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| {
-                        params
-                            .get("cursor")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                    });
-                let limit = params
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| {
-                        params
-                            .get("limit")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                    })
-                    .unwrap_or(400)
-                    .max(1)
-                    .min(5000) as usize;
-                let max_bytes = params
-                    .get("maxBytes")
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| {
-                        params
-                            .get("maxBytes")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                    })
-                    .unwrap_or(200_000)
-                    .max(1)
-                    .min(1_000_000) as usize;
-
-                let result = ctx.state.openclaw_logs().tail(cursor, limit, max_bytes).await;
-                json!({
-                    "file": result.file,
-                    "cursor": result.cursor,
-                    "size": result.size,
-                    "lines": result.lines,
-                    "truncated": result.truncated,
-                    "reset": result.reset,
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    params
+                        .get("limit")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
                 })
-            },
-        ),
+                .unwrap_or(400)
+                .max(1)
+                .min(5000) as usize;
+            let max_bytes = params
+                .get("maxBytes")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    params
+                        .get("maxBytes")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                })
+                .unwrap_or(200_000)
+                .max(1)
+                .min(1_000_000) as usize;
+
+            let result = ctx
+                .state
+                .openclaw_logs()
+                .tail(cursor, limit, max_bytes)
+                .await;
+            json!({
+                "file": result.file,
+                "cursor": result.cursor,
+                "size": result.size,
+                "lines": result.lines,
+                "truncated": result.truncated,
+                "reset": result.reset,
+            })
+        }),
         "models.list" => {
             let models = ctx
                 .state
@@ -8566,6 +21336,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                                 "name": m.name,
                                 "provider": m.provider,
                                 "contextWindow": m.context_window,
+                                "maxOutputTokens": m.max_output_tokens,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -8966,6 +21737,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .and_then(|v| v.as_str())
                 .unwrap_or(crate::openclaw_paths::DEFAULT_AGENT_ID);
             let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id_raw);
+            let session_key = canonicalize_openclaw_session_key(&agent_id, &session_key);
 
             let timeout_ms = params.get("timeout").and_then(|v| v.as_u64());
             let extra_system_prompt = params
@@ -8974,7 +21746,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|s| s.to_string());
 
             // Best-effort delivery: match OpenClaw's `deliver` shape (subset).
-            let wants_delivery = params.get("deliver").and_then(|v| v.as_bool()).unwrap_or(false);
+            let wants_delivery = params
+                .get("deliver")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let explicit_to = params
                 .get("replyTo")
                 .and_then(|v| v.as_str())
@@ -9011,7 +21786,13 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
 
                 // If no explicit target, fall back to sessionKey mapping when it matches a channel.
                 if to.trim().is_empty() {
-                    let (ct, cid) = session_key_to_channel(&session_key);
+                    let session_key_for_channel = openclaw_session_key_to_store_key(&session_key);
+                    let (ct, cid) =
+                        if let Some(group) = parse_openclaw_group_key(&session_key_for_channel) {
+                            (group.channel, group.id)
+                        } else {
+                            session_key_to_channel(&session_key_for_channel)
+                        };
                     if ctx.state.channel_manager().has_channel(&ct) {
                         channel = ct;
                         to = cid;
@@ -9022,8 +21803,8 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 if channel.trim().is_empty() {
                     if let Some((left, right)) = to.split_once(':') {
                         if ctx.state.channel_manager().has_channel(left) {
-                            channel = normalize_channel(left)
-                                .unwrap_or_else(|| left.trim().to_string());
+                            channel =
+                                normalize_channel(left).unwrap_or_else(|| left.trim().to_string());
                             to = right.trim().to_string();
                         }
                     }
@@ -9033,6 +21814,8 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                         to = right.trim().to_string();
                     }
                 }
+
+                to = strip_openclaw_chat_type_prefix(&to).to_string();
 
                 if channel.trim().is_empty() {
                     channel = ctx
@@ -9065,7 +21848,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 None
             };
 
-            let provider = ctx.state.provider().cloned().ok_or_else(|| {
+            let provider = ctx.state.provider().ok_or_else(|| {
                 ErrorShape::new(error_codes::UNAVAILABLE, "provider not configured")
             });
             let provider = match provider {
@@ -9148,19 +21931,99 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             }
         }
         "agents.list" => {
-            let ids = crate::openclaw_paths::list_agent_ids();
+            let agents_file = load_openclaw_agents_file(&ctx.state);
+            let mut agent_cfg_by_id: HashMap<String, OpenclawAgentConfig> = HashMap::new();
+            for agent in agents_file.agents {
+                let id = crate::openclaw_paths::normalize_agent_id(&agent.agent_id);
+                agent_cfg_by_id.insert(id, agent);
+            }
+
+            let model_name_by_id = ctx
+                .state
+                .provider()
+                .map(|p| {
+                    p.models()
+                        .into_iter()
+                        .map(|m| (m.id, m.name))
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+
+            let runtime_shell = resolve_runtime_shell();
+            let ids = list_agent_ids_for_state(&ctx.state);
             let agents = ids
                 .iter()
                 .map(|id| {
-                    let name = if id == crate::openclaw_paths::DEFAULT_AGENT_ID {
-                        Some("drbot".to_string())
+                    let cfg = agent_cfg_by_id.get(id);
+                    let name = cfg
+                        .map(|c| c.name.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            if id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                                "drbot".to_string()
+                            } else {
+                                id.clone()
+                            }
+                        });
+
+                    let avatar = cfg
+                        .and_then(|c| c.avatar.as_deref())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .or_else(|| name.chars().next().map(|c| c.to_string()));
+
+                    let emoji = cfg
+                        .and_then(|c| c.emoji.as_deref())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+
+                    let workspace = cfg
+                        .map(|c| c.workspace.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            resolve_agent_workspace_dir_for_state(&ctx.state, id)
+                                .to_string_lossy()
+                                .to_string()
+                        });
+
+                    let model = cfg.and_then(|c| c.model.clone());
+                    let model_id = model
+                        .as_ref()
+                        .and_then(extract_openclaw_model_primary)
+                        .unwrap_or_default();
+                    let model_name = if model_id.is_empty() {
+                        None
                     } else {
-                        Some(id.clone())
+                        model_name_by_id.get(&model_id).cloned().or(Some(model_id))
                     };
+
+                    let skills = cfg
+                        .and_then(|c| c.skills.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .collect::<Vec<_>>();
+                    let tools = cfg
+                        .and_then(|c| c.tools.as_ref())
+                        .and_then(|t| serde_json::to_value(t).ok());
+                    let image_model = cfg
+                        .and_then(|c| c.image_model.as_ref())
+                        .and_then(|m| serde_json::to_value(m).ok());
                     json!({
                         "id": id,
                         "name": name,
-                        "identity": { "name": name },
+                        "workspace": workspace,
+                        "model": model,
+                        "imageModel": image_model,
+                        "modelName": model_name,
+                        "skills": skills,
+                        "tools": tools,
+                        "runtimeShell": runtime_shell.clone(),
+                        "identity": { "name": name, "avatar": avatar, "emoji": emoji },
                     })
                 })
                 .collect::<Vec<_>>();
@@ -9175,6 +22038,381 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }),
             )
         }
+        "agents.create" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let workspace = params
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let emoji = params
+                .get("emoji")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let avatar = params
+                .get("avatar")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let image_model = params
+                .get("imageModel")
+                .and_then(|v| parse_openclaw_model_list_config_update(v))
+                .unwrap_or(None);
+
+            if name.is_empty() || workspace.is_empty() {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agents.create requires name and workspace",
+                    None,
+                );
+            }
+
+            let agent_id = crate::openclaw_paths::normalize_agent_id(&name);
+            if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agents.create produced reserved agentId=default; choose a different name",
+                    Some(json!({ "agentId": agent_id })),
+                );
+            }
+            if agent_id.eq_ignore_ascii_case("main") {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agents.create produced reserved agentId=main; choose a different name",
+                    Some(json!({ "agentId": agent_id })),
+                );
+            }
+
+            let mut file = load_openclaw_agents_file(&ctx.state);
+            if file
+                .agents
+                .iter()
+                .any(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+            {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agent already exists",
+                    Some(json!({ "agentId": agent_id })),
+                );
+            }
+
+            let workspace_dir = crate::openclaw_paths::resolve_user_path(&workspace);
+            if let Err(e) = std::fs::create_dir_all(&workspace_dir) {
+                return error_response(
+                    &req.id,
+                    error_codes::UNAVAILABLE,
+                    &format!("failed to create workspace dir: {}", e),
+                    Some(json!({ "workspace": workspace })),
+                );
+            }
+            if let Err(err) =
+                ensure_agent_workspace_bootstrap(&workspace_dir, &name, emoji.as_deref())
+            {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
+            }
+
+            file.agents.push(OpenclawAgentConfig {
+                agent_id: agent_id.clone(),
+                name: name.clone(),
+                workspace: workspace.clone(),
+                model: None,
+                image_model,
+                skills: None,
+                tools: None,
+                subagents: None,
+                avatar,
+                emoji,
+            });
+
+            if let Err(err) = store_openclaw_agents_file(&ctx.state, &file) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
+            }
+
+            ok_response(
+                &req.id,
+                json!({
+                    "ok": true,
+                    "agentId": agent_id,
+                    "name": name,
+                    "workspace": workspace,
+                }),
+            )
+        }
+        "agents.update" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let agent_id_raw = params
+                .get("agentId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if agent_id_raw.is_empty() {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agents.update requires agentId",
+                    None,
+                );
+            }
+            let agent_id = crate::openclaw_paths::normalize_agent_id(&agent_id_raw);
+            if agent_id.eq_ignore_ascii_case("main") {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agentId=main is reserved",
+                    Some(json!({ "agentId": agent_id })),
+                );
+            }
+
+            let mut file = load_openclaw_agents_file(&ctx.state);
+            let mut idx = file
+                .agents
+                .iter()
+                .position(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+            if idx.is_none() {
+                // Best-effort: adopt an existing workspace folder (or create a default entry).
+                let fallback_workspace = default_agent_workspace_dir(&ctx.state, &agent_id)
+                    .to_string_lossy()
+                    .to_string();
+                file.agents.push(OpenclawAgentConfig {
+                    agent_id: agent_id.clone(),
+                    name: if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                        "drbot".to_string()
+                    } else {
+                        agent_id.clone()
+                    },
+                    workspace: fallback_workspace,
+                    model: None,
+                    image_model: None,
+                    skills: None,
+                    tools: None,
+                    subagents: None,
+                    avatar: None,
+                    emoji: None,
+                });
+                idx = Some(file.agents.len() - 1);
+            }
+            let idx = idx.unwrap();
+            let entry = &mut file.agents[idx];
+
+            if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    entry.name = trimmed.to_string();
+                }
+            }
+            if let Some(workspace) = params.get("workspace").and_then(|v| v.as_str()) {
+                let trimmed = workspace.trim();
+                if !trimmed.is_empty() {
+                    entry.workspace = trimmed.to_string();
+                    let workspace_dir = crate::openclaw_paths::resolve_user_path(trimmed);
+                    if let Err(e) = std::fs::create_dir_all(&workspace_dir) {
+                        return error_response(
+                            &req.id,
+                            error_codes::UNAVAILABLE,
+                            &format!("failed to create workspace dir: {}", e),
+                            Some(json!({ "workspace": trimmed })),
+                        );
+                    }
+                    if let Err(err) = ensure_agent_workspace_bootstrap(
+                        &workspace_dir,
+                        &entry.name,
+                        entry.emoji.as_deref(),
+                    ) {
+                        return GatewayFrame::Res(ResponseFrame {
+                            id: req.id,
+                            ok: false,
+                            payload: None,
+                            error: Some(err),
+                        });
+                    }
+                }
+            }
+
+            if params.get("model").is_some() {
+                entry.model = match params.get("model") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(s)) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(json!(trimmed))
+                        }
+                    }
+                    Some(other) => Some(other.clone()),
+                };
+            }
+            if params.get("imageModel").is_some() {
+                if let Some(value) = params.get("imageModel") {
+                    if let Some(parsed) = parse_openclaw_model_list_config_update(value) {
+                        entry.image_model = parsed;
+                    }
+                }
+            }
+            if params.get("avatar").is_some() {
+                entry.avatar = params
+                    .get("avatar")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            }
+            if params.get("emoji").is_some() {
+                entry.emoji = params
+                    .get("emoji")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            }
+
+            if params.get("skills").is_some() {
+                entry.skills = match params.get("skills") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::Array(items)) => Some(
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                };
+            }
+
+            if params.get("tools").is_some() {
+                entry.tools = match params.get("tools") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(other) => {
+                        match serde_json::from_value::<OpenclawToolsConfig>(other.clone()) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                return error_response(
+                                    &req.id,
+                                    error_codes::INVALID_REQUEST,
+                                    &format!("invalid agents.update tools: {}", e),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                };
+            }
+
+            if let Err(err) = store_openclaw_agents_file(&ctx.state, &file) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
+            }
+
+            ok_response(&req.id, json!({ "ok": true, "agentId": agent_id }))
+        }
+        "agents.delete" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let agent_id_raw = params
+                .get("agentId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if agent_id_raw.is_empty() {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agents.delete requires agentId",
+                    None,
+                );
+            }
+            let agent_id = crate::openclaw_paths::normalize_agent_id(&agent_id_raw);
+            if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "cannot delete default agent",
+                    Some(json!({ "agentId": agent_id })),
+                );
+            }
+
+            let delete_files = params
+                .get("deleteFiles")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let mut file = load_openclaw_agents_file(&ctx.state);
+            let removed = file
+                .agents
+                .iter()
+                .position(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+            let workspace = removed
+                .and_then(|idx| {
+                    let entry = file.agents.remove(idx);
+                    let ws = entry.workspace.trim().to_string();
+                    if ws.is_empty() {
+                        None
+                    } else {
+                        Some(ws)
+                    }
+                })
+                .unwrap_or_else(|| {
+                    default_agent_workspace_dir(&ctx.state, &agent_id)
+                        .to_string_lossy()
+                        .to_string()
+                });
+
+            if let Err(err) = store_openclaw_agents_file(&ctx.state, &file) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
+            }
+
+            if delete_files {
+                let workspace_dir = crate::openclaw_paths::resolve_user_path(&workspace);
+                if workspace_dir.exists() && workspace_dir.is_dir() {
+                    if let Some(state_dir) = resolve_openclaw_state_dir(&ctx.state) {
+                        let trash_base = state_dir.join("trash").join("agents");
+                        let _ = std::fs::create_dir_all(&trash_base);
+                        let target = trash_base.join(format!("{}-{}", agent_id, now_ms()));
+                        if std::fs::rename(&workspace_dir, &target).is_err() {
+                            if workspace_dir.starts_with(&state_dir) {
+                                let _ = std::fs::remove_dir_all(&workspace_dir);
+                            }
+                        }
+                    }
+                }
+            }
+
+            ok_response(
+                &req.id,
+                json!({ "ok": true, "agentId": agent_id, "removedBindings": 0 }),
+            )
+        }
         "agent.identity.get" => ok_response(&req.id, {
             let agent_id_raw = req
                 .params
@@ -9183,16 +22421,42 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .and_then(|v| v.as_str())
                 .unwrap_or(crate::openclaw_paths::DEFAULT_AGENT_ID);
             let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id_raw);
-            let name = if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
-                "drbot".to_string()
-            } else {
-                agent_id.clone()
-            };
-            let avatar = name.chars().next().map(|c| c.to_string());
+            let agents_file = load_openclaw_agents_file(&ctx.state);
+            let cfg = agents_file
+                .agents
+                .into_iter()
+                .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id);
+            let name = cfg
+                .as_ref()
+                .map(|c| c.name.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                        "drbot".to_string()
+                    } else {
+                        agent_id.clone()
+                    }
+                });
+            let avatar = cfg
+                .as_ref()
+                .and_then(|c| c.avatar.as_deref())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| name.chars().next().map(|c| c.to_string()));
+            let emoji = cfg
+                .as_ref()
+                .and_then(|c| c.emoji.as_deref())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             json!({
                 "agentId": agent_id,
                 "name": name,
                 "avatar": avatar,
+                "emoji": emoji,
+                "runtimeShell": resolve_runtime_shell(),
             })
         }),
         "agents.files.list" => {
@@ -9205,11 +22469,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .trim();
             ok_response(
                 &req.id,
-                handle_agents_files_list(if agent_id.is_empty() {
-                    "default"
-                } else {
-                    agent_id
-                })
+                handle_agents_files_list(
+                    &ctx.state,
+                    if agent_id.is_empty() {
+                        "default"
+                    } else {
+                        agent_id
+                    },
+                )
                 .await,
             )
         }
@@ -9239,6 +22506,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             }
             match handle_agents_files_get(
+                &ctx.state,
                 if agent_id.is_empty() {
                     "default"
                 } else {
@@ -9289,6 +22557,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             }
             match handle_agents_files_set(
+                &ctx.state,
                 if agent_id.is_empty() {
                     "default"
                 } else {
@@ -9321,7 +22590,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             } else {
                 agent_id
             };
-            let workspace = crate::openclaw_paths::resolve_agent_workspace_dir(agent_id);
+            let workspace = resolve_agent_workspace_dir_for_state(&ctx.state, agent_id);
 
             // Best-effort: if remote skills were enabled via skills.update/env, fetch them so
             // they appear in the Skills UI without waiting for a heartbeat.
@@ -9346,8 +22615,12 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             ok_response(&req.id, payload)
         }
         "skills.bins" => {
-            let workspace_dirs = crate::openclaw_paths::list_agent_workspace_dirs();
-            let bins = crate::openclaw_skills::collect_skill_bins(&workspace_dirs, ctx.state.config());
+            let workspace_dirs = list_agent_ids_for_state(&ctx.state)
+                .into_iter()
+                .map(|id| resolve_agent_workspace_dir_for_state(&ctx.state, &id))
+                .collect::<Vec<_>>();
+            let bins =
+                crate::openclaw_skills::collect_skill_bins(&workspace_dirs, ctx.state.config());
             ok_response(&req.id, json!({ "bins": bins }))
         }
         "skills.install" => {
@@ -9383,7 +22656,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            let workspace = crate::openclaw_paths::resolve_agent_workspace_dir("default");
+            let workspace = resolve_agent_workspace_dir_for_state(&ctx.state, "default");
 
             let plan = match crate::openclaw_skills::resolve_skill_install_plan(
                 ctx.state.config(),
@@ -9393,9 +22666,8 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             ) {
                 Ok(p) => p,
                 Err(result) => {
-                    let payload = serde_json::to_value(&result).unwrap_or_else(|_| {
-                        json!({ "ok": result.ok, "message": &result.message })
-                    });
+                    let payload = serde_json::to_value(&result)
+                        .unwrap_or_else(|_| json!({ "ok": result.ok, "message": &result.message }));
                     return GatewayFrame::Res(ResponseFrame {
                         id: req.id,
                         ok: false,
@@ -9412,27 +22684,23 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let needs_remote = !installer_os.is_empty()
-                && !installer_os.iter().any(|os| os == &gateway_platform);
+            let needs_remote =
+                !installer_os.is_empty() && !installer_os.iter().any(|os| os == &gateway_platform);
 
             let result = if needs_remote {
-                let node_id = match select_install_node_for_plan(
-                    &ctx.state,
-                    &plan,
-                    node_id.as_deref(),
-                )
-                .await
-                {
-                    Ok(id) => id,
-                    Err(err) => {
-                        return GatewayFrame::Res(ResponseFrame {
-                            id: req.id,
-                            ok: false,
-                            payload: None,
-                            error: Some(err),
-                        });
-                    }
-                };
+                let node_id =
+                    match select_install_node_for_plan(&ctx.state, &plan, node_id.as_deref()).await
+                    {
+                        Ok(id) => id,
+                        Err(err) => {
+                            return GatewayFrame::Res(ResponseFrame {
+                                id: req.id,
+                                ok: false,
+                                payload: None,
+                                error: Some(err),
+                            });
+                        }
+                    };
 
                 let timeout_ms = timeout_ms.unwrap_or(300_000).clamp(1_000, 900_000);
                 let result =
@@ -9441,8 +22709,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     let st = ctx.state.clone();
                     let node_id_clone = node_id.clone();
                     tokio::spawn(async move {
-                        refresh_remote_node_bins_best_effort(st.clone(), node_id_clone, true)
-                            .await;
+                        refresh_remote_node_bins_best_effort(st.clone(), node_id_clone, true).await;
                         refresh_remote_bins_for_connected_nodes_best_effort(st, true).await;
                     });
                 }
@@ -9506,11 +22773,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .get("fetchRelativeDocs")
                 .and_then(|v| v.as_bool())
                 .or_else(|| params.get("fetch_relative_docs").and_then(|v| v.as_bool()));
-            let extra_docs = params.get("extraDocs").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<String>>()
-            });
+            let extra_docs = params
+                .get("extraDocs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                });
             let heartbeat_url = params
                 .get("heartbeatUrl")
                 .and_then(|v| v.as_str())
@@ -9613,8 +22883,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or(false);
 
             let method_upper = method.trim().to_uppercase();
-            let is_write =
-                matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+            let is_write = matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
             let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_COLOSSEUM_WRITE")
                 .ok()
                 .as_deref()
@@ -9703,8 +22972,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or(false);
 
             let method_upper = method.trim().to_uppercase();
-            let is_write =
-                matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+            let is_write = matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
             let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE")
                 .ok()
                 .as_deref()
@@ -9772,280 +23040,426 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
         }
         "moltbook.post" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let submolt = params.get("submolt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let title = params
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let content = params
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let submolt = params
+                .get("submolt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if title.is_empty() || content.is_empty() || submolt.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "title, content, and submolt are required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "title, content, and submolt are required",
+                    None,
+                );
             }
 
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if !dry_run && !allow_write_by_env {
-                let approval = ExecApprovalRequestPayload {
-                    command: format!("moltbook.post in s/{}", submolt),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some(format!("Allow creating a Moltbook post in s/{}?", submolt)),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some("https://www.moltbook.com/api/v1/posts".to_string()),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.post", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
-                }
-                allow_write = true;
-            }
+            let allow_write = match moltbook_write_gate(
+                &ctx.state,
+                &req.id,
+                "moltbook.post",
+                &format!("moltbook.post in s/{}", submolt),
+                &format!("Allow creating a Moltbook post in s/{}?", submolt),
+                "https://www.moltbook.com/api/v1/posts",
+                dry_run,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(frame) => return frame,
+            };
 
-            match crate::moltbook::moltbook_create_post(&title, &content, &submolt, dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_create_post(
+                    &title,
+                    &content,
+                    &submolt,
+                    dry_run,
+                    allow_write,
+                )
+                .await,
+            )
         }
         "moltbook.feed" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let sort = params.get("sort").and_then(|v| v.as_str()).unwrap_or("hot").trim().to_string();
-            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25).max(1).min(50);
-            let submolt = params.get("submolt").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let sort = params
+                .get("sort")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hot")
+                .trim()
+                .to_string();
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(25)
+                .max(1)
+                .min(50);
+            let submolt = params
+                .get("submolt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
 
-            match crate::moltbook::moltbook_get_feed(&sort, limit, submolt.as_deref()).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_get_feed(&sort, limit, submolt.as_deref()).await,
+            )
         }
         "moltbook.comment" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let post_id = params.get("postId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let parent_id = params.get("parentId").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let post_id = params
+                .get("postId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let content = params
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let parent_id = params
+                .get("parentId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if post_id.is_empty() || content.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "postId and content are required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "postId and content are required",
+                    None,
+                );
             }
 
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if !dry_run && !allow_write_by_env {
-                let approval = ExecApprovalRequestPayload {
-                    command: format!("moltbook.comment on post {}", post_id),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some(format!("Allow commenting on Moltbook post {}?", post_id)),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/posts/{}/comments", post_id)),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.comment", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
-                }
-                allow_write = true;
-            }
+            let allow_write = match moltbook_write_gate(
+                &ctx.state,
+                &req.id,
+                "moltbook.comment",
+                &format!("moltbook.comment on post {}", post_id),
+                &format!("Allow commenting on Moltbook post {}?", post_id),
+                &format!("https://www.moltbook.com/api/v1/posts/{}/comments", post_id),
+                dry_run,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(frame) => return frame,
+            };
 
-            match crate::moltbook::moltbook_create_comment(&post_id, &content, parent_id.as_deref(), dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_create_comment(
+                    &post_id,
+                    &content,
+                    parent_id.as_deref(),
+                    dry_run,
+                    allow_write,
+                )
+                .await,
+            )
         }
         "moltbook.vote" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let post_id = params.get("postId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let direction = params.get("direction").and_then(|v| v.as_str()).unwrap_or("up").trim().to_string();
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let post_id = params
+                .get("postId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let direction = params
+                .get("direction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("up")
+                .trim()
+                .to_string();
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if post_id.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "postId is required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "postId is required",
+                    None,
+                );
             }
 
-            let suffix = if direction == "down" { "downvote" } else { "upvote" };
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if !dry_run && !allow_write_by_env {
-                let approval = ExecApprovalRequestPayload {
-                    command: format!("moltbook.vote {} post {}", suffix, post_id),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some(format!("Allow {} Moltbook post {}?", suffix, post_id)),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/posts/{}/{}", post_id, suffix)),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.vote", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
-                }
-                allow_write = true;
-            }
+            let suffix = if direction == "down" {
+                "downvote"
+            } else {
+                "upvote"
+            };
+            let allow_write = match moltbook_write_gate(
+                &ctx.state,
+                &req.id,
+                "moltbook.vote",
+                &format!("moltbook.vote {} post {}", suffix, post_id),
+                &format!("Allow {} Moltbook post {}?", suffix, post_id),
+                &format!(
+                    "https://www.moltbook.com/api/v1/posts/{}/{}",
+                    post_id, suffix
+                ),
+                dry_run,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(frame) => return frame,
+            };
 
-            match crate::moltbook::moltbook_vote(&post_id, &direction, dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_vote(&post_id, &direction, dry_run, allow_write).await,
+            )
         }
         "moltbook.identity" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("profile").trim().to_string();
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let action = params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("profile")
+                .trim()
+                .to_string();
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            let is_write = action == "token";
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if is_write && !dry_run && !allow_write_by_env {
-                let approval = ExecApprovalRequestPayload {
-                    command: "moltbook.identity token".to_string(),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some("Allow generating a Moltbook identity token?".to_string()),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some("https://www.moltbook.com/api/v1/agents/me/identity-token".to_string()),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.identity", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+            // Only the "token" action is a write; profile/status are read-only.
+            let allow_write = if action == "token" {
+                match moltbook_write_gate(
+                    &ctx.state,
+                    &req.id,
+                    "moltbook.identity",
+                    "moltbook.identity token",
+                    "Allow generating a Moltbook identity token?",
+                    "https://www.moltbook.com/api/v1/agents/me/identity-token",
+                    dry_run,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(frame) => return frame,
                 }
-                allow_write = true;
-            }
+            } else {
+                false
+            };
 
-            match crate::moltbook::moltbook_get_identity(&action, dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_get_identity(&action, dry_run, allow_write).await,
+            )
         }
         "moltbook.search" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let query_str = params.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25).max(1).min(50);
+            let query_str = params
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(25)
+                .max(1)
+                .min(50);
 
             if query_str.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "query is required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "query is required",
+                    None,
+                );
             }
 
-            match crate::moltbook::moltbook_search(&query_str, limit).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_search(&query_str, limit).await,
+            )
         }
         "moltbook.follow" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let agent = params.get("agent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let unfollow = params.get("unfollow").and_then(|v| v.as_bool()).unwrap_or(false);
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let agent = params
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let unfollow = params
+                .get("unfollow")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if agent.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "agent is required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "agent is required",
+                    None,
+                );
             }
 
             let action_label = if unfollow { "unfollow" } else { "follow" };
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if !dry_run && !allow_write_by_env {
-                let approval = ExecApprovalRequestPayload {
-                    command: format!("moltbook.follow {} {}", action_label, agent),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some(format!("Allow {} Moltbook agent {}?", action_label, agent)),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/agents/{}/follow", agent)),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.follow", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
-                }
-                allow_write = true;
-            }
+            let allow_write = match moltbook_write_gate(
+                &ctx.state,
+                &req.id,
+                "moltbook.follow",
+                &format!("moltbook.follow {} {}", action_label, agent),
+                &format!("Allow {} Moltbook agent {}?", action_label, agent),
+                &format!("https://www.moltbook.com/api/v1/agents/{}/follow", agent),
+                dry_run,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(frame) => return frame,
+            };
 
-            match crate::moltbook::moltbook_follow(&agent, unfollow, dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_follow(&agent, unfollow, dry_run, allow_write).await,
+            )
         }
         "moltbook.subscribe" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let submolt = params.get("submolt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let unsubscribe = params.get("unsubscribe").and_then(|v| v.as_bool()).unwrap_or(false);
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let submolt = params
+                .get("submolt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let unsubscribe = params
+                .get("unsubscribe")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if submolt.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "submolt is required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "submolt is required",
+                    None,
+                );
             }
 
-            let action_label = if unsubscribe { "unsubscribe" } else { "subscribe" };
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if !dry_run && !allow_write_by_env {
-                let approval = ExecApprovalRequestPayload {
-                    command: format!("moltbook.subscribe {} s/{}", action_label, submolt),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some(format!("Allow {} Moltbook submolt s/{}?", action_label, submolt)),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some(format!("https://www.moltbook.com/api/v1/submolts/{}/subscribe", submolt)),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.subscribe", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
-                }
-                allow_write = true;
-            }
+            let action_label = if unsubscribe {
+                "unsubscribe"
+            } else {
+                "subscribe"
+            };
+            let allow_write = match moltbook_write_gate(
+                &ctx.state,
+                &req.id,
+                "moltbook.subscribe",
+                &format!("moltbook.subscribe {} s/{}", action_label, submolt),
+                &format!("Allow {} Moltbook submolt s/{}?", action_label, submolt),
+                &format!(
+                    "https://www.moltbook.com/api/v1/submolts/{}/subscribe",
+                    submolt
+                ),
+                dry_run,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(frame) => return frame,
+            };
 
-            match crate::moltbook::moltbook_subscribe(&submolt, unsubscribe, dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_subscribe(&submolt, unsubscribe, dry_run, allow_write)
+                    .await,
+            )
         }
         "moltbook.dm" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("check").trim().to_string();
-            let to = params.get("to").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let message = params.get("message").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let action = params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("check")
+                .trim()
+                .to_string();
+            let to = params
+                .get("to")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let message = params
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            let is_write = action == "send";
-            let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE").ok().as_deref() == Some("1");
-            let mut allow_write = allow_write_by_env;
-            if is_write && !dry_run && !allow_write_by_env {
+            // Only the "send" action is a write; "check" is read-only.
+            let allow_write = if action == "send" {
                 let to_label = to.as_deref().unwrap_or("?");
-                let approval = ExecApprovalRequestPayload {
-                    command: format!("moltbook.dm send to {}", to_label),
-                    cwd: None,
-                    host: Some("moltbook".to_string()),
-                    security: Some("integration-http-write".to_string()),
-                    ask: Some(format!("Allow sending a Moltbook DM to {}?", to_label)),
-                    agent_id: Some("default".to_string()),
-                    resolved_path: Some("https://www.moltbook.com/api/v1/agents/dm/send".to_string()),
-                    session_key: None,
-                };
-                if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                    &ctx.state, "moltbook.dm", approval, 120_000,
-                ).await {
-                    return GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) });
+                match moltbook_write_gate(
+                    &ctx.state,
+                    &req.id,
+                    "moltbook.dm",
+                    &format!("moltbook.dm send to {}", to_label),
+                    &format!("Allow sending a Moltbook DM to {}?", to_label),
+                    "https://www.moltbook.com/api/v1/agents/dm/send",
+                    dry_run,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(frame) => return frame,
                 }
-                allow_write = true;
-            }
+            } else {
+                false
+            };
 
-            match crate::moltbook::moltbook_dm(&action, to.as_deref(), message.as_deref(), dry_run, allow_write).await {
-                Ok(payload) => ok_response(&req.id, payload),
-                Err(err) => GatewayFrame::Res(ResponseFrame { id: req.id, ok: false, payload: None, error: Some(err) }),
-            }
+            moltbook_dispatch_result(
+                &req.id,
+                crate::moltbook::moltbook_dm(
+                    &action,
+                    to.as_deref(),
+                    message.as_deref(),
+                    dry_run,
+                    allow_write,
+                )
+                .await,
+            )
         }
         "browser.request" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
@@ -10111,6 +23525,19 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let account_id = params
+                .get("accountId")
+                .or_else(|| params.get("account_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".to_string());
+            let reply_to = params
+                .get("replyTo")
+                .or_else(|| params.get("reply_to"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let media_url = params
                 .get("mediaUrl")
                 .and_then(|v| v.as_str())
@@ -10131,7 +23558,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let idem = params
                 .get("idempotencyKey")
                 .and_then(|v| v.as_str())
@@ -10164,6 +23594,30 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     };
                     Some(mapped)
                 };
+
+                let canonical_session_key_from_param = session_key.as_deref().map(|raw| {
+                    canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, raw)
+                });
+                let agent_id_for_policy = canonical_session_key_from_param
+                    .as_deref()
+                    .map(|key| {
+                        openclaw_session_key_agent_id(key, crate::openclaw_paths::DEFAULT_AGENT_ID)
+                    })
+                    .unwrap_or_else(|| crate::openclaw_paths::DEFAULT_AGENT_ID.to_string());
+                let mut effective_session_key = canonical_session_key_from_param.clone();
+                let mut send_policy = canonical_session_key_from_param
+                    .as_deref()
+                    .map(|key| resolve_openclaw_session_send_policy_mode(&state, key))
+                    .unwrap_or(OpenclawSendPolicyMode::Ask);
+                if !dry_run && matches!(send_policy, OpenclawSendPolicyMode::Deny) {
+                    let err = ErrorShape::new(error_codes::FORBIDDEN, "send blocked by sendPolicy");
+                    return OpenclawDedupeEntry {
+                        ts: now_ms(),
+                        ok: false,
+                        payload: None,
+                        error: Some(err),
+                    };
+                }
 
                 if !channel.is_empty() {
                     let normalized = normalize_channel(&channel).unwrap_or_default();
@@ -10215,6 +23669,34 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     };
                 }
 
+                if let Some((left, right)) = to.split_once(':') {
+                    if left.eq_ignore_ascii_case(channel.as_str()) {
+                        to = right.trim().to_string();
+                    }
+                }
+                to = strip_openclaw_chat_type_prefix(&to).to_string();
+
+                let derived_to_for_session = derive_openclaw_group_aware_channel_id(&channel, &to);
+
+                if effective_session_key.is_none() {
+                    let fallback_key = canonicalize_openclaw_session_key(
+                        crate::openclaw_paths::DEFAULT_AGENT_ID,
+                        &format!("{}:{}", channel, derived_to_for_session),
+                    );
+                    send_policy = resolve_openclaw_session_send_policy_mode(&state, &fallback_key);
+                    effective_session_key = Some(fallback_key);
+                    if !dry_run && matches!(send_policy, OpenclawSendPolicyMode::Deny) {
+                        let err =
+                            ErrorShape::new(error_codes::FORBIDDEN, "send blocked by sendPolicy");
+                        return OpenclawDedupeEntry {
+                            ts: now_ms(),
+                            ok: false,
+                            payload: None,
+                            error: Some(err),
+                        };
+                    }
+                }
+
                 // Avoid blocking on exec approvals when the channel is not usable anyway.
                 if !dry_run {
                     if !state.channel_manager().is_enabled(&channel) {
@@ -10263,11 +23745,23 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }
                 message = message.trim().to_string();
 
-                let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_SEND_WRITE")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
-                if !dry_run && !allow_write_by_env {
+                message = strip_openclaw_media_path_lines(&message).into_owned();
+                message = message.trim().to_string();
+
+                message = apply_openclaw_outbound_response_prefix(
+                    &state,
+                    &agent_id_for_policy,
+                    Some(&channel),
+                    Some(&account_id),
+                    &message,
+                );
+
+                let allow_write_by_env =
+                    std::env::var("DRBOT_OPENCLAW_SEND_WRITE").ok().as_deref() == Some("1");
+                if !dry_run
+                    && !allow_write_by_env
+                    && matches!(send_policy, OpenclawSendPolicyMode::Ask)
+                {
                     let approval = ExecApprovalRequestPayload {
                         command: format!("send {} {}", channel, to),
                         cwd: None,
@@ -10277,15 +23771,12 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                             "Allow sending an outbound message via {} to {}?",
                             channel, to
                         )),
-                        agent_id: Some("default".to_string()),
+                        agent_id: Some(agent_id_for_policy.clone()),
                         resolved_path: None,
-                        session_key: session_key.clone(),
+                        session_key: effective_session_key.clone(),
                     };
                     if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                        &state,
-                        "send",
-                        approval,
-                        120_000,
+                        &state, "send", approval, 120_000,
                     )
                     .await
                     {
@@ -10298,7 +23789,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     }
                 }
 
-                let outgoing = OutgoingMessage::text(message.clone());
+                let mut outgoing = OutgoingMessage::text(message.clone());
+                if let Some(reply_to) = reply_to.as_deref() {
+                    outgoing = outgoing.reply_to(reply_to);
+                }
                 let send_res = if dry_run {
                     Ok(())
                 } else {
@@ -10317,20 +23811,33 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
 
                         // Best-effort: mirror to session transcript for inspection via sessions.preview.
                         if let Some(store) = state.session_store() {
-                            let user_id =
-                                Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-                            let mirror_key = session_key
-                                .clone()
-                                .unwrap_or_else(|| format!("{}:{}", channel, to));
-                            let mut session = store
-                                .get_by_channel("openclaw", &mirror_key)
+                            let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
+                            let session = if let Some(raw_session_key) = session_key.as_deref() {
+                                let (canonical_key, candidates) =
+                                    openclaw_session_store_key_candidates(
+                                        crate::openclaw_paths::DEFAULT_AGENT_ID,
+                                        raw_session_key,
+                                    );
+                                get_or_create_openclaw_session(
+                                    store,
+                                    user_id,
+                                    &canonical_key,
+                                    &candidates,
+                                )
                                 .await
-                                .ok()
-                                .flatten();
-                            if session.is_none() {
-                                let (ct, cid) = session_key_to_channel(&mirror_key);
-                                session = store.get_or_create(user_id, &ct, &cid).await.ok();
-                            }
+                            } else {
+                                let mirror_key = format!("{}:{}", channel, derived_to_for_session);
+                                let mut session = store
+                                    .get_by_channel("openclaw", &mirror_key)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                if session.is_none() {
+                                    let (ct, cid) = session_key_to_channel(&mirror_key);
+                                    session = store.get_or_create(user_id, &ct, &cid).await.ok();
+                                }
+                                session
+                            };
                             if let Some(mut s) = session {
                                 s.add_message(Message::assistant(&message));
                                 s.update_timestamp();
@@ -10385,6 +23892,13 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let account_id = params
+                .get("accountId")
+                .or_else(|| params.get("account_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".to_string());
             let question = params
                 .get("question")
                 .and_then(|v| v.as_str())
@@ -10398,7 +23912,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or_default();
             let max_selections = params.get("maxSelections").and_then(|v| v.as_u64());
             let duration_hours = params.get("durationHours").and_then(|v| v.as_u64());
-            let dry_run = params.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            let dry_run = params
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let idem = params
                 .get("idempotencyKey")
                 .and_then(|v| v.as_str())
@@ -10467,11 +23984,35 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     }
                 }
 
+                if let Some((left, right)) = to.split_once(':') {
+                    if left.eq_ignore_ascii_case(channel.as_str()) {
+                        to = right.trim().to_string();
+                    }
+                }
+                to = strip_openclaw_chat_type_prefix(&to).to_string();
+
                 if !state.channel_manager().has_channel(&channel) {
                     let err = ErrorShape::new(
                         error_codes::INVALID_REQUEST,
                         format!("unsupported poll channel: {}", channel),
                     );
+                    return OpenclawDedupeEntry {
+                        ts: now_ms(),
+                        ok: false,
+                        payload: None,
+                        error: Some(err),
+                    };
+                }
+
+                let derived_to_for_session = derive_openclaw_group_aware_channel_id(&channel, &to);
+                let policy_session_key = canonicalize_openclaw_session_key(
+                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                    &format!("{}:{}", channel, derived_to_for_session),
+                );
+                let send_policy =
+                    resolve_openclaw_session_send_policy_mode(&state, &policy_session_key);
+                if !dry_run && matches!(send_policy, OpenclawSendPolicyMode::Deny) {
+                    let err = ErrorShape::new(error_codes::FORBIDDEN, "poll blocked by sendPolicy");
                     return OpenclawDedupeEntry {
                         ts: now_ms(),
                         ok: false,
@@ -10525,11 +24066,17 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 text.push_str("\n");
                 text.push_str(reply_hint);
 
-                let allow_write_by_env = std::env::var("DRBOT_OPENCLAW_SEND_WRITE")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
-                if !dry_run && !allow_write_by_env {
+                let agent_id_for_policy = openclaw_session_key_agent_id(
+                    &policy_session_key,
+                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                );
+
+                let allow_write_by_env =
+                    std::env::var("DRBOT_OPENCLAW_SEND_WRITE").ok().as_deref() == Some("1");
+                if !dry_run
+                    && !allow_write_by_env
+                    && matches!(send_policy, OpenclawSendPolicyMode::Ask)
+                {
                     let approval = ExecApprovalRequestPayload {
                         command: format!("poll {} {}", channel, to),
                         cwd: None,
@@ -10539,15 +24086,12 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                             "Allow sending an outbound poll via {} to {}?",
                             channel, to
                         )),
-                        agent_id: Some("default".to_string()),
+                        agent_id: Some(agent_id_for_policy.clone()),
                         resolved_path: None,
-                        session_key: Some(format!("{}:{}", channel, to)),
+                        session_key: Some(policy_session_key.clone()),
                     };
                     if let Err(err) = crate::openclaw_exec_approvals::ensure_tool_write_allowed(
-                        &state,
-                        "poll",
-                        approval,
-                        120_000,
+                        &state, "poll", approval, 120_000,
                     )
                     .await
                     {
@@ -10559,6 +24103,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                         };
                     }
                 }
+
+                text = apply_openclaw_outbound_response_prefix(
+                    &state,
+                    &agent_id_for_policy,
+                    Some(&channel),
+                    Some(&account_id),
+                    &text,
+                );
 
                 let outgoing = OutgoingMessage::text(text);
                 let send_res = if dry_run {
@@ -11054,21 +24606,17 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             let dedupe_key = format!("node.invoke:{}:{}", node_id, idempotency_key);
             let params_json = params.get("params").map(|v| v.to_string());
             let entry = openclaw_idempotent_run(&dedupe_key, || async move {
-                let node_client = state
-                    .list_openclaw_clients()
-                    .await
-                    .into_iter()
-                    .find(|c| {
-                        if c.role != "node" {
-                            return false;
-                        }
-                        let id = c
-                            .device_id
-                            .clone()
-                            .or(c.instance_id.clone())
-                            .unwrap_or_else(|| c.conn_id.clone());
-                        id == node_id
-                    });
+                let node_client = state.list_openclaw_clients().await.into_iter().find(|c| {
+                    if c.role != "node" {
+                        return false;
+                    }
+                    let id = c
+                        .device_id
+                        .clone()
+                        .or(c.instance_id.clone())
+                        .unwrap_or_else(|| c.conn_id.clone());
+                    id == node_id
+                });
                 let Some(node_client) = node_client else {
                     let err = ErrorShape::new(error_codes::UNAVAILABLE, "node not connected")
                         .with_details(json!({ "code": "NOT_CONNECTED" }));
@@ -11095,8 +24643,9 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 };
 
                 if let Some(reason) = allowed_reason {
-                    let err = ErrorShape::new(error_codes::INVALID_REQUEST, "node command not allowed")
-                        .with_details(json!({ "reason": reason, "command": command }));
+                    let err =
+                        ErrorShape::new(error_codes::INVALID_REQUEST, "node command not allowed")
+                            .with_details(json!({ "reason": reason, "command": command }));
                     return OpenclawDedupeEntry {
                         ts: now_ms(),
                         ok: false,
@@ -11129,8 +24678,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 )
                 .await;
 
-                let wait =
-                    tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), rx).await;
+                let wait = tokio::time::timeout(Duration::from_millis(timeout_ms.max(1)), rx).await;
                 let result = match wait {
                     Ok(Ok(r)) => r,
                     Ok(Err(_)) => NodeInvokeResult {
@@ -11329,7 +24877,13 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     .and_then(|v| v.get("triggers"))
                     .and_then(|v| v.as_array())
                 {
-                    if let Ok(payload) = handle_voicewake_set(&ctx.state, triggers).await {
+                    let language = payload.as_ref().and_then(|v| {
+                        v.get("language")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| v.get("locale").and_then(|v| v.as_str()))
+                    });
+                    if let Ok(payload) = handle_voicewake_set(&ctx.state, triggers, language).await
+                    {
                         broadcast_openclaw_event(&ctx.state, "voicewake.changed", payload, None)
                             .await;
                     }
@@ -11541,7 +25095,12 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .trim()
                 .to_string();
             if text.is_empty() {
-                return error_response(&req.id, error_codes::INVALID_REQUEST, "text required", None);
+                return error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "text required",
+                    None,
+                );
             }
 
             let session_key = "main";
@@ -11599,9 +25158,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                         .get("modelIdentifier")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
-                    last_input_seconds: params
-                        .get("lastInputSeconds")
-                        .and_then(|v| v.as_u64()),
+                    last_input_seconds: params.get("lastInputSeconds").and_then(|v| v.as_u64()),
                     mode: params
                         .get("mode")
                         .and_then(|v| v.as_str())
@@ -11631,11 +25188,8 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 let version_changed = changed.contains("version");
                 let mode_changed = changed.contains("mode");
                 let reason_changed = changed.contains("reason") && !ignore_reason;
-                let has_changes = host_changed
-                    || ip_changed
-                    || version_changed
-                    || mode_changed
-                    || reason_changed;
+                let has_changes =
+                    host_changed || ip_changed || version_changed || mode_changed || reason_changed;
 
                 if has_changes {
                     let context_changed = ctx
@@ -11648,8 +25202,11 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
 
                     let mut parts: Vec<String> = Vec::new();
                     if context_changed || host_changed || ip_changed {
-                        let host_label =
-                            presence_update.next.host.clone().unwrap_or_else(|| "Unknown".to_string());
+                        let host_label = presence_update
+                            .next
+                            .host
+                            .clone()
+                            .unwrap_or_else(|| "Unknown".to_string());
                         let ip_label = presence_update.next.ip.clone();
                         let node = if let Some(ip) = ip_label.as_deref() {
                             format!("Node: {} ({})", host_label.trim(), ip.trim())
@@ -11757,8 +25314,13 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             };
+            let language = req.params.as_ref().and_then(|v| {
+                v.get("language")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| v.get("locale").and_then(|v| v.as_str()))
+            });
 
-            match handle_voicewake_set(&ctx.state, triggers).await {
+            match handle_voicewake_set(&ctx.state, triggers, language).await {
                 Ok(payload) => {
                     broadcast_openclaw_event(
                         &ctx.state,
@@ -11873,22 +25435,47 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             }
         }
         "wizard.start" => {
+            if let Some(params) = req.params.as_ref() {
+                if !params.is_object() {
+                    return error_response(
+                        &req.id,
+                        error_codes::INVALID_REQUEST,
+                        "invalid wizard.start params: expected object",
+                        None,
+                    );
+                }
+            }
+
+            // OpenClaw parity: only one wizard session at a time.
+            {
+                let sessions = ctx.wizard_sessions.lock().await;
+                if sessions
+                    .values()
+                    .any(|s| s.status == WizardSessionStatus::Running)
+                {
+                    return error_response(
+                        &req.id,
+                        error_codes::UNAVAILABLE,
+                        "wizard already running",
+                        None,
+                    );
+                }
+            }
+
+            let snapshot = handle_config_get(&ctx.state).await;
             let session_id = Uuid::new_v4().to_string();
-            let step = json!({
-                "id": "drbot-wizard-info",
-                "type": "note",
-                "title": "drbot",
-                "message": "Wizard is not implemented in drbot's OpenClaw gateway yet. Use Config tab (config.get/config.set).",
-                "executor": "gateway"
+            let session = wizard_session_from_config_snapshot(&snapshot);
+            let payload = json!({
+                "sessionId": session_id,
+                "done": false,
+                "step": session.current_step,
+                "status": session.status.as_str(),
             });
             ctx.wizard_sessions
                 .lock()
                 .await
-                .insert(session_id.clone(), WizardSessionState { step: 0 });
-            ok_response(
-                &req.id,
-                json!({ "sessionId": session_id, "done": false, "step": step, "status": "running" }),
-            )
+                .insert(session_id.clone(), session);
+            ok_response(&req.id, payload)
         }
         "wizard.next" => {
             let session_id = req
@@ -11907,16 +25494,89 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
-            let mut sessions = ctx.wizard_sessions.lock().await;
-            if sessions.remove(&session_id).is_none() {
+            let answer = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("answer"))
+                .and_then(|v| v.as_object())
+                .cloned();
+            let (answer_step_id, answer_value) = if let Some(answer) = answer.as_ref() {
+                let step_id = answer
+                    .get("stepId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if step_id.is_empty() {
+                    return error_response(
+                        &req.id,
+                        error_codes::INVALID_REQUEST,
+                        "invalid wizard.next params: answer.stepId required",
+                        None,
+                    );
+                }
+                let value = answer
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                (Some(step_id), Some(value))
+            } else {
+                (None, None)
+            };
+
+            // Remove the session while we mutate so we don't hold the mutex across awaits.
+            let mut session = {
+                let mut sessions = ctx.wizard_sessions.lock().await;
+                sessions.remove(&session_id)
+            };
+            let Some(mut session) = session.take() else {
                 return error_response(
                     &req.id,
                     error_codes::INVALID_REQUEST,
                     "wizard not found",
                     None,
                 );
+            };
+
+            if let (Some(step_id), Some(value)) = (answer_step_id, answer_value) {
+                if let Err(err) =
+                    wizard_apply_answer_and_advance(&ctx.state, &mut session, &step_id, value).await
+                {
+                    // Reinsert session unchanged so the client can retry.
+                    ctx.wizard_sessions
+                        .lock()
+                        .await
+                        .insert(session_id.clone(), session);
+                    return GatewayFrame::Res(ResponseFrame {
+                        id: req.id,
+                        ok: false,
+                        payload: None,
+                        error: Some(err),
+                    });
+                }
             }
-            ok_response(&req.id, json!({ "done": true, "status": "done" }))
+
+            if session.status == WizardSessionStatus::Running {
+                // Keep session alive.
+                let payload = json!({
+                    "done": false,
+                    "step": session.current_step.clone(),
+                    "status": session.status.as_str(),
+                });
+                ctx.wizard_sessions
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), session);
+                ok_response(&req.id, payload)
+            } else {
+                // Completed/errored sessions are one-shot and should be purged.
+                let payload = json!({
+                    "done": true,
+                    "status": session.status.as_str(),
+                    "error": session.error,
+                });
+                ok_response(&req.id, payload)
+            }
         }
         "wizard.cancel" => {
             let session_id = req
@@ -11935,8 +25595,11 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
-            let mut sessions = ctx.wizard_sessions.lock().await;
-            if sessions.remove(&session_id).is_none() {
+            let session = {
+                let mut sessions = ctx.wizard_sessions.lock().await;
+                sessions.remove(&session_id)
+            };
+            if session.is_none() {
                 return error_response(
                     &req.id,
                     error_codes::INVALID_REQUEST,
@@ -11944,7 +25607,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
-            ok_response(&req.id, json!({ "status": "cancelled" }))
+            ok_response(
+                &req.id,
+                json!({ "status": "cancelled", "error": "cancelled" }),
+            )
         }
         "wizard.status" => {
             let session_id = req
@@ -11964,24 +25630,34 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             }
             let sessions = ctx.wizard_sessions.lock().await;
-            if !sessions.contains_key(&session_id) {
+            let Some(session) = sessions.get(&session_id) else {
                 return error_response(
                     &req.id,
                     error_codes::INVALID_REQUEST,
                     "wizard not found",
                     None,
                 );
-            }
-            ok_response(&req.id, json!({ "status": "running" }))
+            };
+            ok_response(
+                &req.id,
+                json!({ "status": session.status.as_str(), "error": session.error }),
+            )
         }
         "system-presence" => ok_response(
             &req.id,
             json!(list_system_presence(&ctx.state, "gateway").await),
         ),
-        "channels.status" => ok_response(
-            &req.id,
-            build_channels_snapshot(now_ms(), &ctx.state).await,
-        ),
+        "channels.status" => {
+            let params = req.params.clone().unwrap_or_else(|| json!({}));
+            let probe = params
+                .get("probe")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            ok_response(
+                &req.id,
+                build_channels_snapshot(now_ms(), &ctx.state, probe).await,
+            )
+        }
         "channels.logout" => {
             let channel = req
                 .params
@@ -12000,23 +25676,102 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             }
             let normalized = channel.to_lowercase();
-            if normalized == "whatsapp" {
-                // WhatsApp bridge disconnect performs an actual logout.
-                let _ = ctx.state.channel_manager().stop_channel("whatsapp").await;
-                ctx.state.openclaw_web_login().reset_whatsapp();
-                ok_response(&req.id, json!({ "cleared": true, "loggedOut": true }))
-            } else {
-                error_response(
+            match normalized.as_str() {
+                "whatsapp" => {
+                    // WhatsApp bridge disconnect performs an actual logout.
+                    let _ = ctx.state.channel_manager().stop_channel("whatsapp").await;
+                    ctx.state.openclaw_web_login().reset_whatsapp();
+                    ok_response(
+                        &req.id,
+                        json!({ "channel": "whatsapp", "accountId": "default", "cleared": true, "loggedOut": true }),
+                    )
+                }
+                "telegram" => {
+                    let cfg_path = resolve_config_path_for_read();
+                    let cfg_exists = cfg_path.exists();
+                    let cfg_raw = if cfg_exists {
+                        std::fs::read_to_string(&cfg_path).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let cfg_hash = if cfg_exists {
+                        Some(compute_openclaw_config_hash_for_state(
+                            &ctx.state, cfg_exists, &cfg_raw,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let env_token = std::env::var("TELEGRAM_BOT_TOKEN")
+                        .ok()
+                        .is_some_and(|v| !v.trim().is_empty());
+
+                    let mut had_token = false;
+                    if cfg_exists {
+                        let cfg: drbot_core::Config = match toml::from_str(&cfg_raw) {
+                            Ok(cfg) => cfg,
+                            Err(_) => {
+                                return error_response(
+                                    &req.id,
+                                    error_codes::INVALID_REQUEST,
+                                    "invalid config; fix it before logging out",
+                                    None,
+                                );
+                            }
+                        };
+                        had_token = cfg.channels.telegram.as_ref().is_some_and(|c| {
+                            let token = c.bot_token.trim();
+                            !token.is_empty() && token != CONFIG_SECRET_PLACEHOLDER
+                        });
+                    }
+
+                    // Always stop the runtime; only patch the config file when there's something to clear.
+                    let _ = ctx.state.channel_manager().logout_channel("telegram").await;
+
+                    if had_token && cfg_exists {
+                        let patch_raw = json!({
+                            "channels": {
+                                "telegram": { "bot_token": "" }
+                            }
+                        })
+                        .to_string();
+                        if let Err(err) =
+                            handle_config_patch(&ctx.state, &patch_raw, cfg_hash.as_deref()).await
+                        {
+                            return GatewayFrame::Res(ResponseFrame {
+                                id: req.id,
+                                ok: false,
+                                payload: None,
+                                error: Some(err),
+                            });
+                        }
+                    }
+
+                    ok_response(
+                        &req.id,
+                        json!({
+                            "channel": "telegram",
+                            "accountId": "default",
+                            "cleared": had_token,
+                            "envToken": env_token,
+                            "loggedOut": true
+                        }),
+                    )
+                }
+                _ => error_response(
                     &req.id,
                     error_codes::INVALID_REQUEST,
                     &format!("channel {} does not support logout", channel),
                     None,
-                )
+                ),
             }
         }
         "web.login.start" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let _force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            let _force = params
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let timeout_ms = params
                 .get("timeoutMs")
                 .and_then(|v| v.as_u64())
@@ -12211,8 +25966,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let include_global = params.get("includeGlobal").and_then(|v| v.as_bool()).unwrap_or(false);
-            let include_unknown = params.get("includeUnknown").and_then(|v| v.as_bool()).unwrap_or(false);
+            let include_global = params
+                .get("includeGlobal")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let include_unknown = params
+                .get("includeUnknown")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let has_key = !key.is_empty();
             let has_session_id = !session_id.is_empty();
@@ -12248,20 +26009,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             };
 
             if has_key {
-                let canonical_key = canonicalize_openclaw_session_key(
+                let (canonical_key, openclaw_candidates) = openclaw_session_store_key_candidates(
                     crate::openclaw_paths::DEFAULT_AGENT_ID,
                     &key,
                 );
                 let store_key = openclaw_session_key_to_store_key(&canonical_key);
-                let mut candidates: Vec<&str> = Vec::new();
-                candidates.push(store_key.as_str());
-                if store_key != key {
-                    candidates.push(key.as_str());
-                }
 
                 let mut found = false;
-                for candidate in candidates {
-                    // Try legacy "openclaw" first, then fall back to split keys.
+                for candidate in &openclaw_candidates {
                     match store.get_by_channel("openclaw", candidate).await {
                         Ok(Some(_)) => {
                             found = true;
@@ -12277,13 +26032,11 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                             );
                         }
                     }
-
-                    let (channel_type, channel_id) = session_key_to_channel(candidate);
+                }
+                if !found {
+                    let (channel_type, channel_id) = session_key_to_channel(&store_key);
                     match store.get_by_channel(&channel_type, &channel_id).await {
-                        Ok(Some(_)) => {
-                            found = true;
-                            break;
-                        }
+                        Ok(Some(_)) => found = true,
                         Ok(None) => {}
                         Err(e) => {
                             return error_response(
@@ -12454,7 +26207,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                                 }
                             }
 
-                            return ok_response(&req.id, json!({ "ok": true, "key": canonical_key }));
+                            return ok_response(
+                                &req.id,
+                                json!({ "ok": true, "key": canonical_key }),
+                            );
                         }
                         Ok(None) => {
                             return error_response(
@@ -12476,19 +26232,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }
 
                 // Treat sessionId as a key string.
-                let canonical_key = canonicalize_openclaw_session_key(
+                let (canonical_key, openclaw_candidates) = openclaw_session_store_key_candidates(
                     crate::openclaw_paths::DEFAULT_AGENT_ID,
                     &session_id,
                 );
                 let store_key = openclaw_session_key_to_store_key(&canonical_key);
-                let mut candidates: Vec<&str> = Vec::new();
-                candidates.push(store_key.as_str());
-                if store_key != session_id {
-                    candidates.push(session_id.as_str());
-                }
 
                 let mut found = false;
-                for candidate in candidates {
+                for candidate in &openclaw_candidates {
                     match store.get_by_channel("openclaw", candidate).await {
                         Ok(Some(_)) => {
                             found = true;
@@ -12504,13 +26255,11 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                             );
                         }
                     }
-
-                    let (channel_type, channel_id) = session_key_to_channel(candidate);
+                }
+                if !found {
+                    let (channel_type, channel_id) = session_key_to_channel(&store_key);
                     match store.get_by_channel(&channel_type, &channel_id).await {
-                        Ok(Some(_)) => {
-                            found = true;
-                            break;
-                        }
+                        Ok(Some(_)) => found = true,
                         Ok(None) => {}
                         Err(e) => {
                             return error_response(
@@ -12625,10 +26374,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
-            ok_response(
-                &req.id,
-                json!({ "ok": true, "key": matches[0].clone() }),
-            )
+            ok_response(&req.id, json!({ "ok": true, "key": matches[0].clone() }))
         }
         "sessions.patch" => {
             let patch = req.params.clone().unwrap_or_else(|| json!({}));
@@ -12725,7 +26471,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 }),
             }
         }
-        "config.get" => ok_response(&req.id, handle_config_get().await),
+        "config.get" => ok_response(&req.id, handle_config_get(&ctx.state).await),
         "config.schema" => ok_response(&req.id, handle_config_schema().await),
         "config.set" => {
             let raw = req
@@ -12742,7 +26488,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .as_ref()
                 .and_then(|v| v.get("baseHash"))
                 .and_then(|v| v.as_str());
-            match handle_config_set(raw, base_hash).await {
+            match handle_config_set(&ctx.state, raw, base_hash).await {
                 Ok(payload) => ok_response(&req.id, payload),
                 Err(err) => GatewayFrame::Res(ResponseFrame {
                     id: req.id,
@@ -12775,7 +26521,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|v| v.min(60_000))
                 .unwrap_or(2_000);
 
-            match handle_config_set(raw, base_hash).await {
+            match handle_config_set(&ctx.state, raw, base_hash).await {
                 Ok(payload) => {
                     let path = payload
                         .get("path")
@@ -12783,18 +26529,28 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                         .unwrap_or("")
                         .to_string();
                     let config = payload.get("config").cloned().unwrap_or_else(|| json!({}));
-                    let sentinel_payload = json!({
-                        "kind": "config-apply",
-                        "status": "ok",
-                        "ts": now_ms(),
-                        "sessionKey": session_key,
-                        "message": note,
-                        "doctorHint": "Restart drbot to apply config changes.",
-                        "stats": {
-                            "mode": "config.apply",
-                            "root": path,
+                    let sentinel_payload = crate::openclaw_restart::build_restart_sentinel_payload(
+                        crate::openclaw_restart::RestartSentinelPayloadParams {
+                            kind: "config-apply",
+                            status: "ok",
+                            ts_ms: now_ms(),
+                            session_key: session_key.clone(),
+                            message: note.clone(),
+                            doctor_hint: Some("Restart drbot to apply config changes.".to_string()),
+                            stats: json!({
+                                "mode": "config.apply",
+                                "root": path,
+                            }),
                         },
-                    });
+                    );
+                    let sentinel_path = crate::openclaw_restart::write_restart_sentinel_best_effort(
+                        &ctx.state,
+                        sentinel_payload.clone(),
+                    );
+                    let restart = crate::openclaw_restart::schedule_sigusr1_restart(
+                        Some(restart_delay_ms),
+                        Some("config.apply"),
+                    );
 
                     ok_response(
                         &req.id,
@@ -12802,16 +26558,9 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                             "ok": true,
                             "path": path,
                             "config": config,
-                            "restart": {
-                                "ok": false,
-                                "pid": std::process::id(),
-                                "signal": "SIGUSR1",
-                                "delayMs": restart_delay_ms,
-                                "reason": "config.apply",
-                                "mode": "signal",
-                            },
+                            "restart": restart,
                             "sentinel": {
-                                "path": serde_json::Value::Null,
+                                "path": sentinel_path,
                                 "payload": sentinel_payload,
                             }
                         }),
@@ -12848,7 +26597,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|v| v.min(60_000))
                 .unwrap_or(2_000);
 
-            match handle_config_patch(raw, base_hash).await {
+            match handle_config_patch(&ctx.state, raw, base_hash).await {
                 Ok(payload) => {
                     let path = payload
                         .get("path")
@@ -12856,18 +26605,28 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                         .unwrap_or("")
                         .to_string();
                     let config = payload.get("config").cloned().unwrap_or_else(|| json!({}));
-                    let sentinel_payload = json!({
-                        "kind": "config-apply",
-                        "status": "ok",
-                        "ts": now_ms(),
-                        "sessionKey": session_key,
-                        "message": note,
-                        "doctorHint": "Restart drbot to apply config changes.",
-                        "stats": {
-                            "mode": "config.patch",
-                            "root": path,
+                    let sentinel_payload = crate::openclaw_restart::build_restart_sentinel_payload(
+                        crate::openclaw_restart::RestartSentinelPayloadParams {
+                            kind: "config-apply",
+                            status: "ok",
+                            ts_ms: now_ms(),
+                            session_key: session_key.clone(),
+                            message: note.clone(),
+                            doctor_hint: Some("Restart drbot to apply config changes.".to_string()),
+                            stats: json!({
+                                "mode": "config.patch",
+                                "root": path,
+                            }),
                         },
-                    });
+                    );
+                    let sentinel_path = crate::openclaw_restart::write_restart_sentinel_best_effort(
+                        &ctx.state,
+                        sentinel_payload.clone(),
+                    );
+                    let restart = crate::openclaw_restart::schedule_sigusr1_restart(
+                        Some(restart_delay_ms),
+                        Some("config.patch"),
+                    );
 
                     ok_response(
                         &req.id,
@@ -12875,16 +26634,9 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                             "ok": true,
                             "path": path,
                             "config": config,
-                            "restart": {
-                                "ok": false,
-                                "pid": std::process::id(),
-                                "signal": "SIGUSR1",
-                                "delayMs": restart_delay_ms,
-                                "reason": "config.patch",
-                                "mode": "signal",
-                            },
+                            "restart": restart,
                             "sentinel": {
-                                "path": serde_json::Value::Null,
+                                "path": sentinel_path,
                                 "payload": sentinel_payload,
                             }
                         }),
@@ -13148,67 +26900,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
         }
         "update.run" => {
             let params = req.params.clone().unwrap_or_else(|| json!({}));
-            let session_key = params
-                .get("sessionKey")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let note = params
-                .get("note")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let restart_delay_ms = params
-                .get("restartDelayMs")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.min(60_000))
-                .unwrap_or(2_000);
-
-            let result = json!({
-                "status": "error",
-                "mode": "unknown",
-                "reason": "update.run is not supported by drbot (OpenClaw compatibility endpoint only)",
-                "steps": [],
-                "durationMs": 0,
-            });
-
-            let sentinel_payload = json!({
-                "kind": "update",
-                "status": "error",
-                "ts": now_ms(),
-                "sessionKey": session_key,
-                "message": note,
-                "doctorHint": "Update is not implemented for drbot. Update via your package manager / git checkout.",
-                "stats": {
-                    "mode": "unknown",
-                    "root": serde_json::Value::Null,
-                    "before": serde_json::Value::Null,
-                    "after": serde_json::Value::Null,
-                    "steps": [],
-                    "reason": "unsupported",
-                    "durationMs": 0
-                }
-            });
-
-            ok_response(
-                &req.id,
-                json!({
-                    "ok": true,
-                    "result": result,
-                    "restart": {
-                        "ok": false,
-                        "pid": std::process::id(),
-                        "signal": "SIGUSR1",
-                        "delayMs": restart_delay_ms,
-                        "reason": "update.run",
-                        "mode": "signal",
-                    },
-                    "sentinel": {
-                        "path": serde_json::Value::Null,
-                        "payload": sentinel_payload,
-                    }
-                }),
-            )
+            ok_response(&req.id, handle_update_run(&ctx.state, &params).await)
         }
         "chat.history" => {
             let session_key = req
@@ -13256,6 +26948,11 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+            let response_prefix = params
+                .get("responsePrefix")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
             if session_key.is_empty() {
                 return error_response(
@@ -13265,6 +26962,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
+            let session_key = canonicalize_openclaw_session_key(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                &session_key,
+            );
             if run_id.is_empty() {
                 return error_response(
                     &req.id,
@@ -13312,7 +27013,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             }
 
             let provider = match ctx.state.provider() {
-                Some(p) => p.clone(),
+                Some(p) => p,
                 None => {
                     return error_response(
                         &req.id,
@@ -13341,7 +27042,15 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 return ok_response(&req.id, json!({ "runId": run_id, "status": "in_flight" }));
             }
 
-            tokio::spawn(spawn_chat_run(ctx.clone(), provider, run_id.clone(), session_key, user_msg, cancel_rx));
+            tokio::spawn(spawn_chat_run(
+                ctx.clone(),
+                provider,
+                run_id.clone(),
+                session_key,
+                user_msg,
+                response_prefix,
+                cancel_rx,
+            ));
             ok_response(&req.id, json!({ "runId": run_id, "status": "started" }))
         }
         "chat.abort" => {
@@ -13365,11 +27074,16 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
+            let session_key = canonicalize_openclaw_session_key(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                &session_key,
+            );
 
             // OpenClaw parity: if runId is present and active but doesn't match the provided
             // sessionKey, return an INVALID_REQUEST error instead of silently ignoring it.
             if let Some(run_id) = run_id.as_deref() {
-                if let Some(found_session) = ctx.state.openclaw_find_chat_run_session_key(run_id).await
+                if let Some(found_session) =
+                    ctx.state.openclaw_find_chat_run_session_key(run_id).await
                 {
                     if found_session != session_key {
                         return error_response(
@@ -13427,6 +27141,10 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
+            let session_key = canonicalize_openclaw_session_key(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                &session_key,
+            );
 
             let Some(store) = ctx.state.session_store() else {
                 return error_response(
@@ -13444,19 +27162,17 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .map(|l| format!("[{}]\n\n", l.chars().take(100).collect::<String>()))
                 .unwrap_or_default();
             let combined = format!("{}{}", label_prefix, message);
+            let combined = strip_openclaw_media_path_lines(&combined).into_owned();
 
             // Persist to the session transcript so chat.history shows it later.
             // Stable operator user id.
             let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-            let mut session = store
-                .get_by_channel("openclaw", &session_key)
-                .await
-                .ok()
-                .flatten();
-            if session.is_none() {
-                let (channel_type, channel_id) = session_key_to_channel(&session_key);
-                session = store.get_or_create(user_id, &channel_type, &channel_id).await.ok();
-            }
+            let (canonical_key, candidates) = openclaw_session_store_key_candidates(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                &session_key,
+            );
+            let session =
+                get_or_create_openclaw_session(store, user_id, &canonical_key, &candidates).await;
             if let Some(mut s) = session {
                 s.add_message(Message::assistant(&combined));
                 s.update_timestamp();
@@ -13553,6 +27269,10 @@ fn node_method_allowed(method: &str) -> bool {
     )
 }
 
+fn method_requires_operator_admin_scope(method: &str) -> bool {
+    matches!(method, "agents.create" | "agents.update" | "agents.delete")
+}
+
 async fn authorize_openclaw_request(ctx: &ConnCtx, req: &RequestFrame) -> Option<GatewayFrame> {
     let Some(client) = ctx.state.get_openclaw_client(&ctx.conn_id).await else {
         return Some(error_response(
@@ -13583,6 +27303,21 @@ async fn authorize_openclaw_request(ctx: &ConnCtx, req: &RequestFrame) -> Option
                 error_codes::FORBIDDEN,
                 "scope 'global' required",
                 Some(json!({ "requiredScopes": ["global"], "scopes": client.scopes })),
+            ));
+        }
+    }
+
+    if method_requires_operator_admin_scope(req.method.as_str()) {
+        let is_admin = client
+            .scopes
+            .iter()
+            .any(|s| s == "operator.admin" || s == "global");
+        if !is_admin {
+            return Some(error_response(
+                &req.id,
+                error_codes::FORBIDDEN,
+                "scope 'operator.admin' required",
+                Some(json!({ "requiredScopes": ["operator.admin"], "scopes": client.scopes })),
             ));
         }
     }
@@ -13746,8 +27481,7 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                 }
             }
         } else if let Some(timeout_ms) = idle_timeout_ms {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), ws_receiver.next())
-                .await
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), ws_receiver.next()).await
             {
                 Ok(v) => v,
                 Err(_) => {
@@ -13930,7 +27664,10 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
             let shared_auth_ok = state.validate_token(shared_provided);
             let mut auth_ok = shared_auth_ok;
 
-            let role_raw = params.role.clone().unwrap_or_else(|| "operator".to_string());
+            let role_raw = params
+                .role
+                .clone()
+                .unwrap_or_else(|| "operator".to_string());
             let role_trimmed = role_raw.trim();
             let role = if role_trimmed.is_empty() || role_trimmed == "operator" {
                 "operator".to_string()
@@ -13954,15 +27691,13 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
             let mut device_id: Option<String> = None;
             let mut device_public_key: Option<String> = None;
             if let Some(device) = params.device.as_ref().and_then(|v| v.as_object()) {
-                let has_any = ["id", "publicKey", "signature"]
-                    .into_iter()
-                    .any(|k| {
-                        device
-                            .get(k)
-                            .and_then(|v| v.as_str())
-                            .map(|s| !s.trim().is_empty())
-                            .unwrap_or(false)
-                    });
+                let has_any = ["id", "publicKey", "signature"].into_iter().any(|k| {
+                    device
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                });
                 if has_any {
                     let raw_id = device
                         .get("id")
@@ -14132,7 +27867,8 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
             // Back-compat: treat missing scopes as "global" for operator clients that are
             // not using signed device identity. For signed connections, scopes are part of
             // the signature payload; do not silently widen them.
-            let scopes = if role == "operator" && requested_scopes.is_empty() && device_id.is_none() {
+            let scopes = if role == "operator" && requested_scopes.is_empty() && device_id.is_none()
+            {
                 vec!["global".to_string()]
             } else {
                 requested_scopes
@@ -14178,7 +27914,13 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                 if let (Some(token), Some(device_id)) =
                     (auth_token.as_deref(), openclaw_client.device_id.as_deref())
                 {
-                    match verify_device_token(&state, device_id, token, &openclaw_client.role, &openclaw_client.scopes) {
+                    match verify_device_token(
+                        &state,
+                        device_id,
+                        token,
+                        &openclaw_client.role,
+                        &openclaw_client.scopes,
+                    ) {
                         Ok(true) => {
                             auth_ok = true;
                         }
@@ -14189,16 +27931,18 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
             }
 
             if !auth_ok {
-                let err = error_response(&req.id, error_codes::INVALID_REQUEST, "unauthorized", None);
+                let err =
+                    error_response(&req.id, error_codes::INVALID_REQUEST, "unauthorized", None);
                 send_frame(&tx, &queued_bytes, &closing, &err).await;
                 break;
             }
 
             // Pairing enforcement (OpenClaw parity) when a device identity is presented.
             let mut hello_auth: Option<serde_json::Value> = None;
-            if let (Some(device_id), Some(public_key)) =
-                (openclaw_client.device_id.clone(), device_public_key.as_deref())
-            {
+            if let (Some(device_id), Some(public_key)) = (
+                openclaw_client.device_id.clone(),
+                device_public_key.as_deref(),
+            ) {
                 let paired = match get_paired_device(&state, &device_id) {
                     Ok(v) => v,
                     Err(e) => {
@@ -14212,11 +27956,9 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                     if paired.public_key != public_key {
                         require_pairing = Some("not-paired");
                     } else {
-                        let allowed_roles = merge_roles(
-                            &[paired.roles.clone()],
-                            &[paired.role.clone()],
-                        )
-                        .unwrap_or_default();
+                        let allowed_roles =
+                            merge_roles(&[paired.roles.clone()], &[paired.role.clone()])
+                                .unwrap_or_default();
                         if allowed_roles.is_empty()
                             || !allowed_roles.iter().any(|r| r == &openclaw_client.role)
                         {
@@ -14236,10 +27978,18 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
 
                 if let Some(reason) = require_pairing {
                     let silent = if is_local_client { Some(true) } else { None };
-                    match request_device_pairing(&state, &device_id, public_key, &openclaw_client, silent) {
+                    match request_device_pairing(
+                        &state,
+                        &device_id,
+                        public_key,
+                        &openclaw_client,
+                        silent,
+                    ) {
                         Ok((pair_req, created)) => {
                             if pair_req.silent == Some(true) {
-                                if let Ok(Some((request_id, device))) = approve_device_pairing(&state, &pair_req.request_id) {
+                                if let Ok(Some((request_id, device))) =
+                                    approve_device_pairing(&state, &pair_req.request_id)
+                                {
                                     broadcast_openclaw_event(
                                         &state,
                                         "device.pair.resolved",
@@ -14258,7 +28008,8 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                                     broadcast_openclaw_event(
                                         &state,
                                         "device.pair.requested",
-                                        serde_json::to_value(&pair_req).unwrap_or_else(|_| json!({})),
+                                        serde_json::to_value(&pair_req)
+                                            .unwrap_or_else(|_| json!({})),
                                         None,
                                     )
                                     .await;
@@ -14267,7 +28018,9 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                                     &req.id,
                                     error_codes::NOT_PAIRED,
                                     "pairing required",
-                                    Some(json!({"requestId": pair_req.request_id, "reason": reason })),
+                                    Some(
+                                        json!({"requestId": pair_req.request_id, "reason": reason }),
+                                    ),
                                 );
                                 send_frame(&tx, &queued_bytes, &closing, &err).await;
                                 break;
@@ -14275,7 +28028,12 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                         }
                         Err(e) => {
                             warn!(error = %e.message, "device pairing request failed");
-                            let err = error_response(&req.id, error_codes::UNAVAILABLE, "pairing request failed", None);
+                            let err = error_response(
+                                &req.id,
+                                error_codes::UNAVAILABLE,
+                                "pairing request failed",
+                                None,
+                            );
                             send_frame(&tx, &queued_bytes, &closing, &err).await;
                             break;
                         }

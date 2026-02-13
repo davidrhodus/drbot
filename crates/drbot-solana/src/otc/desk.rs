@@ -336,7 +336,8 @@ impl OtcDeskAgent {
         settlement_mint: Pubkey,
     ) -> Self {
         let quote_engine: Arc<dyn QuoteEngine> = Arc::new(
-            SpreadQuoteEngine::new("USDC", settlement_mint).with_sol_usdc_market(mid_price, spread_bps),
+            SpreadQuoteEngine::new("USDC", settlement_mint)
+                .with_sol_usdc_market(mid_price, spread_bps),
         );
 
         Self::new(
@@ -377,7 +378,8 @@ impl OtcDeskAgent {
         settlement_mint: Pubkey,
     ) -> Self {
         let quote_engine: Arc<dyn QuoteEngine> = Arc::new(
-            SpreadQuoteEngine::new("USDC", settlement_mint).with_sol_usdc_market(mid_price, spread_bps),
+            SpreadQuoteEngine::new("USDC", settlement_mint)
+                .with_sol_usdc_market(mid_price, spread_bps),
         );
 
         Self::new(

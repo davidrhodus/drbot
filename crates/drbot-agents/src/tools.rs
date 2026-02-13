@@ -1,13 +1,13 @@
 //! Tool system for agent capabilities.
 
-use crate::{AgentError, Result};
 use crate::tool_root::{
     ensure_root_dir, resolve_existing_dir, resolve_existing_file, resolve_write_file_path,
 };
 use crate::unified_diff::{apply_unified_diff_to_text, parse_unified_diff};
+use crate::{AgentError, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -115,18 +115,53 @@ async fn maybe_spool_tool_output(root: &PathBuf, tool: &str, output: String) -> 
 /// Collection of built-in tools.
 pub struct BuiltinTools;
 
+#[derive(Debug, Clone, Default)]
+pub struct BuiltinToolsOptions {
+    pub bash_allowed_prefixes: Option<Vec<String>>,
+    pub bash_safe_bins: Option<Vec<String>>,
+    pub bash_extra_allowed_prefixes: Vec<String>,
+}
+
 impl BuiltinTools {
-    /// Get all built-in tools.
-    pub fn all(root: impl Into<PathBuf>) -> Result<Vec<Arc<dyn AgentTool>>> {
+    /// Get all built-in tools with optional per-tool overrides.
+    pub fn all_with_options(
+        root: impl Into<PathBuf>,
+        options: BuiltinToolsOptions,
+    ) -> Result<Vec<Arc<dyn AgentTool>>> {
         let root = ensure_root_dir(&root.into()).map_err(AgentError::ToolError)?;
+
+        let mut bash = BashTool::new(root.clone());
+        if let Some(allowed) = options.bash_allowed_prefixes {
+            bash = bash.with_allowed_commands(allowed);
+        }
+        if let Some(safe) = options.bash_safe_bins {
+            bash = bash.with_safe_bins(safe);
+        }
+        if !options.bash_extra_allowed_prefixes.is_empty() {
+            bash = bash.with_extra_allowed_commands(options.bash_extra_allowed_prefixes);
+        }
+        let bash = Arc::new(bash);
+        let exec_alias = Arc::new(AliasTool::new("exec", bash.clone()));
+
+        let read_file = Arc::new(ReadFileTool::new(root.clone()));
+        let read_alias = Arc::new(AliasTool::new("read", read_file.clone()));
+
+        let write_file = Arc::new(WriteFileTool::new(root.clone()));
+        let write_alias = Arc::new(AliasTool::new("write", write_file.clone()));
+
+        let edit_tool = Arc::new(EditTool::new(root.clone()));
 
         let list_directory = Arc::new(ListDirectoryTool::new(root.clone()));
         let list_dir_alias = Arc::new(AliasTool::new("list_dir", list_directory.clone()));
 
         Ok(vec![
-            Arc::new(BashTool::new(root.clone())),
-            Arc::new(ReadFileTool::new(root.clone())),
-            Arc::new(WriteFileTool::new(root.clone())),
+            bash,
+            exec_alias,
+            read_file,
+            read_alias,
+            write_file,
+            write_alias,
+            edit_tool,
             list_directory,
             list_dir_alias,
             Arc::new(SearchTool::new(root.clone())),
@@ -135,6 +170,11 @@ impl BuiltinTools {
             Arc::new(CalculatorTool),
         ])
     }
+
+    /// Get all built-in tools.
+    pub fn all(root: impl Into<PathBuf>) -> Result<Vec<Arc<dyn AgentTool>>> {
+        Self::all_with_options(root, BuiltinToolsOptions::default())
+    }
 }
 
 /// Tool for executing bash commands.
@@ -142,6 +182,8 @@ pub struct BashTool {
     root: PathBuf,
     /// Allowed command prefixes (for sandboxing).
     allowed_prefixes: Vec<String>,
+    /// Safe binaries allowed in allowlist mode (stdin-only / no path-like args).
+    safe_bins: HashSet<String>,
     /// Timeout in seconds.
     timeout_secs: u64,
 }
@@ -186,7 +228,9 @@ impl BashTool {
             .unwrap_or_default();
 
         let allow_all = allow_all
-            || allowlist.iter().any(|s| s == "*" || s.eq_ignore_ascii_case("all"));
+            || allowlist
+                .iter()
+                .any(|s| s == "*" || s.eq_ignore_ascii_case("all"));
 
         let allowed_prefixes = if allow_all {
             Vec::new()
@@ -209,9 +253,32 @@ impl BashTool {
                 "uniq".to_string(),
             ]
         };
+
+        let safe_bins_raw = std::env::var("DRBOT_OPENCLAW_AGENT_BASH_SAFE_BINS")
+            .ok()
+            .or_else(|| std::env::var("DRBOT_AGENT_BASH_SAFE_BINS").ok());
+        let default_safe_bins = [
+            "jq", "grep", "cut", "sort", "uniq", "head", "tail", "tr", "wc",
+        ];
+        let safe_bins_list: Vec<String> = match safe_bins_raw.as_deref().map(|s| s.trim()) {
+            Some("") => Vec::new(),
+            Some(raw) => raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => default_safe_bins.iter().map(|s| s.to_string()).collect(),
+        };
+        let safe_bins: HashSet<String> = safe_bins_list
+            .into_iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Self {
             root,
             allowed_prefixes,
+            safe_bins,
             timeout_secs: 300,
         }
     }
@@ -219,6 +286,190 @@ impl BashTool {
     pub fn with_allowed_commands(mut self, commands: Vec<String>) -> Self {
         self.allowed_prefixes = commands;
         self
+    }
+
+    pub fn with_extra_allowed_commands(mut self, commands: Vec<String>) -> Self {
+        if self.allowed_prefixes.is_empty() {
+            return self;
+        }
+        let mut seen: HashSet<String> = self.allowed_prefixes.iter().cloned().collect();
+        for cmd in commands {
+            let trimmed = cmd.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                self.allowed_prefixes.push(trimmed.to_string());
+            }
+        }
+        self
+    }
+
+    pub fn with_safe_bins(mut self, bins: Vec<String>) -> Self {
+        self.safe_bins = bins
+            .into_iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self
+    }
+
+    fn strip_outer_quotes(mut token: &str) -> &str {
+        loop {
+            let bytes = token.as_bytes();
+            if bytes.len() < 2 {
+                return token;
+            }
+            let first = bytes[0];
+            let last = bytes[bytes.len() - 1];
+            if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                token = &token[1..bytes.len() - 1];
+                continue;
+            }
+            return token;
+        }
+    }
+
+    fn is_path_like_token(token: &str) -> bool {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed == "-" {
+            return false;
+        }
+        if trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.starts_with('~') {
+            return true;
+        }
+        if trimmed.starts_with('/') {
+            return true;
+        }
+        // Windows drive letter path.
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 3
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+            && bytes[0].is_ascii_alphabetic()
+        {
+            return true;
+        }
+        false
+    }
+
+    fn safe_bin_usage(&self, part: &str, cwd: &std::path::Path) -> bool {
+        if self.safe_bins.is_empty() {
+            return false;
+        }
+
+        let lowered = part.to_ascii_lowercase();
+        if lowered.contains("$(")
+            || lowered.contains('`')
+            || lowered.contains('>')
+            || lowered.contains('<')
+        {
+            return false;
+        }
+
+        let tokens: Vec<&str> = part.split_whitespace().collect();
+        if tokens.is_empty() {
+            return false;
+        }
+
+        let mut i = 0usize;
+        while i < tokens.len() && Self::looks_like_env_assignment(tokens[i]) {
+            i += 1;
+        }
+
+        let exec_index = loop {
+            if i >= tokens.len() {
+                return false;
+            }
+            let tok_raw = tokens[i].trim();
+            if tok_raw.is_empty() {
+                i += 1;
+                continue;
+            }
+            let tok_unquoted = Self::strip_outer_quotes(tok_raw);
+            let tok = tok_unquoted.trim_start_matches('\\');
+            let base = tok.rsplit('/').next().unwrap_or(tok);
+            match base {
+                "env" => {
+                    i += 1;
+                    while i < tokens.len()
+                        && (tokens[i].starts_with('-')
+                            || Self::looks_like_env_assignment(tokens[i]))
+                    {
+                        i += 1;
+                    }
+                    continue;
+                }
+                "command" | "builtin" => {
+                    i += 1;
+                    while i < tokens.len() && tokens[i].starts_with('-') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                "nice" | "nohup" | "time" => {
+                    i += 1;
+                    while i < tokens.len() && tokens[i].starts_with('-') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => break i,
+            }
+        };
+
+        let exec_raw = tokens[exec_index].trim();
+        let exec_unquoted = Self::strip_outer_quotes(exec_raw);
+        let exec_tok = exec_unquoted.trim_start_matches('\\');
+        let exec_base = exec_tok.rsplit('/').next().unwrap_or(exec_tok);
+        let exec_lower = exec_base.to_ascii_lowercase();
+        if !self.safe_bins.contains(exec_lower.as_str()) {
+            return false;
+        }
+
+        let args = &tokens[(exec_index + 1)..];
+        for token_raw in args {
+            let token_raw = token_raw.trim();
+            if token_raw.is_empty() {
+                continue;
+            }
+            let token = Self::strip_outer_quotes(token_raw);
+            if token.is_empty() {
+                continue;
+            }
+            if token == "-" {
+                continue;
+            }
+            if token.starts_with('-') {
+                if let Some((_, value)) = token.split_once('=') {
+                    let value = Self::strip_outer_quotes(value);
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if Self::is_path_like_token(value) {
+                        return false;
+                    }
+                    let candidate = cwd.join(value);
+                    if candidate.exists() {
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            if Self::is_path_like_token(token) {
+                return false;
+            }
+            let candidate = cwd.join(token);
+            if candidate.exists() {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn looks_like_env_assignment(token: &str) -> bool {
@@ -231,10 +482,7 @@ impl BashTool {
         if key.is_empty() || key.starts_with('-') {
             return false;
         }
-        if !key
-            .chars()
-            .all(|c| c == '_' || c.is_ascii_alphanumeric())
-        {
+        if !key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
             return false;
         }
         // POSIX env var name must not start with a digit.
@@ -266,6 +514,7 @@ impl BashTool {
                 i += 1;
                 continue;
             }
+            let tok = Self::strip_outer_quotes(tok);
             let tok = tok.trim_start_matches('\\');
             let base = tok.rsplit('/').next().unwrap_or(tok);
             match base {
@@ -274,7 +523,8 @@ impl BashTool {
                 "env" => {
                     i += 1;
                     while i < tokens.len()
-                        && (tokens[i].starts_with('-') || Self::looks_like_env_assignment(tokens[i]))
+                        && (tokens[i].starts_with('-')
+                            || Self::looks_like_env_assignment(tokens[i]))
                     {
                         i += 1;
                     }
@@ -331,7 +581,7 @@ impl BashTool {
         false
     }
 
-    fn is_allowed(&self, command: &str) -> bool {
+    fn is_allowed(&self, command: &str, cwd: &std::path::Path) -> bool {
         if self.allowed_prefixes.is_empty() {
             return true; // No restrictions
         }
@@ -355,13 +605,19 @@ impl BashTool {
                 let Some(exec) = Self::first_executable_token(part) else {
                     return false;
                 };
-                if !self
+                if self
                     .allowed_prefixes
                     .iter()
                     .any(|p| exec == *p || exec.ends_with(&format!("/{}", p)))
                 {
-                    return false;
+                    continue;
                 }
+
+                if self.safe_bin_usage(part, cwd) {
+                    continue;
+                }
+
+                return false;
             }
         }
         true
@@ -375,7 +631,7 @@ impl AgentTool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command and return the output"
+        "Execute a shell command and return the output"
     }
 
     fn parameters(&self) -> Value {
@@ -384,11 +640,28 @@ impl AgentTool for BashTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The bash command to execute"
+                    "description": "The shell command to execute"
+                },
+                "cmd": {
+                    "type": "string",
+                    "description": "Alias for command"
                 },
                 "cwd": {
                     "type": "string",
                     "description": "Optional working directory under the tool root"
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Alias for cwd"
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional timeout in seconds (overrides default)"
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Optional environment variables (PATH and dynamic linker variables are forbidden)",
+                    "additionalProperties": { "type": "string" }
                 }
             },
             "required": ["command"]
@@ -396,9 +669,97 @@ impl AgentTool for BashTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let command = args["command"]
-            .as_str()
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                args.get("cmd")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .ok_or_else(|| AgentError::ToolError("Missing 'command' argument".to_string()))?;
+
+        let cwd_arg = args
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("workdir").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim();
+        let cwd = if cwd_arg.is_empty() {
+            self.root.clone()
+        } else {
+            resolve_existing_dir(&self.root, cwd_arg).map_err(AgentError::ToolError)?
+        };
+
+        let mut env_vars: HashMap<String, String> = HashMap::new();
+        if let Some(env) = args.get("env").and_then(|v| v.as_object()) {
+            const DANGEROUS_HOST_ENV_VARS: &[&str] = &[
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "LD_AUDIT",
+                "DYLD_INSERT_LIBRARIES",
+                "DYLD_LIBRARY_PATH",
+                "NODE_OPTIONS",
+                "NODE_PATH",
+                "PYTHONPATH",
+                "PYTHONHOME",
+                "RUBYLIB",
+                "PERL5LIB",
+                "BASH_ENV",
+                "ENV",
+                "GCONV_PATH",
+                "IFS",
+                "SSLKEYLOGFILE",
+            ];
+
+            for (key, value) in env {
+                let key_trimmed = key.trim();
+                if key_trimmed.is_empty() {
+                    continue;
+                }
+                let normalized_key = key_trimmed.to_string();
+                if normalized_key.chars().enumerate().any(|(idx, ch)| {
+                    if idx == 0 {
+                        !(ch == '_' || ch.is_ascii_alphabetic())
+                    } else {
+                        !(ch == '_' || ch.is_ascii_alphanumeric())
+                    }
+                }) {
+                    return Err(AgentError::ToolError(format!(
+                        "Invalid env var name: {}",
+                        key_trimmed
+                    )));
+                }
+
+                let upper = normalized_key.to_ascii_uppercase();
+                if upper == "PATH" {
+                    return Err(AgentError::ToolError(
+                        "Refusing to run with custom PATH".to_string(),
+                    ));
+                }
+                if upper.starts_with("LD_") || upper.starts_with("DYLD_") {
+                    return Err(AgentError::ToolError(format!(
+                        "Refusing to run with forbidden env var: {}",
+                        key_trimmed
+                    )));
+                }
+                if DANGEROUS_HOST_ENV_VARS
+                    .iter()
+                    .any(|v| v.eq_ignore_ascii_case(&upper))
+                {
+                    return Err(AgentError::ToolError(format!(
+                        "Refusing to run with forbidden env var: {}",
+                        key_trimmed
+                    )));
+                }
+
+                let value_str = value.as_str().ok_or_else(|| {
+                    AgentError::ToolError(format!("Invalid env var value for {}", key_trimmed))
+                })?;
+                env_vars.insert(normalized_key, value_str.to_string());
+            }
+        }
 
         if Self::command_is_forbidden(command) {
             return Err(AgentError::ToolError(format!(
@@ -407,32 +768,100 @@ impl AgentTool for BashTool {
             )));
         }
 
-        if !self.is_allowed(command) {
-            return Err(AgentError::ToolError(format!("Command not allowed: {}", command)));
+        if !self.is_allowed(command, &cwd) {
+            return Err(AgentError::ToolError(format!(
+                "Command not allowed: {}",
+                command
+            )));
         }
 
-        let cwd_arg = args.get("cwd").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let cwd = if cwd_arg.is_empty() {
-            self.root.clone()
+        debug!("Executing shell command: {}", command);
+
+        let timeout_secs = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .unwrap_or(self.timeout_secs)
+            .min(3600);
+
+        fn resolve_powershell_path() -> String {
+            let system_root = std::env::var("SystemRoot")
+                .ok()
+                .or_else(|| std::env::var("WINDIR").ok());
+            if let Some(root) = system_root {
+                let trimmed = root.trim();
+                if !trimmed.is_empty() {
+                    let candidate = PathBuf::from(trimmed)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe");
+                    if candidate.exists() {
+                        return candidate.to_string_lossy().to_string();
+                    }
+                }
+            }
+            "powershell.exe".to_string()
+        }
+
+        let output = if cfg!(windows) {
+            let output = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), {
+                let mut cmd = Command::new(resolve_powershell_path());
+                cmd.arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-Command")
+                    .arg(command)
+                    .current_dir(&cwd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                for (k, v) in &env_vars {
+                    cmd.env(k, v);
+                }
+                cmd.output()
+            })
+            .await
+            .map_err(|_| AgentError::Timeout)?;
+            output.map_err(|e| AgentError::ToolError(e.to_string()))?
         } else {
-            resolve_existing_dir(&self.root, cwd_arg).map_err(AgentError::ToolError)?
+            let bash_output =
+                tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), {
+                    let mut cmd = Command::new("bash");
+                    cmd.arg("-lc")
+                        .arg(command)
+                        .current_dir(&cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    for (k, v) in &env_vars {
+                        cmd.env(k, v);
+                    }
+                    cmd.output()
+                })
+                .await
+                .map_err(|_| AgentError::Timeout)?;
+
+            match bash_output {
+                Ok(output) => output,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let sh_output =
+                        tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), {
+                            let mut cmd = Command::new("sh");
+                            cmd.arg("-c")
+                                .arg(command)
+                                .current_dir(&cwd)
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped());
+                            for (k, v) in &env_vars {
+                                cmd.env(k, v);
+                            }
+                            cmd.output()
+                        })
+                        .await
+                        .map_err(|_| AgentError::Timeout)?;
+                    sh_output.map_err(|e| AgentError::ToolError(e.to_string()))?
+                }
+                Err(err) => return Err(AgentError::ToolError(err.to_string())),
+            }
         };
-
-        debug!("Executing bash command: {}", command);
-
-        let output = tokio::time::timeout(
-            tokio::time::Duration::from_secs(self.timeout_secs),
-            Command::new("bash")
-                .arg("-lc")
-                .arg(command)
-                .current_dir(&cwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await
-        .map_err(|_| AgentError::Timeout)?
-        .map_err(|e| AgentError::ToolError(e.to_string()))?;
 
         let code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -499,8 +928,15 @@ impl AgentTool for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let path = args["path"]
-            .as_str()
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                args.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .ok_or_else(|| AgentError::ToolError("Missing 'path' argument".to_string()))?;
 
         let file = resolve_existing_file(&self.root, path).map_err(AgentError::ToolError)?;
@@ -551,8 +987,15 @@ impl AgentTool for WriteFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String> {
-        let path = args["path"]
-            .as_str()
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                args.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
             .ok_or_else(|| AgentError::ToolError("Missing 'path' argument".to_string()))?;
         let content = args["content"]
             .as_str()
@@ -567,6 +1010,116 @@ impl AgentTool for WriteFileTool {
             "Successfully wrote {} bytes to {}",
             content.len(),
             file.display()
+        ))
+    }
+}
+
+/// Tool for making precise edits to an existing file by replacing a specific
+/// substring (`oldText`) with a new value (`newText`).
+pub struct EditTool {
+    root: PathBuf,
+}
+
+impl EditTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl AgentTool for EditTool {
+    fn name(&self) -> &str {
+        "edit"
+    }
+
+    fn description(&self) -> &str {
+        "Make a precise edit to a file by replacing oldText with newText."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to edit." },
+                "file_path": { "type": "string", "description": "Alias for path." },
+                "oldText": { "type": "string", "description": "Exact substring to replace." },
+                "old_string": { "type": "string", "description": "Alias for oldText." },
+                "newText": { "type": "string", "description": "Replacement substring." },
+                "new_string": { "type": "string", "description": "Alias for newText." },
+                "replaceAll": { "type": "boolean", "description": "If true, replace all occurrences (default false)." }
+            },
+            "required": ["path", "oldText", "newText"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                args.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .ok_or_else(|| AgentError::ToolError("Missing 'path' argument".to_string()))?;
+        let old_text = args
+            .get("oldText")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("old_string").and_then(|v| v.as_str()))
+            .ok_or_else(|| AgentError::ToolError("Missing 'oldText' argument".to_string()))?;
+        let new_text = args
+            .get("newText")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("new_string").and_then(|v| v.as_str()))
+            .ok_or_else(|| AgentError::ToolError("Missing 'newText' argument".to_string()))?;
+        let replace_all = args
+            .get("replaceAll")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if old_text.is_empty() {
+            return Err(AgentError::ToolError(
+                "'oldText' must be non-empty".to_string(),
+            ));
+        }
+
+        let file = resolve_existing_file(&self.root, path).map_err(AgentError::ToolError)?;
+        let bytes = tokio::fs::read(&file)
+            .await
+            .map_err(|e| AgentError::ToolError(format!("Failed to read file: {}", e)))?;
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        let occurrences = text.match_indices(old_text).count();
+        if occurrences == 0 {
+            return Err(AgentError::ToolError(format!(
+                "oldText not found in {}",
+                file.display()
+            )));
+        }
+        if occurrences > 1 && !replace_all {
+            return Err(AgentError::ToolError(format!(
+                "oldText occurs {} times in {} (set replaceAll=true to replace all)",
+                occurrences,
+                file.display()
+            )));
+        }
+
+        let updated = if replace_all {
+            text.replace(old_text, new_text)
+        } else {
+            text.replacen(old_text, new_text, 1)
+        };
+
+        tokio::fs::write(&file, updated.as_bytes())
+            .await
+            .map_err(|e| AgentError::ToolError(format!("Failed to write file: {}", e)))?;
+
+        Ok(format!(
+            "Successfully edited {} (replaced {} occurrence{})",
+            file.display(),
+            if replace_all { occurrences } else { 1 },
+            if occurrences == 1 { "" } else { "s" }
         ))
     }
 }
@@ -684,8 +1237,8 @@ impl AgentTool for SearchTool {
             .ok_or_else(|| AgentError::ToolError("Missing 'pattern' argument".to_string()))?;
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        let target =
-            crate::tool_root::resolve_existing_path(&self.root, path).map_err(AgentError::ToolError)?;
+        let target = crate::tool_root::resolve_existing_path(&self.root, path)
+            .map_err(AgentError::ToolError)?;
 
         // Prefer ripgrep; fall back to grep.
         let rg_output = tokio::time::timeout(
@@ -707,20 +1260,18 @@ impl AgentTool for SearchTool {
 
         let output = match rg_output {
             Ok(Ok(out)) => out,
-            _ => {
-                tokio::time::timeout(
-                    tokio::time::Duration::from_secs(self.timeout_secs),
-                    Command::new("grep")
-                        .args(["-R", "-n", pattern, target.to_string_lossy().as_ref()])
-                        .current_dir(&self.root)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .output(),
-                )
-                .await
-                .map_err(|_| AgentError::Timeout)?
-                .map_err(|e| AgentError::ToolError(format!("Search failed: {}", e)))?
-            }
+            _ => tokio::time::timeout(
+                tokio::time::Duration::from_secs(self.timeout_secs),
+                Command::new("grep")
+                    .args(["-R", "-n", pattern, target.to_string_lossy().as_ref()])
+                    .current_dir(&self.root)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output(),
+            )
+            .await
+            .map_err(|_| AgentError::Timeout)?
+            .map_err(|e| AgentError::ToolError(format!("Search failed: {}", e)))?,
         };
 
         let code = output.status.code().unwrap_or(-1);
@@ -828,9 +1379,9 @@ impl AgentTool for ApplyPatchTool {
 
                 let joined = crate::tool_root::join_relative(&self.root, &old_path)
                     .map_err(AgentError::ToolError)?;
-                tokio::fs::remove_file(&joined)
-                    .await
-                    .map_err(|e| AgentError::ToolError(format!("Failed to delete '{}': {}", joined.display(), e)))?;
+                tokio::fs::remove_file(&joined).await.map_err(|e| {
+                    AgentError::ToolError(format!("Failed to delete '{}': {}", joined.display(), e))
+                })?;
                 out_lines.push(format!("deleted {}", old_path));
                 continue;
             }
@@ -854,10 +1405,11 @@ impl AgentTool for ApplyPatchTool {
             let original = if old_path == "/dev/null" {
                 String::new()
             } else {
-                let file = resolve_existing_file(&self.root, &target_path).map_err(AgentError::ToolError)?;
-                let bytes = tokio::fs::read(&file)
-                    .await
-                    .map_err(|e| AgentError::ToolError(format!("Failed to read '{}': {}", file.display(), e)))?;
+                let file = resolve_existing_file(&self.root, &target_path)
+                    .map_err(AgentError::ToolError)?;
+                let bytes = tokio::fs::read(&file).await.map_err(|e| {
+                    AgentError::ToolError(format!("Failed to read '{}': {}", file.display(), e))
+                })?;
                 String::from_utf8_lossy(&bytes).to_string()
             };
 
@@ -867,10 +1419,11 @@ impl AgentTool for ApplyPatchTool {
                 updated.push('\n');
             }
 
-            let file = resolve_write_file_path(&self.root, &target_path).map_err(AgentError::ToolError)?;
-            tokio::fs::write(&file, updated)
-                .await
-                .map_err(|e| AgentError::ToolError(format!("Failed to write '{}': {}", file.display(), e)))?;
+            let file =
+                resolve_write_file_path(&self.root, &target_path).map_err(AgentError::ToolError)?;
+            tokio::fs::write(&file, updated).await.map_err(|e| {
+                AgentError::ToolError(format!("Failed to write '{}': {}", file.display(), e))
+            })?;
             out_lines.push(format!("patched {}", target_path));
         }
 
@@ -1079,10 +1632,7 @@ mod tests {
     use super::*;
 
     fn temp_root() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "drbot-agents-tools-test-{}",
-            Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("drbot-agents-tools-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         ensure_root_dir(&dir).unwrap()
     }
@@ -1097,15 +1647,31 @@ mod tests {
     #[test]
     fn test_bash_tool_allowed() {
         let tool = BashTool::new(temp_root());
-        assert!(tool.is_allowed("ls -la"));
-        assert!(tool.is_allowed("cat file.txt"));
-        assert!(!tool.is_allowed("rm -rf /"));
+        assert!(tool.is_allowed("ls -la", &tool.root));
+        assert!(tool.is_allowed("cat file.txt", &tool.root));
+        assert!(!tool.is_allowed("rm -rf /", &tool.root));
         assert!(BashTool::command_is_forbidden("env rm -rf /"));
         assert!(BashTool::command_is_forbidden("command rm -rf /"));
         assert!(BashTool::command_is_forbidden("sudo ls"));
+        assert!(BashTool::command_is_forbidden("\"rm\" -rf /"));
 
         let tool = BashTool::new(temp_root()).with_allowed_commands(vec!["git".to_string()]);
-        assert!(tool.is_allowed("env git status"));
+        assert!(tool.is_allowed("env git status", &tool.root));
+    }
+
+    #[test]
+    fn test_bash_tool_safe_bins_allow_stdio_use() {
+        let root = temp_root();
+        std::fs::write(root.join("file.json"), r#"{"x":1}"#).unwrap();
+
+        let tool = BashTool::new(root.clone())
+            .with_allowed_commands(vec!["git".to_string()])
+            .with_safe_bins(vec!["jq".to_string()]);
+
+        assert!(tool.is_allowed("jq '.x'", &root));
+        assert!(!tool.is_allowed("jq file.json", &root));
+        assert!(!tool.is_allowed("jq .", &root));
+        assert!(!tool.is_allowed("jq ./file.json", &root));
     }
 
     #[test]
@@ -1115,6 +1681,71 @@ mod tests {
 
         assert!(registry.get("calculator").is_some());
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_builtin_tools_include_openclaw_aliases() {
+        let tools = BuiltinTools::all(temp_root()).unwrap();
+        let names: HashSet<String> = tools.into_iter().map(|t| t.name().to_string()).collect();
+        assert!(names.contains("exec"));
+        assert!(names.contains("read"));
+        assert!(names.contains("write"));
+        assert!(names.contains("edit"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_accepts_file_path_alias() {
+        let root = temp_root();
+        std::fs::write(root.join("foo.txt"), "hello").unwrap();
+        let tool = ReadFileTool::new(root.clone());
+        let out = tool
+            .execute(serde_json::json!({ "file_path": "foo.txt" }))
+            .await
+            .unwrap();
+        assert!(out.contains("hello"), "out={}", out);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool_accepts_file_path_alias() {
+        let root = temp_root();
+        let tool = WriteFileTool::new(root.clone());
+        tool.execute(serde_json::json!({ "file_path": "bar.txt", "content": "world" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("bar.txt")).unwrap(),
+            "world"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_accepts_claude_style_aliases() {
+        let root = temp_root();
+        std::fs::write(root.join("edit.txt"), "hello world\n").unwrap();
+        let tool = EditTool::new(root.clone());
+        tool.execute(serde_json::json!({
+            "file_path": "edit.txt",
+            "old_string": "world",
+            "new_string": "universe"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("edit.txt")).unwrap(),
+            "hello universe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_accepts_cmd_and_workdir_aliases() {
+        let root = temp_root();
+        let tool = BashTool::new(root);
+        let out = tool
+            .execute(serde_json::json!({ "cmd": "echo hello", "workdir": "." }))
+            .await
+            .unwrap();
+        assert!(out.contains("exit_code:"), "out={}", out);
+        assert!(out.contains("hello"), "out={}", out);
     }
 
     #[tokio::test]

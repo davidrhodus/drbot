@@ -8,9 +8,12 @@ use crate::{API_VERSION, DEFAULT_BASE_URL};
 use async_trait::async_trait;
 use drbot_core::message::{Content, Message, Role};
 use drbot_core::{Error, Result};
-use drbot_providers::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, ToolUse, Usage};
+use drbot_providers::{
+    ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, ToolUse, Usage,
+};
 use futures::StreamExt;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tracing::{debug, error, warn};
@@ -22,6 +25,7 @@ pub struct AnthropicProvider {
     base_url: String,
     default_model: String,
     default_max_tokens: usize,
+    extra_headers: HashMap<String, String>,
 }
 
 impl AnthropicProvider {
@@ -33,6 +37,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             default_model: "claude-sonnet-4-20250514".to_string(),
             default_max_tokens: 8192,
+            extra_headers: HashMap::new(),
         }
     }
 
@@ -51,6 +56,12 @@ impl AnthropicProvider {
     /// Set the default max tokens.
     pub fn with_default_max_tokens(mut self, max_tokens: usize) -> Self {
         self.default_max_tokens = max_tokens;
+        self
+    }
+
+    /// Set additional headers for requests.
+    pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.extra_headers = headers;
         self
     }
 
@@ -163,12 +174,16 @@ impl AnthropicProvider {
 
         debug!(model = %request.model, "Sending request to Anthropic");
 
-        let response = self
+        let mut builder = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (key, value) in &self.extra_headers {
+            builder = builder.header(key.as_str(), value.as_str());
+        }
+        let response = builder
             .json(request)
             .send()
             .await
@@ -204,12 +219,16 @@ impl AnthropicProvider {
 
         debug!(model = %request.model, "Sending streaming request to Anthropic");
 
-        let response = self
+        let mut builder = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (key, value) in &self.extra_headers {
+            builder = builder.header(key.as_str(), value.as_str());
+        }
+        let response = builder
             .json(request)
             .send()
             .await
@@ -449,43 +468,93 @@ impl Provider for AnthropicProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        vec![
+        let provider = "anthropic".to_string();
+        let mut models = vec![
+            ModelInfo {
+                id: "claude-opus-4-6".to_string(),
+                name: "Claude Opus 4.6".to_string(),
+                provider: provider.clone(),
+                context_window: 200000,
+                max_output_tokens: Some(64000),
+            },
+            ModelInfo {
+                id: "claude-opus-4-5".to_string(),
+                name: "Claude Opus 4.5".to_string(),
+                provider: provider.clone(),
+                context_window: 200000,
+                max_output_tokens: Some(64000),
+            },
+            ModelInfo {
+                id: "claude-sonnet-4-5".to_string(),
+                name: "Claude Sonnet 4.5".to_string(),
+                provider: provider.clone(),
+                context_window: 200000,
+                max_output_tokens: Some(64000),
+            },
+            ModelInfo {
+                id: "claude-sonnet-4-1".to_string(),
+                name: "Claude Sonnet 4.1".to_string(),
+                provider: provider.clone(),
+                context_window: 200000,
+                max_output_tokens: Some(64000),
+            },
+            ModelInfo {
+                id: "claude-haiku-4-5".to_string(),
+                name: "Claude Haiku 4.5".to_string(),
+                provider: provider.clone(),
+                context_window: 200000,
+                max_output_tokens: Some(64000),
+            },
             ModelInfo {
                 id: "claude-sonnet-4-20250514".to_string(),
                 name: "Claude Sonnet 4".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider.clone(),
                 context_window: 200000,
                 max_output_tokens: Some(64000),
             },
             ModelInfo {
                 id: "claude-opus-4-20250514".to_string(),
                 name: "Claude Opus 4".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider.clone(),
                 context_window: 200000,
                 max_output_tokens: Some(32000),
             },
             ModelInfo {
                 id: "claude-3-5-sonnet-20241022".to_string(),
                 name: "Claude 3.5 Sonnet".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider.clone(),
                 context_window: 200000,
                 max_output_tokens: Some(8192),
             },
             ModelInfo {
                 id: "claude-3-5-haiku-20241022".to_string(),
                 name: "Claude 3.5 Haiku".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider.clone(),
                 context_window: 200000,
                 max_output_tokens: Some(8192),
             },
             ModelInfo {
                 id: "claude-3-opus-20240229".to_string(),
                 name: "Claude 3 Opus".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider.clone(),
                 context_window: 200000,
                 max_output_tokens: Some(4096),
             },
-        ]
+        ];
+
+        // Ensure the configured default model appears in `models.list` even if it's not
+        // in the small built-in catalog (OpenClaw Control UI convenience).
+        if !models.iter().any(|m| m.id == self.default_model) {
+            models.push(ModelInfo {
+                id: self.default_model.clone(),
+                name: self.default_model.clone(),
+                provider,
+                context_window: 200000,
+                max_output_tokens: None,
+            });
+        }
+
+        models
     }
 
     fn name(&self) -> &str {
@@ -501,7 +570,9 @@ mod tests {
     fn test_provider_creation() {
         let provider = AnthropicProvider::new("test-key");
         assert_eq!(provider.name(), "anthropic");
-        assert!(!provider.models().is_empty());
+        let models = provider.models();
+        assert!(!models.is_empty());
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-6"));
     }
 
     #[test]

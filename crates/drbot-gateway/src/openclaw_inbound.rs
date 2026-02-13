@@ -56,20 +56,39 @@ async fn persist_incoming(state: &GatewayState, incoming: &IncomingMessage) {
     let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
 
     let channel_type = incoming.channel_type.trim();
-    let channel_id = incoming.channel_id.trim();
+    let raw_channel_id = incoming.channel_id.trim();
+    let derived_channel_id =
+        crate::openclaw::derive_openclaw_group_aware_channel_id(channel_type, raw_channel_id);
+    let channel_id = derived_channel_id.trim();
     if channel_type.is_empty() || channel_id.is_empty() {
         return;
     }
 
-    let mut session = match store
-        .get_or_create(user_id, channel_type, channel_id)
+    let mut session = store
+        .get_by_channel(channel_type, channel_id)
         .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, channel = %channel_type, channel_id = %channel_id, "OpenClaw inbound: failed to load/create session");
-            return;
+        .ok()
+        .flatten();
+
+    if session.is_none() && channel_id != raw_channel_id {
+        if let Ok(Some(mut legacy)) = store.get_by_channel(channel_type, raw_channel_id).await {
+            legacy.channel_type = channel_type.to_string();
+            legacy.channel_id = channel_id.to_string();
+            if store.update(&legacy).await.is_ok() {
+                session = Some(legacy);
+            }
         }
+    }
+
+    let mut session = match session {
+        Some(s) => s,
+        None => match store.get_or_create(user_id, channel_type, channel_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, channel = %channel_type, channel_id = %channel_id, "OpenClaw inbound: failed to load/create session");
+                return;
+            }
+        },
     };
 
     session.add_message(incoming_to_session_message(incoming));
@@ -84,6 +103,33 @@ async fn handle_incoming(state: &GatewayState, incoming: IncomingMessage) {
 
     // Poll resolution hooks live in `openclaw_polls`; keep this call best-effort.
     crate::openclaw_polls::maybe_resolve_from_incoming(state, &incoming).await;
+
+    // OpenClaw Control UI expects real-time updates for inbound messages.
+    // Broadcast as a `chat` event (state=final) with a user-role message payload.
+    let channel_type = incoming.channel_type.trim();
+    let channel_id = incoming.channel_id.trim();
+    if !channel_type.is_empty() && !channel_id.is_empty() {
+        let derived_channel_id =
+            crate::openclaw::derive_openclaw_group_aware_channel_id(channel_type, channel_id);
+        let raw_key = format!("{}:{}", channel_type, derived_channel_id);
+        let session_key = crate::openclaw::canonicalize_openclaw_session_key(
+            crate::openclaw_paths::DEFAULT_AGENT_ID,
+            &raw_key,
+        );
+        if !session_key.is_empty() {
+            let msg = incoming_to_session_message(&incoming);
+            let payload = json!({
+                "runId": format!("inbound-{}", incoming.id),
+                "sessionKey": session_key,
+                "seq": 0,
+                "state": "final",
+                "message": crate::openclaw::drbot_message_to_openclaw(&msg),
+                "stopReason": "inbound",
+            });
+            crate::openclaw::broadcast_openclaw_event_opts(state, "chat", payload, None, true)
+                .await;
+        }
+    }
 }
 
 async fn run_channel_loop(state: GatewayState, channel_type: String) {
@@ -96,7 +142,10 @@ async fn run_channel_loop(state: GatewayState, channel_type: String) {
             continue;
         }
 
-        let rx = state.channel_manager().connect_and_subscribe(&channel_type).await;
+        let rx = state
+            .channel_manager()
+            .connect_and_subscribe(&channel_type)
+            .await;
         let mut rx = match rx {
             Ok(r) => {
                 backoff_ms = 1_000;

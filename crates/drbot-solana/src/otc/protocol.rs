@@ -2,8 +2,8 @@
 //!
 //! Defines the message types for OTC negotiation between agents.
 
-use chrono::{DateTime, Utc};
 use crate::{Result, SolanaError};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -484,9 +484,8 @@ impl OTCEnvelope {
             return Ok(false);
         };
 
-        let sig = Signature::from_str(sig_str).map_err(|e| {
-            SolanaError::OTCError(format!("Invalid signature encoding: {e}"))
-        })?;
+        let sig = Signature::from_str(sig_str)
+            .map_err(|e| SolanaError::OTCError(format!("Invalid signature encoding: {e}")))?;
         let bytes = self.signable_bytes()?;
 
         Ok(sig.verify(wallet.as_ref(), &bytes))

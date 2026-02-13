@@ -18,6 +18,16 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+fn openclaw_skills_ssrf_policy() -> crate::ssrf::SsrfPolicy {
+    crate::ssrf::SsrfPolicy::from_env(
+        &[
+            "DRBOT_OPENCLAW_SKILLS_ALLOW_PRIVATE",
+            "DRBOT_OPENCLAW_REMOTE_SKILLS_ALLOW_PRIVATE",
+        ],
+        Some("DRBOT_OPENCLAW_SKILLS_ALLOWED_HOSTNAMES"),
+    )
+}
+
 // Keep in sync with OpenClaw's default config truthiness checks.
 const DEFAULT_CONFIG_VALUES: &[(&str, bool)] =
     &[("browser.enabled", true), ("browser.evaluateEnabled", true)];
@@ -237,6 +247,20 @@ pub struct SkillInstallResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct ClawhubInstallParams {
+    pub skill: String,
+    pub registry: Option<String>,
+    pub site: Option<String>,
+    pub version: Option<String>,
+    pub workdir: Option<PathBuf>,
+    pub dir: Option<String>,
+    pub skills_dir: Option<PathBuf>,
+    pub bin: Option<String>,
+    pub force: bool,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct SkillInstallPlan {
     pub skill_key: String,
     pub kind: String,
@@ -370,7 +394,11 @@ pub(crate) fn bump_skills_snapshot_version() -> u64 {
     let now = now_ms();
     SKILLS_SNAPSHOT_VERSION
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            Some(if now <= cur { cur.saturating_add(1) } else { now })
+            Some(if now <= cur {
+                cur.saturating_add(1)
+            } else {
+                now
+            })
         })
         .unwrap_or_else(|cur| cur)
 }
@@ -444,10 +472,14 @@ fn resolve_remote_skill_sync_max_file_bytes() -> usize {
 async fn fetch_remote_text(
     client: &reqwest::Client,
     url: &str,
+    policy: &crate::ssrf::SsrfPolicy,
     meta: Option<&RemoteFileMeta>,
     max_bytes: usize,
 ) -> Result<(Option<String>, Option<String>, u16, Option<String>), String> {
-    let mut req = client.get(url);
+    let parsed = crate::ssrf::ensure_url_allowed(url, policy)
+        .await
+        .map_err(|e| format!("{}: {}", e.code, e.message))?;
+    let mut req = client.get(parsed);
     if let Some(meta) = meta {
         if let Some(etag) = meta.etag.as_deref() {
             req = req.header(IF_NONE_MATCH, etag);
@@ -478,29 +510,29 @@ async fn fetch_remote_text(
     }
     if let Some(len) = res.content_length() {
         if len as usize > max_bytes {
-            return Err(format!("remote content too large ({} bytes) for {}", len, url));
+            return Err(format!(
+                "remote content too large ({} bytes) for {}",
+                len, url
+            ));
         }
     }
-    let body = res
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|b| {
-            if b.len() > max_bytes {
-                return Err(format!(
-                    "remote content too large ({} bytes) for {}",
-                    b.len(),
-                    url
-                ));
-            }
-            String::from_utf8(b.to_vec()).map_err(|e| e.to_string())
-        })?;
+    let body = res.bytes().await.map_err(|e| e.to_string()).and_then(|b| {
+        if b.len() > max_bytes {
+            return Err(format!(
+                "remote content too large ({} bytes) for {}",
+                b.len(),
+                url
+            ));
+        }
+        String::from_utf8(b.to_vec()).map_err(|e| e.to_string())
+    })?;
     Ok((etag, last_modified, status, Some(body)))
 }
 
 async fn sync_remote_markdown(
     client: &reqwest::Client,
     url: &str,
+    policy: &crate::ssrf::SsrfPolicy,
     path: &Path,
     min_interval_ms: u64,
 ) -> Result<bool, String> {
@@ -518,7 +550,7 @@ async fn sync_remote_markdown(
 
     let max_bytes = resolve_remote_skill_sync_max_file_bytes();
     let (etag, last_modified, status, maybe_body) =
-        fetch_remote_text(client, url, meta.as_ref(), max_bytes).await?;
+        fetch_remote_text(client, url, policy, meta.as_ref(), max_bytes).await?;
     let fetched_at_ms = now_ms();
 
     if status == 304 {
@@ -564,8 +596,67 @@ async fn sync_remote_markdown(
     Ok(true)
 }
 
+fn is_remote_skill_dir_name_safe(value: &str) -> bool {
+    const MAX_LEN: usize = 96;
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_LEN {
+        return false;
+    }
+
+    let bytes = trimmed.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+}
+
+fn normalize_remote_skill_dir_token(value: &str) -> String {
+    const MAX_LEN: usize = 64;
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "skill".to_string();
+    }
+
+    let mut out = String::with_capacity(trimmed.len().min(MAX_LEN));
+    let mut last_dash = false;
+    for ch in trimmed.chars() {
+        if out.len() >= MAX_LEN {
+            break;
+        }
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "skill".to_string()
+    } else {
+        out
+    }
+}
+
 fn resolve_remote_skill_dir(cfg: &Config, skill_key: &str) -> PathBuf {
-    resolve_managed_skills_dir(cfg).join(skill_key)
+    let base = resolve_managed_skills_dir(cfg);
+    let trimmed = skill_key.trim();
+
+    if is_remote_skill_dir_name_safe(trimmed) {
+        return base.join(trimmed);
+    }
+
+    let normalized = normalize_remote_skill_dir_token(trimmed);
+    let suffix: String = sha256_hex(trimmed).chars().take(12).collect();
+    base.join(format!("{}-{}", normalized, suffix))
 }
 
 /// Best-effort sync for any skills configured with `entries.<skillKey>.url`.
@@ -578,6 +669,7 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
         return;
     }
 
+    let ssrf_policy = openclaw_skills_ssrf_policy();
     let min_interval_ms = resolve_remote_skill_sync_min_interval_ms();
     let ua = format!(
         "drbot/{} (+openclaw-remote-skill-sync)",
@@ -590,6 +682,7 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
         .unwrap_or(20);
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(ua)
         .build()
     {
@@ -607,12 +700,17 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
         if entry.enabled == Some(false) {
             continue;
         }
-        let Some(url) = entry.url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        let Some(url) = entry
+            .url
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
         let dir = resolve_remote_skill_dir(cfg, &skill_key);
         let skill_path = dir.join("SKILL.md");
-        match sync_remote_markdown(&client, url, &skill_path, min_interval_ms).await {
+        match sync_remote_markdown(&client, url, &ssrf_policy, &skill_path, min_interval_ms).await {
             Ok(updated) => {
                 updated_any = updated_any || updated;
                 debug!(
@@ -622,7 +720,9 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
                     "openclaw_skills: remote SKILL.md sync"
                 );
             }
-            Err(err) => warn!(skill_key = %skill_key, error = %err, "openclaw_skills: remote SKILL.md sync failed"),
+            Err(err) => {
+                warn!(skill_key = %skill_key, error = %err, "openclaw_skills: remote SKILL.md sync failed")
+            }
         }
 
         // Best-effort: remote skills can reference additional docs in the same directory.
@@ -689,6 +789,7 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
                         match sync_remote_markdown(
                             &client,
                             resolved.as_str(),
+                            &ssrf_policy,
                             &dest,
                             min_interval_ms,
                         )
@@ -735,7 +836,15 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
             .filter(|s| !s.is_empty())
         {
             let heartbeat_path = dir.join("HEARTBEAT.md");
-            match sync_remote_markdown(&client, heartbeat_url, &heartbeat_path, min_interval_ms).await {
+            match sync_remote_markdown(
+                &client,
+                heartbeat_url,
+                &ssrf_policy,
+                &heartbeat_path,
+                min_interval_ms,
+            )
+            .await
+            {
                 Ok(updated) => {
                     updated_any = updated_any || updated;
                     debug!(
@@ -745,7 +854,9 @@ pub async fn sync_configured_remote_skills_best_effort(cfg: &Config) {
                         "openclaw_skills: remote HEARTBEAT.md sync"
                     );
                 }
-                Err(err) => warn!(skill_key = %skill_key, error = %err, "openclaw_skills: remote HEARTBEAT.md sync failed"),
+                Err(err) => {
+                    warn!(skill_key = %skill_key, error = %err, "openclaw_skills: remote HEARTBEAT.md sync failed")
+                }
             }
         }
     }
@@ -861,10 +972,7 @@ pub fn collect_required_skill_bins_for_platform(
             if !required_os.is_empty() && !required_os.iter().any(|os| os == platform) {
                 continue;
             }
-            let requires = entry
-                .metadata
-                .as_ref()
-                .and_then(|m| m.requires.as_ref());
+            let requires = entry.metadata.as_ref().and_then(|m| m.requires.as_ref());
             let Some(requires) = requires else { continue };
 
             for bin in requires.bins.iter().chain(requires.any_bins.iter()) {
@@ -891,10 +999,38 @@ pub fn build_workspace_skills_prompt_with_remote(
     cfg: &Config,
     remote: Option<&RemoteSkillEligibility>,
 ) -> String {
+    build_workspace_skills_prompt_with_remote_filtered(workspace_dir, cfg, remote, None)
+}
+
+pub fn build_workspace_skills_prompt_with_remote_filtered(
+    workspace_dir: &Path,
+    cfg: &Config,
+    remote: Option<&RemoteSkillEligibility>,
+    skill_filter: Option<&[String]>,
+) -> String {
     let managed_dir = resolve_managed_skills_dir(cfg);
-    let entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
+    let mut entries = load_workspace_skill_entries(workspace_dir, &managed_dir);
     if entries.is_empty() {
         return String::new();
+    }
+
+    if let Some(skill_filter) = skill_filter {
+        let allowed: HashSet<String> = skill_filter
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if allowed.is_empty() {
+            return String::new();
+        }
+        entries.retain(|entry| {
+            let key = resolve_skill_key(entry);
+            allowed.contains(&key) || allowed.contains(&entry.skill.name)
+        });
+        if entries.is_empty() {
+            return String::new();
+        }
     }
 
     let config_json = serde_json::to_value(cfg).unwrap_or_else(|_| json!({}));
@@ -954,7 +1090,8 @@ pub fn build_workspace_skills_prompt_with_remote(
             .into_iter()
             .chain(drbot_core::markdown::extract_markdown_reference_definition_targets(body))
         {
-            if let Some(rel) = drbot_core::markdown::normalize_relative_doc_path_from_target(&target)
+            if let Some(rel) =
+                drbot_core::markdown::normalize_relative_doc_path_from_target(&target)
             {
                 push_extra(rel);
             }
@@ -1137,6 +1274,209 @@ pub(crate) fn resolve_skill_install_plan(
     })
 }
 
+pub async fn install_clawhub_skill(
+    cfg: &Config,
+    params: ClawhubInstallParams,
+) -> SkillInstallResult {
+    let skill = normalize_clawhub_skill_slug(&params.skill);
+    if skill.is_empty() {
+        return SkillInstallResult {
+            ok: false,
+            message: "Skill name required".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            code: None,
+        };
+    }
+
+    let Some(bin) = resolve_clawhub_bin(params.bin.as_deref()) else {
+        return SkillInstallResult {
+            ok: false,
+            message: "ClawHub CLI not found (set DRBOT_CLAWHUB_BIN or install clawhub)".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            code: None,
+        };
+    };
+
+    let (workdir, dir_name, dest_dir) = resolve_clawhub_install_paths(cfg, &params);
+    if let Some(workdir) = workdir.as_ref() {
+        if let Err(err) = std::fs::create_dir_all(workdir) {
+            return SkillInstallResult {
+                ok: false,
+                message: format!("Failed to create workdir: {}", err),
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+            };
+        }
+    }
+    if let Some(dest) = dest_dir.as_ref() {
+        if let Err(err) = std::fs::create_dir_all(dest) {
+            return SkillInstallResult {
+                ok: false,
+                message: format!("Failed to create skills dir: {}", err),
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+            };
+        }
+    }
+
+    let mut argv: Vec<String> = Vec::new();
+    argv.push(bin);
+    argv.push("install".to_string());
+    argv.push(skill.clone());
+    if params.force {
+        argv.push("--force".to_string());
+    }
+    argv.push("--no-input".to_string());
+    if let Some(version) = params
+        .version
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        argv.push("--version".to_string());
+        argv.push(version.to_string());
+    }
+    if let Some(site) = params
+        .site
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        argv.push("--site".to_string());
+        argv.push(site.to_string());
+    }
+    if let Some(registry) = params
+        .registry
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        argv.push("--registry".to_string());
+        argv.push(registry.to_string());
+    }
+    if let Some(workdir) = workdir.as_ref() {
+        argv.push("--workdir".to_string());
+        argv.push(workdir.to_string_lossy().to_string());
+    }
+    if let Some(dir_name) = dir_name.as_ref() {
+        argv.push("--dir".to_string());
+        argv.push(dir_name.to_string());
+    }
+
+    let timeout_ms = params.timeout_ms.unwrap_or(300_000).clamp(1_000, 900_000);
+    let output = run_command_with_timeout(&argv, timeout_ms, None).await;
+    let ok = output.code == Some(0);
+    let message = if ok {
+        match dest_dir.as_ref() {
+            Some(dest) => format!("Installed {} into {}", skill, dest.to_string_lossy()),
+            None => format!("Installed {}", skill),
+        }
+    } else {
+        format_install_failure_message(output.code, &output.stdout, &output.stderr)
+    };
+
+    SkillInstallResult {
+        ok,
+        message,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        code: output.code,
+    }
+}
+
+fn resolve_clawhub_bin(override_bin: Option<&str>) -> Option<String> {
+    if let Some(bin) = override_bin.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Some(bin.to_string());
+    }
+    if let Ok(raw) = std::env::var("DRBOT_CLAWHUB_BIN") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if has_binary("clawhub") {
+        return Some("clawhub".to_string());
+    }
+    if has_binary("clawdhub") {
+        return Some("clawdhub".to_string());
+    }
+    None
+}
+
+fn normalize_clawhub_skill_slug(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if !trimmed.contains("://") {
+        return trimmed.to_string();
+    }
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        if let Some(host) = url.host_str() {
+            if host.contains("clawhub.ai") || host.contains("clawhub.com") {
+                let segments: Vec<_> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
+                if let Some(pos) = segments.iter().position(|s| *s == "skills") {
+                    if let Some(slug) = segments.get(pos + 1) {
+                        if !slug.trim().is_empty() {
+                            return slug.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn resolve_clawhub_install_paths(
+    cfg: &Config,
+    params: &ClawhubInstallParams,
+) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
+    if let Some(skills_dir) = params.skills_dir.as_ref() {
+        let (workdir, dir_name) = split_skills_dir(skills_dir);
+        let dest_dir = workdir.join(&dir_name);
+        return (Some(workdir), Some(dir_name), Some(dest_dir));
+    }
+
+    if params.workdir.is_some() || params.dir.is_some() {
+        let workdir = params
+            .workdir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let dir_name = params
+            .dir
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "skills".to_string());
+        let dest_dir = workdir.join(&dir_name);
+        return (Some(workdir), Some(dir_name), Some(dest_dir));
+    }
+
+    let managed = resolve_managed_skills_dir(cfg);
+    let (workdir, dir_name) = split_skills_dir(&managed);
+    let dest_dir = workdir.join(&dir_name);
+    (Some(workdir), Some(dir_name), Some(dest_dir))
+}
+
+fn split_skills_dir(path: &Path) -> (PathBuf, String) {
+    let dir_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "skills".to_string());
+    let workdir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    (workdir, dir_name)
+}
+
 // ---------------------------------------------------------------------------
 // Skill status helpers
 // ---------------------------------------------------------------------------
@@ -1211,28 +1551,28 @@ fn build_skill_status_entry(
 
     let platform = resolve_runtime_platform();
 
-    let remote_has_bin = |bin: &str| -> bool {
-        remote
-            .map(|r| r.bins.contains(bin.trim()))
-            .unwrap_or(false)
-    };
+    let remote_has_bin =
+        |bin: &str| -> bool { remote.map(|r| r.bins.contains(bin.trim())).unwrap_or(false) };
 
     let missing_bins = required_bins
         .iter()
         .filter(|bin| !has_binary(bin) && !remote_has_bin(bin))
         .cloned()
         .collect::<Vec<_>>();
-    let missing_any_bins =
-        if required_any_bins.is_empty()
-            || required_any_bins.iter().any(|bin| has_binary(bin))
-            || remote
-                .map(|r| required_any_bins.iter().any(|bin| r.bins.contains(bin.trim())))
-                .unwrap_or(false)
-        {
-            Vec::new()
-        } else {
-            required_any_bins.clone()
-        };
+    let missing_any_bins = if required_any_bins.is_empty()
+        || required_any_bins.iter().any(|bin| has_binary(bin))
+        || remote
+            .map(|r| {
+                required_any_bins
+                    .iter()
+                    .any(|bin| r.bins.contains(bin.trim()))
+            })
+            .unwrap_or(false)
+    {
+        Vec::new()
+    } else {
+        required_any_bins.clone()
+    };
     let missing_os = if required_os.is_empty()
         || required_os.iter().any(|os| os == platform)
         || remote
@@ -1555,14 +1895,19 @@ fn is_blocked_by_skill_allowlist(
     let mut deny = skills_cfg.denylist.clone();
     deny.extend(env_deny);
 
-    if deny.iter().any(|s| s == skill_key || s == &entry.skill.name) {
+    if deny
+        .iter()
+        .any(|s| s == skill_key || s == &entry.skill.name)
+    {
         return true;
     }
 
     if allow.is_empty() {
         return false;
     }
-    !allow.iter().any(|s| s == skill_key || s == &entry.skill.name)
+    !allow
+        .iter()
+        .any(|s| s == skill_key || s == &entry.skill.name)
 }
 
 // ---------------------------------------------------------------------------
@@ -2207,7 +2552,14 @@ async fn install_download_spec(
     }
 
     let archive_path = target_dir.join(&filename);
-    let download = download_file(url, &archive_path, timeout_ms).await;
+    let ssrf_policy = crate::ssrf::SsrfPolicy::from_env(
+        &[
+            "DRBOT_OPENCLAW_SKILLS_ALLOW_PRIVATE",
+            "DRBOT_OPENCLAW_SKILLS_INSTALL_ALLOW_PRIVATE",
+        ],
+        Some("DRBOT_OPENCLAW_SKILLS_ALLOWED_HOSTNAMES"),
+    );
+    let download = download_file(url, &ssrf_policy, &archive_path, timeout_ms).await;
     let downloaded = match download {
         Ok(bytes) => bytes,
         Err(message) => {
@@ -2268,7 +2620,11 @@ async fn install_download_spec(
     }
 }
 
-fn resolve_download_target_dir(cfg: &Config, entry: &SkillEntry, spec: &SkillInstallSpec) -> PathBuf {
+fn resolve_download_target_dir(
+    cfg: &Config,
+    entry: &SkillEntry,
+    spec: &SkillInstallSpec,
+) -> PathBuf {
     if let Some(target) = spec
         .target_dir
         .as_deref()
@@ -2306,12 +2662,21 @@ fn resolve_archive_type(spec: &SkillInstallSpec, filename: &str) -> Option<Strin
     None
 }
 
-async fn download_file(url: &str, dest_path: &Path, timeout_ms: u64) -> Result<u64, String> {
+async fn download_file(
+    url: &str,
+    ssrf_policy: &crate::ssrf::SsrfPolicy,
+    dest_path: &Path,
+    timeout_ms: u64,
+) -> Result<u64, String> {
+    let parsed = crate::ssrf::ensure_url_allowed(url, ssrf_policy)
+        .await
+        .map_err(|e| format!("{}: {}", e.code, e.message))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let resp = client.get(parsed).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!(
             "Download failed ({} {})",
@@ -2523,7 +2888,7 @@ fn resolve_brew_executable() -> Option<String> {
     None
 }
 
-fn resolve_runtime_platform() -> &'static str {
+pub(crate) fn resolve_runtime_platform() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",

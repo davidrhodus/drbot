@@ -138,7 +138,11 @@ impl Page {
 
         let result = self
             .cdp
-            .send("Page.navigate", Some(serde_json::json!({ "url": url })))
+            .send_with_session(
+                "Page.navigate",
+                Some(serde_json::json!({ "url": url })),
+                self.session_id.as_deref(),
+            )
             .await?;
 
         let frame_id = result
@@ -181,7 +185,11 @@ impl Page {
 
         let result = self
             .cdp
-            .send("Page.captureScreenshot", Some(params))
+            .send_with_session(
+                "Page.captureScreenshot",
+                Some(params),
+                self.session_id.as_deref(),
+            )
             .await?;
 
         let data = result
@@ -196,16 +204,45 @@ impl Page {
         Ok(bytes)
     }
 
+    /// Render the current page to PDF.
+    pub async fn pdf(&self) -> drbot_core::Result<Vec<u8>> {
+        debug!("Printing to PDF");
+
+        let result = self
+            .cdp
+            .send_with_session(
+                "Page.printToPDF",
+                Some(serde_json::json!({
+                    "printBackground": true,
+                    "transferMode": "ReturnAsBase64",
+                })),
+                self.session_id.as_deref(),
+            )
+            .await?;
+
+        let data = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| drbot_core::Error::Internal("No pdf data".to_string()))?;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| drbot_core::Error::Internal(format!("Base64 decode failed: {}", e)))?;
+
+        Ok(bytes)
+    }
+
     /// Get page content (HTML).
     pub async fn content(&self) -> drbot_core::Result<String> {
         let result = self
             .cdp
-            .send(
+            .send_with_session(
                 "Runtime.evaluate",
                 Some(serde_json::json!({
                     "expression": "document.documentElement.outerHTML",
                     "returnByValue": true,
                 })),
+                self.session_id.as_deref(),
             )
             .await?;
 
@@ -232,13 +269,14 @@ impl Page {
 
         let result = self
             .cdp
-            .send(
+            .send_with_session(
                 "Runtime.evaluate",
                 Some(serde_json::json!({
                     "expression": expression,
                     "returnByValue": true,
                     "awaitPromise": true,
                 })),
+                self.session_id.as_deref(),
             )
             .await?;
 
@@ -315,7 +353,7 @@ impl Page {
     /// Set viewport size.
     pub async fn set_viewport(&self, width: u32, height: u32) -> drbot_core::Result<()> {
         self.cdp
-            .send(
+            .send_with_session(
                 "Emulation.setDeviceMetricsOverride",
                 Some(serde_json::json!({
                     "width": width,
@@ -323,6 +361,7 @@ impl Page {
                     "deviceScaleFactor": 1,
                     "mobile": false,
                 })),
+                self.session_id.as_deref(),
             )
             .await?;
         Ok(())

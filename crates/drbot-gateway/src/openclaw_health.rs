@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -115,7 +116,7 @@ impl OpenclawHealthService {
             broadcast_openclaw_event(
                 &state,
                 "health",
-                build_health_payload_from_snapshot(&state, next),
+                build_health_payload_from_snapshot(&state, next).await,
                 Some(StateVersion {
                     presence: state.openclaw_presence_version(),
                     health: version,
@@ -127,86 +128,151 @@ impl OpenclawHealthService {
 }
 
 pub async fn build_health_snapshot(state: &GatewayState) -> serde_json::Value {
-    let provider_configured = state.provider().is_some();
-    let sessions_enabled = state.session_store().is_some();
+    // Build a stable snapshot for change detection (avoid including timestamps/durations).
+    //
+    // The OpenClaw Control UI expects the `health` method payload to resemble the
+    // `HealthSummary` shape (see upstream `commands/health.ts`), but for events we
+    // only need to know when key health inputs have changed (channels/linking).
 
-    // OpenClaw's `health` primarily reflects gateway availability; configuration issues
-    // are reported in `issues` so clients don't treat an unconfigured provider as an
-    // offline gateway.
-    let status = "ok";
-    let mut issues: Vec<String> = Vec::new();
-    if !provider_configured {
-        issues.push("provider-not-configured".to_string());
+    let channel_order = vec![
+        "telegram",
+        "whatsapp",
+        "discord",
+        "googlechat",
+        "slack",
+        "signal",
+        "imessage",
+        "matrix",
+        "webchat",
+    ];
+
+    let label_for = |key: &str| -> String {
+        match key {
+            "telegram" => "Telegram".to_string(),
+            "whatsapp" => "WhatsApp".to_string(),
+            "discord" => "Discord".to_string(),
+            "googlechat" => "Google Chat".to_string(),
+            "slack" => "Slack".to_string(),
+            "signal" => "Signal".to_string(),
+            "imessage" => "iMessage".to_string(),
+            "matrix" => "Matrix".to_string(),
+            "webchat" => "WebChat".to_string(),
+            other => other.to_string(),
+        }
+    };
+
+    let mut channel_labels = serde_json::Map::new();
+    for key in &channel_order {
+        channel_labels.insert((*key).to_string(), json!(label_for(key)));
     }
-    if !sessions_enabled {
-        issues.push("session-store-unavailable".to_string());
-    }
-    issues.sort();
+
+    let heartbeat_every_ms = std::env::var("DRBOT_OPENCLAW_HEARTBEAT_EVERY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 1_000)
+        .unwrap_or(30 * 60 * 1000);
+    let heartbeat_seconds = heartbeat_every_ms / 1000;
 
     let whatsapp = state.openclaw_web_login().snapshot_whatsapp();
     let runtime = state.channel_manager().runtime_snapshot().await;
 
-    let mut keys = runtime.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-
     let mut channels_obj = serde_json::Map::new();
-    for key in keys {
-        let snap = runtime.get(&key).expect("present");
-        let connected = if key == "whatsapp" {
-            whatsapp.connected
-        } else {
-            snap.connected
-        };
-        channels_obj.insert(
-            key.clone(),
-            json!({
-                "enabled": snap.enabled,
-                "configured": snap.configured,
-                "running": snap.running,
-                "connected": connected,
-                "lastError": snap.last_error,
-            }),
-        );
+    for key in &channel_order {
+        let rt = runtime.get(*key);
+        let configured = rt.map(|r| r.configured).unwrap_or(false);
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("configured".to_string(), json!(configured));
+
+        // OpenClaw's health UI treats WhatsApp as the primary "linked" channel.
+        if *key == "whatsapp" && configured {
+            obj.insert("linked".to_string(), json!(whatsapp.connected));
+        }
+
+        channels_obj.insert((*key).to_string(), serde_json::Value::Object(obj));
     }
 
     json!({
-        "status": status,
-        "issues": issues,
-        "provider": { "configured": provider_configured },
-        "sessions": { "enabled": sessions_enabled },
-        "heartbeats": { "enabled": state.openclaw_heartbeats_enabled() },
-        "whatsapp": {
-            "connected": whatsapp.connected,
-            "status": whatsapp.status,
-            "hasQr": whatsapp.qr_data_url.is_some(),
-        },
         "channels": serde_json::Value::Object(channels_obj),
+        "channelOrder": channel_order,
+        "channelLabels": serde_json::Value::Object(channel_labels),
+        "heartbeatSeconds": heartbeat_seconds,
     })
 }
 
 pub async fn build_health_payload(state: &GatewayState) -> serde_json::Value {
     let snapshot = build_health_snapshot(state).await;
-    build_health_payload_from_snapshot(state, snapshot)
+    build_health_payload_from_snapshot(state, snapshot).await
 }
 
-fn build_health_payload_from_snapshot(state: &GatewayState, snapshot: serde_json::Value) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    out.insert("ts".to_string(), json!(now_ms()));
-    out.insert(
-        "uptimeMs".to_string(),
-        json!(state.uptime_secs().saturating_mul(1000)),
-    );
+async fn build_health_payload_from_snapshot(
+    state: &GatewayState,
+    snapshot: serde_json::Value,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let ts = now_ms();
 
-    match snapshot {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map {
-                out.insert(k, v);
-            }
-        }
-        other => {
-            out.insert("health".to_string(), other);
+    let sessions = build_sessions_summary(state, ts).await;
+
+    let duration_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+
+    let mut out = serde_json::Map::new();
+    out.insert("ok".to_string(), json!(true));
+    out.insert("ts".to_string(), json!(ts));
+    out.insert("durationMs".to_string(), json!(duration_ms));
+
+    // Merge stable snapshot fields.
+    if let serde_json::Value::Object(map) = snapshot {
+        for (k, v) in map {
+            out.insert(k, v);
         }
     }
 
+    out.insert("sessions".to_string(), sessions);
+
     serde_json::Value::Object(out)
+}
+
+async fn build_sessions_summary(state: &GatewayState, now_ms: u64) -> serde_json::Value {
+    let path = state
+        .config()
+        .storage
+        .database_path
+        .to_string_lossy()
+        .to_string();
+    let mut count: usize = 0;
+    let mut recent: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(store) = state.session_store() {
+        let mut list = store
+            .list(drbot_sessions::ListOptions {
+                include_archived: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default();
+        count = list.len();
+        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+        for s in list.into_iter().take(12) {
+            let key = if s.channel_type == "openclaw" {
+                s.channel_id.clone()
+            } else {
+                format!("{}:{}", s.channel_type, s.channel_id)
+            };
+            let updated_at_ms: u64 = s.updated_at.timestamp_millis().try_into().unwrap_or(0);
+            let age_ms = now_ms.saturating_sub(updated_at_ms);
+            recent.push(json!({
+                "key": key,
+                "updatedAt": updated_at_ms,
+                "age": age_ms,
+            }));
+        }
+    }
+
+    json!({
+        "path": path,
+        "count": count,
+        "recent": recent,
+    })
 }

@@ -171,7 +171,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if let (Some(keypair_manager), Some(program_id)) = (desk_keypair, args.escrow_program_id) {
         let fee_payer = if let Some(path) = &args.fee_payer_wallet {
-            Some(FileKeypairManager::from_file(path)?.keypair().insecure_clone())
+            Some(
+                FileKeypairManager::from_file(path)?
+                    .keypair()
+                    .insecure_clone(),
+            )
         } else {
             None
         };

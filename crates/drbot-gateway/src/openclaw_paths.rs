@@ -5,6 +5,7 @@
 //! multi-instance deployments remain isolated. Operators can override this via:
 //! - `OPENCLAW_STATE_DIR`
 //! - `CLAWDBOT_STATE_DIR` (legacy)
+//! - `OPENCLAW_HOME` (OpenClaw v2026.2.9+)
 
 use drbot_core::Config;
 use std::path::PathBuf;
@@ -46,6 +47,7 @@ fn resolve_state_dir_override() -> Option<PathBuf> {
     let override_env = std::env::var("OPENCLAW_STATE_DIR")
         .ok()
         .or_else(|| std::env::var("CLAWDBOT_STATE_DIR").ok())
+        .or_else(|| std::env::var("OPENCLAW_HOME").ok())
         .unwrap_or_default();
     let trimmed = override_env.trim();
     if trimmed.is_empty() {
@@ -112,9 +114,9 @@ pub fn normalize_agent_id(value: &str) -> String {
         if !bytes[0].is_ascii_alphanumeric() {
             return false;
         }
-        bytes.iter().all(|b| {
-            b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-'
-        })
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
     }
 
     if is_valid(trimmed) {

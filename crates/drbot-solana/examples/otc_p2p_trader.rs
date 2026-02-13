@@ -14,15 +14,14 @@
 //!     --escrow-program-id <PROGRAM_PUBKEY> \
 //!     --direction buy --amount-sol 1
 
-use clap::Parser;
 use chrono::Utc;
+use clap::Parser;
 use drbot_a2a::{A2AConfig, A2AHub, Agent};
 use drbot_a2a_p2p::{start_p2p_bridge, P2PConfig};
 use drbot_solana::otc::{
-    build_escrow_params, sign_otc_notification, wait_for_settled_notification, EscrowManager,
-    spawn_otc_auto_cancel_watcher, OtcSettlementWatch, OtcSettlementWatchStore, EscrowParty,
-    make_sol_rfq, OTCMessage, OtcTraderClient, TradeDirection,
-    OTC_CAPABILITY,
+    build_escrow_params, make_sol_rfq, sign_otc_notification, spawn_otc_auto_cancel_watcher,
+    wait_for_settled_notification, EscrowManager, EscrowParty, OTCMessage, OtcSettlementWatch,
+    OtcSettlementWatchStore, OtcTraderClient, TradeDirection, OTC_CAPABILITY,
 };
 use drbot_solana::wallet::FileKeypairManager;
 use serde_json::json;
@@ -256,7 +255,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|k| k.pubkey())
         .unwrap_or_else(Pubkey::default);
 
-    let rfq = make_sol_rfq(direction, amount_lamports, args.expires_secs, initiator_wallet);
+    let rfq = make_sol_rfq(
+        direction,
+        amount_lamports,
+        args.expires_secs,
+        initiator_wallet,
+    );
 
     let quotes = if let Some(kp) = keypair_manager.as_ref() {
         trader
@@ -269,7 +273,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await?
     } else {
         trader
-            .broadcast_rfq(rfq.clone(), args.max_quotes, Duration::from_millis(args.timeout_ms))
+            .broadcast_rfq(
+                rfq.clone(),
+                args.max_quotes,
+                Duration::from_millis(args.timeout_ms),
+            )
             .await?
     };
 
@@ -330,8 +338,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 _ => None,
             })
             .reduce(|a, b| match direction {
-                TradeDirection::Buy => if b.2 < a.2 { b } else { a },
-                TradeDirection::Sell => if b.2 > a.2 { b } else { a },
+                TradeDirection::Buy => {
+                    if b.2 < a.2 {
+                        b
+                    } else {
+                        a
+                    }
+                }
+                TradeDirection::Sell => {
+                    if b.2 > a.2 {
+                        b
+                    } else {
+                        a
+                    }
+                }
             });
 
         let Some((desk_agent_id, best_env, _price)) = best else {
@@ -374,7 +394,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await;
         watch_store.flush().await?;
 
-        if escrow_manager.try_get_escrow(&escrow_address).await?.is_none() {
+        if escrow_manager
+            .try_get_escrow(&escrow_address)
+            .await?
+            .is_none()
+        {
             match fee_payer.as_ref() {
                 Some(fee_payer) => {
                     let _ = escrow_manager
@@ -382,7 +406,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .await?;
                 }
                 None => {
-                    let _ = escrow_manager.create_escrow(keypair, params.clone()).await?;
+                    let _ = escrow_manager
+                        .create_escrow(keypair, params.clone())
+                        .await?;
                 }
             }
         }
@@ -420,7 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let notify_msg = if settled {
             let (final_price, final_quantity) = match &quote_msg {
-                OTCMessage::Quote { price, quantity, .. } => (*price, *quantity),
+                OTCMessage::Quote {
+                    price, quantity, ..
+                } => (*price, *quantity),
                 _ => (0.0, 0),
             };
             OTCMessage::Settled {
@@ -484,13 +512,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 {
                     match status {
                         drbot_otc_escrow_program::ReceiptStatus::Settled => {
-                            println!("{}", serde_json::to_string_pretty(&json!({ "status": "settled" }))?);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&json!({ "status": "settled" }))?
+                            );
                             watch_store.remove(params.negotiation_id).await;
                             watch_store.flush().await?;
                             break;
                         }
                         drbot_otc_escrow_program::ReceiptStatus::Cancelled => {
-                            println!("{}", serde_json::to_string_pretty(&json!({ "status": "cancelled" }))?);
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&json!({ "status": "cancelled" }))?
+                            );
                             watch_store.remove(params.negotiation_id).await;
                             watch_store.flush().await?;
                             break;

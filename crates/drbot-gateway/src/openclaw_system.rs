@@ -273,14 +273,26 @@ impl OpenclawSystemPresence {
         // Track changes for a few keys the UI cares about.
         let mut changed = Vec::new();
         for (name, prev, nextv) in [
-            ("host", previous.as_ref().and_then(|p| p.host.as_deref()), next.host.as_deref()),
-            ("ip", previous.as_ref().and_then(|p| p.ip.as_deref()), next.ip.as_deref()),
+            (
+                "host",
+                previous.as_ref().and_then(|p| p.host.as_deref()),
+                next.host.as_deref(),
+            ),
+            (
+                "ip",
+                previous.as_ref().and_then(|p| p.ip.as_deref()),
+                next.ip.as_deref(),
+            ),
             (
                 "version",
                 previous.as_ref().and_then(|p| p.version.as_deref()),
                 next.version.as_deref(),
             ),
-            ("mode", previous.as_ref().and_then(|p| p.mode.as_deref()), next.mode.as_deref()),
+            (
+                "mode",
+                previous.as_ref().and_then(|p| p.mode.as_deref()),
+                next.mode.as_deref(),
+            ),
             (
                 "reason",
                 previous.as_ref().and_then(|p| p.reason.as_deref()),
@@ -323,4 +335,3 @@ impl OpenclawSystemPresence {
         out
     }
 }
-

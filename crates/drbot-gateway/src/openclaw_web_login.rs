@@ -86,10 +86,7 @@ impl OpenclawWebLoginStore {
                 return;
             }
         };
-        let svg = code
-            .render::<svg::Color>()
-            .min_dimensions(256, 256)
-            .build();
+        let svg = code.render::<svg::Color>().min_dimensions(256, 256).build();
         let b64 = drbot_base64_util::encode(svg.as_bytes());
         let data_url = format!("data:image/svg+xml;base64,{}", b64);
 
@@ -101,4 +98,3 @@ impl OpenclawWebLoginStore {
         let _ = self.whatsapp_tx.send(next);
     }
 }
-

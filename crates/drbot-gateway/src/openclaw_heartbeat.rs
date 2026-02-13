@@ -17,7 +17,7 @@ use drbot_agents::{
 };
 use drbot_core::message::Message;
 use drbot_core::message::Role;
-use drbot_providers::{ChatOptions, Provider, StreamEvent as ProviderStreamEvent};
+use drbot_providers::{ChatOptions, Provider, StreamEvent as ProviderStreamEvent, Usage};
 use futures::StreamExt;
 use serde_json::json;
 use std::collections::HashMap;
@@ -121,7 +121,8 @@ impl Drop for OpenclawMainLaneGuard {
 }
 
 fn resolve_state_key(state: &GatewayState) -> PathBuf {
-    crate::openclaw_paths::resolve_openclaw_state_dir(state.config()).unwrap_or_else(|| PathBuf::from(""))
+    crate::openclaw_paths::resolve_openclaw_state_dir(state.config())
+        .unwrap_or_else(|| PathBuf::from(""))
 }
 
 fn resolve_indicator_type(status: &str) -> Option<&'static str> {
@@ -482,7 +483,7 @@ async fn run_heartbeat_once_impl(
         crate::openclaw::refresh_remote_bins_for_connected_nodes_best_effort(st, false).await;
     });
 
-    let provider: Arc<dyn Provider> = match state.provider().cloned() {
+    let provider: Arc<dyn Provider> = match state.provider() {
         Some(p) => p,
         None => {
             emit_heartbeat_event(
@@ -505,9 +506,15 @@ async fn run_heartbeat_once_impl(
     let started_at = now_ms();
     let _lane = OpenclawMainLaneGuard::new(state.clone());
 
-    let workspace_dir = crate::openclaw_paths::resolve_agent_workspace_dir("default");
+    let workspace_dir = crate::openclaw::resolve_agent_workspace_dir_for_state(&state, "default");
     let mut heartbeat_sections: Vec<(String, String)> = Vec::new();
     let remote = crate::openclaw::resolve_remote_skill_eligibility(state).await;
+
+    let main_session_key = crate::openclaw::canonicalize_openclaw_session_key(
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+        "main",
+    );
+    let legacy_main_key = "main";
 
     // Workspace heartbeat file (optional).
     let heartbeat_path = workspace_dir.join(DEFAULT_HEARTBEAT_FILENAME);
@@ -519,13 +526,11 @@ async fn run_heartbeat_once_impl(
     // Skill-provided heartbeat files (optional).
     //
     // Many OpenClaw skills ship a HEARTBEAT.md alongside SKILL.md (e.g. Colosseum).
-    for (skill_name, base_dir) in
-        crate::openclaw_skills::list_eligible_skill_dirs_with_remote(
-            &workspace_dir,
-            state.config(),
-            remote.as_ref(),
-        )
-    {
+    for (skill_name, base_dir) in crate::openclaw_skills::list_eligible_skill_dirs_with_remote(
+        &workspace_dir,
+        state.config(),
+        remote.as_ref(),
+    ) {
         let path = base_dir.join(DEFAULT_HEARTBEAT_FILENAME);
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
@@ -542,7 +547,10 @@ async fn run_heartbeat_once_impl(
 
     // Pending system events (ephemeral queue). These should still be visible to
     // heartbeats even when transcripts are excluded.
-    let queued_system_events = state.openclaw_peek_system_events("main").await;
+    let mut queued_system_events = state.openclaw_peek_system_events(&main_session_key).await;
+    if legacy_main_key != main_session_key {
+        queued_system_events.extend(state.openclaw_peek_system_events(legacy_main_key).await);
+    }
     let has_system_events = !queued_system_events.is_empty();
 
     // Skip heartbeat only if we have at least one heartbeat file and all of them
@@ -570,11 +578,10 @@ async fn run_heartbeat_once_impl(
         };
     }
 
-    let include_transcript =
-        std::env::var("DRBOT_OPENCLAW_HEARTBEAT_INCLUDE_TRANSCRIPT")
-            .ok()
-            .as_deref()
-            == Some("1");
+    let include_transcript = std::env::var("DRBOT_OPENCLAW_HEARTBEAT_INCLUDE_TRANSCRIPT")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     // Load main session (if configured). We keep this best-effort even when
     // we don't include the transcript in the heartbeat prompt, so output can
@@ -583,7 +590,38 @@ async fn run_heartbeat_once_impl(
     let mut persisted_session = None;
     if let Some(store) = state.session_store() {
         let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
-        if let Ok(s) = store.get_or_create(user_id, "openclaw", "main").await {
+        let mut session = store
+            .get_by_channel("openclaw", &main_session_key)
+            .await
+            .ok()
+            .flatten();
+        if session.is_none() && legacy_main_key != main_session_key {
+            session = store
+                .get_by_channel("openclaw", legacy_main_key)
+                .await
+                .ok()
+                .flatten();
+            if let Some(mut s) = session.take() {
+                if store
+                    .get_by_channel("openclaw", &main_session_key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    s.channel_id = main_session_key.clone();
+                    let _ = store.update(&s).await;
+                }
+                session = Some(s);
+            }
+        }
+        if session.is_none() {
+            session = store
+                .get_or_create(user_id, "openclaw", &main_session_key)
+                .await
+                .ok();
+        }
+        if let Some(s) = session {
             if include_transcript {
                 messages.extend(s.messages.clone());
             }
@@ -628,7 +666,8 @@ async fn run_heartbeat_once_impl(
     }
 
     // AgentWallet-native prefetch: public network pulse.
-    if let Some(ctx) = crate::agentwallet::fetch_agentwallet_heartbeat_context(state.config()).await {
+    if let Some(ctx) = crate::agentwallet::fetch_agentwallet_heartbeat_context(state.config()).await
+    {
         if let Ok(pretty) = serde_json::to_string_pretty(&ctx) {
             prompt.push_str("\n\n---\nAgentWallet context (prefetched):\n");
             prompt.push_str(&pretty);
@@ -646,12 +685,16 @@ async fn run_heartbeat_once_impl(
         }
     }
 
-    let skills_prompt =
-        crate::openclaw_skills::build_workspace_skills_prompt_with_remote(
-            &workspace_dir,
-            state.config(),
-            remote.as_ref(),
-        );
+    let skills_filter = crate::openclaw::resolve_openclaw_agent_skills_filter(
+        state,
+        crate::openclaw_paths::DEFAULT_AGENT_ID,
+    );
+    let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
+        &workspace_dir,
+        state.config(),
+        remote.as_ref(),
+        skills_filter.as_deref(),
+    );
     let system_prompt_text = skills_prompt.trim().to_string();
     let system_prompt_opt = if system_prompt_text.is_empty() {
         None
@@ -671,17 +714,29 @@ async fn run_heartbeat_once_impl(
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|v| *v >= 1)
                 .unwrap_or(6),
-            model: crate::openclaw::resolve_openclaw_session_model_override(state, "main"),
+            model: crate::openclaw::resolve_openclaw_session_model_override(
+                state,
+                &main_session_key,
+            )
+            .or_else(|| crate::openclaw::resolve_openclaw_agent_default_model(state, "default")),
             system_prompt: system_prompt_text,
             use_planning: false,
-            iteration_timeout_secs: std::env::var("DRBOT_OPENCLAW_HEARTBEAT_ITERATION_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|v| *v >= 1)
-                .unwrap_or(60),
+            iteration_timeout_secs: std::env::var(
+                "DRBOT_OPENCLAW_HEARTBEAT_ITERATION_TIMEOUT_SECS",
+            )
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(60),
         };
 
-        let mut agent = DrbotAgent::new(provider.clone(), agent_cfg);
+        let provider = Arc::new(crate::openclaw_usage::UsageLoggingProvider::new(
+            state.clone(),
+            provider.clone(),
+            Some(main_session_key.clone()),
+            Some(format!("heartbeat-agent:{}", started_at)),
+        )) as Arc<dyn Provider>;
+        let mut agent = DrbotAgent::new(provider, agent_cfg);
 
         // Conservative baseline: do not expose generic HTTP, shell, or write tools in heartbeats.
         let builtin = match BuiltinTools::all(workspace_dir.clone()) {
@@ -692,7 +747,7 @@ async fn run_heartbeat_once_impl(
             }
         };
         for tool in builtin {
-            if matches!(tool.name(), "http" | "bash" | "write_file") {
+            if matches!(tool.name(), "http" | "bash" | "write_file" | "apply_patch") {
                 continue;
             }
             agent.register_tool(tool);
@@ -703,12 +758,20 @@ async fn run_heartbeat_once_impl(
         agent.register_tool(Arc::new(
             crate::openclaw_agent_tools::MoltbookRequestTool::new(state.clone()),
         ));
-        agent.register_tool(Arc::new(crate::openclaw_agent_tools::SendTool::new(
-            state.clone(),
-        )));
-        agent.register_tool(Arc::new(crate::openclaw_agent_tools::PollTool::new(
-            state.clone(),
-        )));
+        agent.register_tool(Arc::new(
+            crate::openclaw_agent_tools::SendTool::new_with_context(
+                state.clone(),
+                "default",
+                &main_session_key,
+            ),
+        ));
+        agent.register_tool(Arc::new(
+            crate::openclaw_agent_tools::PollTool::new_with_context(
+                state.clone(),
+                "default",
+                &main_session_key,
+            ),
+        ));
 
         for msg in &messages {
             let text = msg.text_content();
@@ -752,8 +815,14 @@ async fn run_heartbeat_once_impl(
         // Ensure the model has a fresh "tick" prompt even if the session has no new user input.
         messages.push(Message::user(prompt));
 
+        let model_override =
+            crate::openclaw::resolve_openclaw_session_model_override(state, &main_session_key);
+        let model_override = model_override
+            .clone()
+            .or_else(|| crate::openclaw::resolve_openclaw_agent_default_model(state, "default"));
+        let model_override_for_record = model_override.clone();
         let options = ChatOptions {
-            model: crate::openclaw::resolve_openclaw_session_model_override(state, "main"),
+            model: model_override,
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -763,6 +832,8 @@ async fn run_heartbeat_once_impl(
         };
 
         let mut full = String::new();
+        let mut final_usage: Option<Usage> = None;
+        let mut stream_model: Option<String> = None;
         let stream_res = provider.stream(&messages, options).await;
         let mut stream = match stream_res {
             Ok(s) => s,
@@ -786,7 +857,11 @@ async fn run_heartbeat_once_impl(
 
         while let Some(evt) = stream.next().await {
             match evt {
+                ProviderStreamEvent::Start { model } => stream_model = Some(model),
                 ProviderStreamEvent::Delta { content } => full.push_str(&content),
+                ProviderStreamEvent::Stop { reason: _, usage } => {
+                    final_usage = usage;
+                }
                 ProviderStreamEvent::Error { message } => {
                     let duration_ms = now_ms().saturating_sub(started_at);
                     emit_heartbeat_event(
@@ -806,6 +881,19 @@ async fn run_heartbeat_once_impl(
             }
         }
 
+        if let Some(usage) = final_usage.as_ref() {
+            let model_for_record = stream_model.clone().or(model_override_for_record.clone());
+            let record = crate::openclaw_usage::record_from_stream(
+                state,
+                provider.name(),
+                model_for_record,
+                Some(main_session_key.clone()),
+                Some(format!("heartbeat-stream:{}", started_at)),
+                usage,
+            );
+            crate::openclaw_usage::append_usage_record_best_effort(state, record).await;
+        }
+
         full
     };
 
@@ -814,7 +902,14 @@ async fn run_heartbeat_once_impl(
     // We've run a heartbeat (success path); clear queued system events so they
     // don't leak into subsequent prompts.
     if has_system_events {
-        let _ = state.openclaw_drain_system_event_entries("main").await;
+        let _ = state
+            .openclaw_drain_system_event_entries(&main_session_key)
+            .await;
+        if legacy_main_key != main_session_key {
+            let _ = state
+                .openclaw_drain_system_event_entries(legacy_main_key)
+                .await;
+        }
     }
 
     let trimmed = full.trim();

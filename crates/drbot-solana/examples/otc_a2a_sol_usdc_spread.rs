@@ -27,7 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create trader client and broadcast an RFQ to any desks.
     let trader = OtcTraderClient::new(hub.clone(), "trader-1").await;
-    let rfq = make_sol_rfq(TradeDirection::Buy, 1_000_000_000, 120, solana_sdk::pubkey::Pubkey::default());
+    let rfq = make_sol_rfq(
+        TradeDirection::Buy,
+        1_000_000_000,
+        120,
+        solana_sdk::pubkey::Pubkey::default(),
+    );
     let quotes = trader.broadcast_rfq(rfq, 5, Duration::from_secs(1)).await?;
 
     let output: Vec<_> = quotes

@@ -39,7 +39,10 @@ mod network;
 mod page;
 mod session;
 
-pub use browser::{Browser, BrowserOptions, TargetInfo, VersionInfo};
+pub use browser::{
+    Browser, BrowserDownload, BrowserNetworkRequest, BrowserOptions, BrowserPageError,
+    BrowserSetCookie, TargetInfo, VersionInfo,
+};
 pub use console::{ConsoleConfig, ConsoleMessage, ConsoleMonitor, LogLevel};
 pub use network::{
     HttpMethod, NetworkConfig, NetworkEntry, NetworkEvent, NetworkMonitor, NetworkRequest,

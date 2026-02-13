@@ -225,7 +225,9 @@ impl OpenclawPollStore {
 
         // Also enqueue an ephemeral system event for that session so the next agent
         // run can react without requiring transcripts.
-        state.openclaw_enqueue_system_event(&session_key, &note, None).await;
+        state
+            .openclaw_enqueue_system_event(&session_key, &note, None)
+            .await;
     }
 }
 

@@ -296,9 +296,9 @@ pub async fn colosseum_request(
 
     let allow_write = allow_write
         || std::env::var("DRBOT_OPENCLAW_COLOSSEUM_WRITE")
-        .ok()
-        .as_deref()
-        == Some("1");
+            .ok()
+            .as_deref()
+            == Some("1");
     let is_write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     if is_write && !dry_run && !allow_write {
         return Err(ErrorShape::new(
@@ -499,8 +499,7 @@ pub async fn sync_colosseum_docs_best_effort(cfg: &Config) {
                     drbot_core::markdown::extract_markdown_reference_definition_targets(&body),
                 );
 
-                let mut seen: std::collections::HashSet<PathBuf> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
                 let mut fetched = 0usize;
                 for target in targets {
                     if fetched >= max_relative_docs {
@@ -538,13 +537,8 @@ pub async fn sync_colosseum_docs_best_effort(cfg: &Config) {
                     }
 
                     let dest = resolve_colosseum_skill_dir(cfg).join(&rel_path);
-                    match sync_remote_markdown(
-                        &client,
-                        resolved.as_str(),
-                        &dest,
-                        min_interval_ms,
-                    )
-                    .await
+                    match sync_remote_markdown(&client, resolved.as_str(), &dest, min_interval_ms)
+                        .await
                     {
                         Ok(updated) => debug!(
                             updated,

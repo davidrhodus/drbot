@@ -267,7 +267,14 @@ impl OTCSkill {
 
         let quote = self
             .manager
-            .create_quote(rfq_uuid, price, quantity, settlement_asset, settlement_mint, 120)
+            .create_quote(
+                rfq_uuid,
+                price,
+                quantity,
+                settlement_asset,
+                settlement_mint,
+                120,
+            )
             .await
             .map_err(|e| drbot_skills::SkillError::ExecutionFailed(e.to_string()))?;
 

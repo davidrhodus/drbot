@@ -2,6 +2,9 @@
 //!
 //! This crate defines the `Provider` trait that all AI backends must implement.
 
+pub mod cli;
+pub use cli::CliProvider;
+
 use async_trait::async_trait;
 use drbot_core::message::Message;
 use drbot_core::Result;

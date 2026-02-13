@@ -21,6 +21,8 @@ drbot-skills.workspace = true
 drbot-agents.workspace = true
 drbot-channels.workspace = true
 drbot-webchat.workspace = true
+drbot-memory.workspace = true
+drbot-mcp.workspace = true
 drbot-telegram.workspace = true
 drbot-discord.workspace = true
 drbot-slack.workspace = true
@@ -28,6 +30,7 @@ drbot-whatsapp.workspace = true
 drbot-signal.workspace = true
 drbot-imessage.workspace = true
 drbot-matrix.workspace = true
+drbot-update.workspace = true
 chrono-tz = "0.10"
 json5 = "0.4"
 reqwest.workspace = true
@@ -35,7 +38,9 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tokio-stream.workspace = true
 axum.workspace = true
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower.workspace = true
+rustls.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -43,12 +48,16 @@ toml.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+regex.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
 ring.workspace = true
 async-trait.workspace = true
 qrcode = "0.14"
+libc = "0.2"
+portable-pty = "0.9"
+zip.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

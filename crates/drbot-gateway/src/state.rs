@@ -1,28 +1,30 @@
 //! Gateway state management.
 
-use crate::client::Client;
 use crate::channel_manager::ChannelManager;
+use crate::client::Client;
+use crate::openclaw_logs::OpenclawLogBuffer;
+use crate::openclaw_polls::OpenclawPollStore;
 use crate::openclaw_system::{
     OpenclawSystemEvents, OpenclawSystemPresence, SystemEventEntry, SystemPresence,
     SystemPresencePayload, SystemPresenceUpdate,
 };
-use crate::openclaw_polls::OpenclawPollStore;
-use crate::openclaw_logs::OpenclawLogBuffer;
 use crate::openclaw_web_login::OpenclawWebLoginStore;
 use drbot_anthropic::AnthropicProvider;
 use drbot_core::Config;
+use drbot_memory::MemoryStore;
 use drbot_ollama::OllamaProvider;
 use drbot_openai::OpenAIProvider;
-use drbot_providers::Provider;
+use drbot_providers::{CliProvider, Provider};
 use drbot_sessions::{SessionStore, SqliteSessionStore};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -92,7 +94,7 @@ struct GatewayStateInner {
     /// Server start time.
     start_time: Instant,
     /// AI provider.
-    provider: Option<Arc<dyn Provider>>,
+    provider: StdRwLock<Option<Arc<dyn Provider>>>,
     /// Session store.
     session_store: Option<Arc<dyn SessionStore>>,
     /// Outbound channels runtime (best-effort; used by OpenClaw send/poll).
@@ -111,6 +113,8 @@ struct GatewayStateInner {
     openclaw_inbound_started: Mutex<std::collections::HashSet<String>>,
     /// In-flight OpenClaw `chat.send` runs (global registry for cross-connection abort).
     openclaw_chat_runs: Mutex<HashMap<String, OpenclawChatRun>>,
+    /// Semantic memory store for OpenClaw runs (best-effort).
+    openclaw_memory_store: Option<Arc<MemoryStore>>,
 }
 
 #[derive(Clone)]
@@ -133,6 +137,7 @@ impl GatewayState {
         let openclaw_system_presence = Arc::new(OpenclawSystemPresence::new());
         let openclaw_polls = Arc::new(OpenclawPollStore::new());
         let openclaw_logs = Arc::new(OpenclawLogBuffer::new());
+        let openclaw_memory_store = init_openclaw_memory_store(&config);
 
         // Initialize session store
         let session_store: Option<Arc<dyn SessionStore>> =
@@ -151,7 +156,7 @@ impl GatewayState {
                 openclaw_last_heartbeat: RwLock::new(None),
                 openclaw_main_inflight: AtomicU64::new(0),
                 start_time: Instant::now(),
-                provider,
+                provider: StdRwLock::new(provider),
                 session_store,
                 channel_manager,
                 openclaw_system_events,
@@ -161,6 +166,7 @@ impl GatewayState {
                 openclaw_logs,
                 openclaw_inbound_started: Mutex::new(std::collections::HashSet::new()),
                 openclaw_chat_runs: Mutex::new(HashMap::new()),
+                openclaw_memory_store,
             }),
         }
     }
@@ -171,8 +177,20 @@ impl GatewayState {
     }
 
     /// Get the AI provider.
-    pub fn provider(&self) -> Option<&Arc<dyn Provider>> {
-        self.inner.provider.as_ref()
+    pub fn provider(&self) -> Option<Arc<dyn Provider>> {
+        self.inner
+            .provider
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_provider(&self, provider: Option<Arc<dyn Provider>>) {
+        *self
+            .inner
+            .provider
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = provider;
     }
 
     /// Get the session store.
@@ -194,6 +212,10 @@ impl GatewayState {
 
     pub fn openclaw_logs(&self) -> &OpenclawLogBuffer {
         self.inner.openclaw_logs.as_ref()
+    }
+
+    pub fn openclaw_memory_store(&self) -> Option<&Arc<MemoryStore>> {
+        self.inner.openclaw_memory_store.as_ref()
     }
 
     /// Register a channel listener as started for the inbound bridge.
@@ -351,7 +373,10 @@ impl GatewayState {
     }
 
     pub async fn openclaw_has_system_events(&self, session_key: &str) -> bool {
-        self.inner.openclaw_system_events.has_events(session_key).await
+        self.inner
+            .openclaw_system_events
+            .has_events(session_key)
+            .await
     }
 
     pub async fn openclaw_drain_system_event_entries(
@@ -514,20 +539,77 @@ impl GatewayState {
 
     /// Check if authentication is required.
     pub fn auth_required(&self) -> bool {
-        self.inner.config.gateway.auth_token.is_some()
+        self.inner
+            .config
+            .gateway
+            .auth_token
+            .as_deref()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .is_some()
     }
 
     /// Validate an authentication token.
     pub fn validate_token(&self, token: &str) -> bool {
-        match &self.inner.config.gateway.auth_token {
-            Some(expected) => token == expected,
-            None => true, // No auth required
+        let expected = self
+            .inner
+            .config
+            .gateway
+            .auth_token
+            .as_deref()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty());
+        let Some(expected) = expected else {
+            return true; // No auth required
+        };
+
+        let provided = token.trim();
+        if provided.is_empty() || provided.len() != expected.len() {
+            return false;
         }
+
+        // Avoid `==` so we don't leak early-exit timing on mismatches.
+        let mut diff: u8 = 0;
+        for (a, b) in provided.as_bytes().iter().zip(expected.as_bytes().iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
+    /// Validate an inbound webhook token (hooks.token).
+    pub fn validate_hooks_token(&self, token: &str) -> bool {
+        let expected = self
+            .inner
+            .config
+            .hooks
+            .token
+            .as_deref()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty());
+        let Some(expected) = expected else {
+            return false;
+        };
+
+        let provided = token.trim();
+        if provided.is_empty() || provided.len() != expected.len() {
+            return false;
+        }
+
+        // Avoid `==` so we don't leak early-exit timing on mismatches.
+        let mut diff: u8 = 0;
+        for (a, b) in provided.as_bytes().iter().zip(expected.as_bytes().iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+
 
     /// Check if the provider is configured.
     pub fn has_provider(&self) -> bool {
-        self.inner.provider.is_some()
+        self.inner
+            .provider
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Check if the session store is configured.
@@ -536,7 +618,41 @@ impl GatewayState {
     }
 }
 
-fn init_provider(config: &Config) -> Option<Arc<dyn Provider>> {
+fn init_openclaw_memory_store(config: &Config) -> Option<Arc<MemoryStore>> {
+    fn truthy(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    let enabled = std::env::var("DRBOT_OPENCLAW_MEMORY_ENABLED")
+        .ok()
+        .as_deref()
+        .map(truthy)
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+
+    let Some(dir) = crate::openclaw_paths::resolve_openclaw_state_dir(config) else {
+        return None;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+
+    let path: PathBuf = dir.join("openclaw-memory.sqlite");
+    match MemoryStore::new(&path) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(err) => {
+            tracing::warn!(error = %err, path = %path.to_string_lossy(), "failed to open OpenClaw memory store");
+            None
+        }
+    }
+}
+
+pub(crate) fn init_provider(config: &Config) -> Option<Arc<dyn Provider>> {
     let selected = config
         .providers
         .default_provider
@@ -548,7 +664,15 @@ fn init_provider(config: &Config) -> Option<Arc<dyn Provider>> {
         "anthropic" | "claude" => init_provider_anthropic(config),
         "openai" | "gpt" => init_provider_openai(config),
         "ollama" | "local" => init_provider_ollama(config),
+        "claude-cli" | "claude-code" => init_provider_cli_preset(config, "claude-cli"),
+        "codex-cli" | "codex" => init_provider_cli_preset(config, "codex-cli"),
         other => {
+            if let Some(provider) = init_provider_openai_compatible(config, other) {
+                return Some(provider);
+            }
+            if let Some(provider) = init_provider_cli_custom(config, other) {
+                return Some(provider);
+            }
             tracing::warn!(provider = %other, "Unknown provider; falling back to auto");
             init_provider_auto(config)
         }
@@ -566,6 +690,9 @@ fn init_provider_anthropic(config: &Config) -> Option<Arc<dyn Provider>> {
         let mut provider = AnthropicProvider::new(&cfg.api_key);
         if let Some(base_url) = &cfg.base_url {
             provider = provider.with_base_url(base_url);
+        }
+        if !cfg.headers.is_empty() {
+            provider = provider.with_extra_headers(cfg.headers.clone());
         }
         let model = cfg
             .default_model
@@ -588,6 +715,9 @@ fn init_provider_openai(config: &Config) -> Option<Arc<dyn Provider>> {
         if let Some(base_url) = &cfg.base_url {
             provider = provider.with_base_url(base_url);
         }
+        if !cfg.headers.is_empty() {
+            provider = provider.with_extra_headers(cfg.headers.clone());
+        }
         let model = cfg
             .default_model
             .clone()
@@ -598,6 +728,35 @@ fn init_provider_openai(config: &Config) -> Option<Arc<dyn Provider>> {
         tracing::info!(provider = "openai", "Initialized provider");
         Arc::new(provider) as Arc<dyn Provider>
     })
+}
+
+fn init_provider_openai_compatible(config: &Config, name: &str) -> Option<Arc<dyn Provider>> {
+    config
+        .providers
+        .openai_compatible
+        .iter()
+        .find(|c| c.name == name)
+        .map(|cfg| {
+            let mut provider = OpenAIProvider::new(&cfg.api_key)
+                .with_provider_name(name.to_string())
+                .with_base_url(cfg.base_url.clone());
+            let model = cfg
+                .default_model
+                .clone()
+                .or_else(|| config.providers.default_model.clone());
+            if let Some(model) = model {
+                provider = provider.with_default_model(model);
+            }
+            if !cfg.headers.is_empty() {
+                provider = provider.with_extra_headers(cfg.headers.clone());
+            }
+            tracing::info!(
+                provider = %name,
+                base_url = %cfg.base_url,
+                "Initialized OpenAI-compatible provider"
+            );
+            Arc::new(provider) as Arc<dyn Provider>
+        })
 }
 
 fn init_provider_ollama(config: &Config) -> Option<Arc<dyn Provider>> {
@@ -611,6 +770,32 @@ fn init_provider_ollama(config: &Config) -> Option<Arc<dyn Provider>> {
             provider = provider.with_default_model(model);
         }
         tracing::info!(provider = "ollama", base_url = %cfg.url, "Initialized provider");
+        Arc::new(provider) as Arc<dyn Provider>
+    })
+}
+
+fn init_provider_cli_preset(_config: &Config, name: &str) -> Option<Arc<dyn Provider>> {
+    let provider = match name {
+        "claude-cli" | "claude-code" => CliProvider::claude_cli(),
+        "codex-cli" | "codex" => CliProvider::codex_cli(),
+        _ => return None,
+    };
+    match provider.check_command_exists() {
+        Ok(()) => {
+            tracing::info!(provider = %name, "Initialized CLI provider");
+            Some(Arc::new(provider))
+        }
+        Err(e) => {
+            tracing::warn!(provider = %name, error = %e, "CLI provider not available");
+            None
+        }
+    }
+}
+
+fn init_provider_cli_custom(config: &Config, name: &str) -> Option<Arc<dyn Provider>> {
+    config.providers.cli.iter().find(|c| c.name == name).map(|cfg| {
+        let provider = CliProvider::from_config(cfg);
+        tracing::info!(provider = %name, command = %cfg.command, "Initialized custom CLI provider");
         Arc::new(provider) as Arc<dyn Provider>
     })
 }

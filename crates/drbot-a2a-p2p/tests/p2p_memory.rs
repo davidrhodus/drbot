@@ -117,10 +117,8 @@ async fn p2p_retries_outbound_messages_across_peer_restart() {
     let hub_a = Arc::new(A2AHub::new(A2AConfig::default(), agent_a.clone()));
     let hub_b = Arc::new(A2AHub::new(A2AConfig::default(), agent_b.clone()));
 
-    let identity_path = std::env::temp_dir().join(format!(
-        "drbot-a2a-p2p-test-{}.key",
-        uuid::Uuid::new_v4()
-    ));
+    let identity_path =
+        std::env::temp_dir().join(format!("drbot-a2a-p2p-test-{}.key", uuid::Uuid::new_v4()));
 
     let mut cfg_a = P2PConfig::default();
     cfg_a.listen_addrs = vec!["/memory/0".parse().unwrap()];

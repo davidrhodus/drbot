@@ -9,11 +9,8 @@ use tokio::sync::Mutex;
 
 const MAX_LOG_BYTES: usize = 5_000_000;
 
-fn now_ms() -> u64 {
-    chrono::Utc::now()
-        .timestamp_millis()
-        .try_into()
-        .unwrap_or(0)
+fn now_stamp() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +46,7 @@ impl OpenclawLogBuffer {
         }
 
         // Prefix with timestamp to keep logs readable when tailing.
-        let stamped = format!("[{}] {}\n", now_ms(), line);
+        let stamped = format!("[{}] {}\n", now_stamp(), line);
         let mut st = self.inner.lock().await;
         st.bytes.extend_from_slice(stamped.as_bytes());
 
@@ -61,7 +58,11 @@ impl OpenclawLogBuffer {
         let overflow = st.bytes.len().saturating_sub(MAX_LOG_BYTES);
         let mut drop_len = overflow;
         if drop_len > 0 {
-            if let Some(pos) = st.bytes.get(drop_len..).and_then(|rest| rest.iter().position(|b| *b == b'\n')) {
+            if let Some(pos) = st
+                .bytes
+                .get(drop_len..)
+                .and_then(|rest| rest.iter().position(|b| *b == b'\n'))
+            {
                 drop_len = drop_len.saturating_add(pos + 1);
             }
         }
@@ -71,7 +72,12 @@ impl OpenclawLogBuffer {
         }
     }
 
-    pub async fn tail(&self, cursor: Option<u64>, limit: usize, max_bytes: usize) -> LogsTailResult {
+    pub async fn tail(
+        &self,
+        cursor: Option<u64>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> LogsTailResult {
         let max_bytes = max_bytes.clamp(1, 1_000_000) as u64;
         let limit = limit.clamp(1, 5000);
 
@@ -118,7 +124,10 @@ impl OpenclawLogBuffer {
         let offset = start.saturating_sub(st.base_cursor) as usize;
         let slice = &st.bytes[offset..];
 
-        let mut lines = String::from_utf8_lossy(slice).split('\n').map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut lines = String::from_utf8_lossy(slice)
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
 
         // If we started mid-line, drop the first partial line (OpenClaw parity).
         if start > st.base_cursor {

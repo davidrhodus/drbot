@@ -138,7 +138,10 @@ mod tests {
     fn extracts_inline_link_targets() {
         let md = "See [doc](docs/one.md) and [x](two.md#section).";
         let out = extract_markdown_inline_link_targets(md);
-        assert_eq!(out, vec!["docs/one.md".to_string(), "two.md#section".to_string()]);
+        assert_eq!(
+            out,
+            vec!["docs/one.md".to_string(), "two.md#section".to_string()]
+        );
     }
 
     #[test]

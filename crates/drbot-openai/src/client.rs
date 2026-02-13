@@ -11,6 +11,7 @@ use drbot_providers::{
 };
 use futures::stream::Stream;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::pin::Pin;
 use tracing::{debug, error, trace};
 
@@ -24,6 +25,8 @@ pub const DEFAULT_MODEL: &str = "gpt-4o";
 pub struct OpenAIProvider {
     /// HTTP client.
     client: Client,
+    /// Provider name (for gateway/UI).
+    provider_name: String,
     /// API key.
     api_key: String,
     /// Base URL for the API.
@@ -32,6 +35,8 @@ pub struct OpenAIProvider {
     default_model: String,
     /// Default max tokens.
     default_max_tokens: usize,
+    /// Additional headers to send with each request (OpenRouter attribution, etc).
+    extra_headers: HashMap<String, String>,
 }
 
 impl OpenAIProvider {
@@ -39,16 +44,30 @@ impl OpenAIProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
+            provider_name: "openai".to_string(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             default_model: DEFAULT_MODEL.to_string(),
             default_max_tokens: 4096,
+            extra_headers: HashMap::new(),
         }
+    }
+
+    /// Set the provider name (used for UI/usage attribution).
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = name.into();
+        self
     }
 
     /// Set the base URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Set additional headers for requests.
+    pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.extra_headers = headers;
         self
     }
 
@@ -93,8 +112,8 @@ impl OpenAIProvider {
                 match block {
                     Content::Text { text: t } => text.push_str(t),
                     Content::ToolUse { id, name, input } => {
-                        let args = serde_json::to_string(input)
-                            .unwrap_or_else(|_| "null".to_string());
+                        let args =
+                            serde_json::to_string(input).unwrap_or_else(|_| "null".to_string());
                         tool_calls.push(crate::api::ToolCall {
                             id: id.clone(),
                             tool_type: "function".to_string(),
@@ -212,40 +231,122 @@ impl OpenAIProvider {
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn name(&self) -> &str {
-        "openai"
+        self.provider_name.as_str()
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        vec![
+        let provider = self.provider_name.clone();
+        let mut models = vec![
+            ModelInfo {
+                id: "gpt-5.3".to_string(),
+                name: "GPT-5.3".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.3-codex".to_string(),
+                name: "GPT-5.3 Codex".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.2".to_string(),
+                name: "GPT-5.2".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.2-codex".to_string(),
+                name: "GPT-5.2 Codex".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.1".to_string(),
+                name: "GPT-5.1".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.1-codex".to_string(),
+                name: "GPT-5.1 Codex".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.1-codex-mini".to_string(),
+                name: "GPT-5.1 Codex Mini".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.1-codex-max".to_string(),
+                name: "GPT-5.1 Codex Max".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
+            ModelInfo {
+                id: "gpt-5.0".to_string(),
+                name: "GPT-5.0".to_string(),
+                provider: provider.clone(),
+                context_window: 400000,
+                max_output_tokens: Some(128000),
+            },
             ModelInfo {
                 id: "gpt-4o".to_string(),
                 name: "GPT-4o".to_string(),
-                provider: "openai".to_string(),
+                provider: provider.clone(),
                 context_window: 128000,
                 max_output_tokens: Some(16384),
             },
             ModelInfo {
                 id: "gpt-4o-mini".to_string(),
                 name: "GPT-4o Mini".to_string(),
-                provider: "openai".to_string(),
+                provider: provider.clone(),
                 context_window: 128000,
                 max_output_tokens: Some(16384),
             },
             ModelInfo {
                 id: "gpt-4-turbo".to_string(),
                 name: "GPT-4 Turbo".to_string(),
-                provider: "openai".to_string(),
+                provider: provider.clone(),
                 context_window: 128000,
                 max_output_tokens: Some(4096),
             },
             ModelInfo {
                 id: "gpt-3.5-turbo".to_string(),
                 name: "GPT-3.5 Turbo".to_string(),
-                provider: "openai".to_string(),
+                provider: provider.clone(),
                 context_window: 16385,
                 max_output_tokens: Some(4096),
             },
-        ]
+        ];
+
+        // Ensure the configured default model appears in `models.list` even if it's not
+        // in the small built-in catalog (OpenClaw Control UI convenience).
+        if !models.iter().any(|m| m.id == self.default_model) {
+            models.push(ModelInfo {
+                id: self.default_model.clone(),
+                name: self.default_model.clone(),
+                provider,
+                context_window: if self.default_model.starts_with("gpt-5") {
+                    400000
+                } else {
+                    128000
+                },
+                max_output_tokens: None,
+            });
+        }
+
+        models
     }
 
     async fn chat(
@@ -256,13 +357,31 @@ impl Provider for OpenAIProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let request = self.build_request(messages, &options, false);
 
-        debug!(model = %request.model, "Sending chat request to OpenAI");
+        debug!(
+            provider = %self.provider_name,
+            model = %request.model,
+            "Sending chat request"
+        );
 
-        let response = self
+        let mut builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        for (key, value) in &self.extra_headers {
+            let key_trimmed = key.trim();
+            if key_trimmed.is_empty() {
+                continue;
+            }
+            if key_trimmed.eq_ignore_ascii_case("authorization")
+                || key_trimmed.eq_ignore_ascii_case("content-type")
+            {
+                continue;
+            }
+            builder = builder.header(key_trimmed, value);
+        }
+
+        let response = builder
             .json(&request)
             .send()
             .await
@@ -298,9 +417,8 @@ impl Provider for OpenAIProvider {
             .unwrap_or_default()
             .into_iter()
             .map(|tc| {
-                let input =
-                    serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                        .unwrap_or(serde_json::Value::Null);
+                let input = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                    .unwrap_or(serde_json::Value::Null);
                 ToolUse {
                     id: tc.id,
                     name: tc.function.name,
@@ -334,13 +452,31 @@ impl Provider for OpenAIProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let request = self.build_request(messages, &options, true);
 
-        debug!(model = %request.model, "Starting streaming request to OpenAI");
+        debug!(
+            provider = %self.provider_name,
+            model = %request.model,
+            "Starting streaming request"
+        );
 
-        let response = self
+        let mut builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        for (key, value) in &self.extra_headers {
+            let key_trimmed = key.trim();
+            if key_trimmed.is_empty() {
+                continue;
+            }
+            if key_trimmed.eq_ignore_ascii_case("authorization")
+                || key_trimmed.eq_ignore_ascii_case("content-type")
+            {
+                continue;
+            }
+            builder = builder.header(key_trimmed, value);
+        }
+
+        let response = builder
             .json(&request)
             .send()
             .await
@@ -511,6 +647,8 @@ mod tests {
         let models = provider.models();
         assert!(!models.is_empty());
         assert!(models.iter().any(|m| m.id == "gpt-4o"));
+        assert!(models.iter().any(|m| m.id == "gpt-5.3"));
+        assert!(models.iter().any(|m| m.id == "gpt-5.3-codex"));
     }
 
     #[test]

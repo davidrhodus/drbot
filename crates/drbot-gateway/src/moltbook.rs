@@ -316,9 +316,9 @@ pub async fn moltbook_request(
 
     let allow_write = allow_write
         || std::env::var("DRBOT_OPENCLAW_MOLTBOOK_WRITE")
-        .ok()
-        .as_deref()
-        == Some("1");
+            .ok()
+            .as_deref()
+            == Some("1");
     let is_write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     if is_write && !dry_run && !allow_write {
         return Err(ErrorShape::new(
@@ -437,7 +437,16 @@ pub async fn moltbook_create_post(
         "content": content,
         "submolt": submolt,
     });
-    moltbook_request("POST", "/posts", None, Some(&body), None, dry_run, allow_write).await
+    moltbook_request(
+        "POST",
+        "/posts",
+        None,
+        Some(&body),
+        None,
+        dry_run,
+        allow_write,
+    )
+    .await
 }
 
 /// Read the feed (optionally filtered by submolt).
@@ -474,7 +483,16 @@ pub async fn moltbook_create_comment(
     }
     let path = format!("/posts/{}/comments", post_id);
     let body_val = serde_json::Value::Object(body);
-    moltbook_request("POST", &path, None, Some(&body_val), None, dry_run, allow_write).await
+    moltbook_request(
+        "POST",
+        &path,
+        None,
+        Some(&body_val),
+        None,
+        dry_run,
+        allow_write,
+    )
+    .await
 }
 
 /// Upvote or downvote a post.
@@ -484,7 +502,11 @@ pub async fn moltbook_vote(
     dry_run: bool,
     allow_write: bool,
 ) -> Result<serde_json::Value, ErrorShape> {
-    let suffix = if direction == "down" { "downvote" } else { "upvote" };
+    let suffix = if direction == "down" {
+        "downvote"
+    } else {
+        "upvote"
+    };
     let path = format!("/posts/{}/{}", post_id, suffix);
     moltbook_request("POST", &path, None, None, None, dry_run, allow_write).await
 }
@@ -497,16 +519,24 @@ pub async fn moltbook_get_identity(
 ) -> Result<serde_json::Value, ErrorShape> {
     match action {
         "status" => moltbook_request("GET", "/agents/status", None, None, None, false, false).await,
-        "token" => moltbook_request("POST", "/agents/me/identity-token", None, None, None, dry_run, allow_write).await,
+        "token" => {
+            moltbook_request(
+                "POST",
+                "/agents/me/identity-token",
+                None,
+                None,
+                None,
+                dry_run,
+                allow_write,
+            )
+            .await
+        }
         _ => moltbook_request("GET", "/agents/me", None, None, None, false, false).await, // "profile" or default
     }
 }
 
 /// Search posts, agents, or submolts.
-pub async fn moltbook_search(
-    query_str: &str,
-    limit: u64,
-) -> Result<serde_json::Value, ErrorShape> {
+pub async fn moltbook_search(query_str: &str, limit: u64) -> Result<serde_json::Value, ErrorShape> {
     let q = json!({ "q": query_str, "limit": limit });
     moltbook_request("GET", "/search", Some(&q), None, None, false, false).await
 }
@@ -554,7 +584,16 @@ pub async fn moltbook_dm(
                 ));
             }
             let body = json!({ "to": to, "message": message });
-            moltbook_request("POST", "/agents/dm/send", None, Some(&body), None, dry_run, allow_write).await
+            moltbook_request(
+                "POST",
+                "/agents/dm/send",
+                None,
+                Some(&body),
+                None,
+                dry_run,
+                allow_write,
+            )
+            .await
         }
         _ => {
             // "check" or default

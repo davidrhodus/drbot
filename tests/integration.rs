@@ -55,6 +55,7 @@ fn test_config_serialization_roundtrip() {
     config.providers.anthropic = Some(AnthropicConfig {
         api_key: "test-key".to_string(),
         base_url: None,
+        headers: Default::default(),
         default_model: Some("claude-sonnet-4-20250514".to_string()),
         max_tokens: Some(4096),
     });

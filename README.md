@@ -81,6 +81,7 @@ drbot gateway              # Start WebSocket gateway server
 drbot chat                 # Interactive chat with AI
 drbot tui                  # Terminal UI chat interface
 drbot skills               # Manage OpenClaw-style skills (status/sync/prompt)
+drbot skills clawhub-install # Install a ClawHub skill into the managed skills dir
 drbot config               # Show current configuration
 drbot doctor               # Run health checks
 ```
@@ -234,6 +235,16 @@ for interoperability with OpenClaw clients (Control UI, nodes).
   to bypass approvals.
 - OpenClaw agent runs include a restricted `bash` tool by default; set `DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST`
   (comma-separated) or `DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL=1` to relax it.
+
+### ClawHub Skills
+
+Install skills from ClawHub (requires the ClawHub CLI):
+
+```bash
+drbot skills clawhub-install <skill-slug>
+```
+
+Optional flags mirror the CLI (`--site`, `--registry`, `--version`, `--force`, `--timeout-ms`).
 
 ## Providers
 

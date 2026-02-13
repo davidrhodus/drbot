@@ -41,8 +41,12 @@ fn parse_unified_diff_hunk_header(line: &str) -> Result<(usize, usize, usize, us
     };
     let body = trimmed[2..end].trim();
     let mut parts = body.split_whitespace();
-    let old = parts.next().ok_or_else(|| format!("invalid hunk header: {}", line))?;
-    let new = parts.next().ok_or_else(|| format!("invalid hunk header: {}", line))?;
+    let old = parts
+        .next()
+        .ok_or_else(|| format!("invalid hunk header: {}", line))?;
+    let new = parts
+        .next()
+        .ok_or_else(|| format!("invalid hunk header: {}", line))?;
 
     fn parse_range(token: &str, sigil: char) -> Result<(usize, usize), String> {
         let t = token
@@ -104,7 +108,13 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>, String> {
 
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("--- ") {
-            finish_file(&mut files, &mut cur_old, &mut cur_new, &mut cur_hunks, &mut cur_hunk);
+            finish_file(
+                &mut files,
+                &mut cur_old,
+                &mut cur_new,
+                &mut cur_hunks,
+                &mut cur_hunk,
+            );
             let token = rest.trim().split_whitespace().next().unwrap_or("");
             if token.is_empty() {
                 return Err(format!("invalid --- line: {}", line));
@@ -123,7 +133,8 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>, String> {
 
         if line.starts_with("@@") {
             finish_hunk(&mut cur_hunks, &mut cur_hunk);
-            let (old_start, old_count, new_start, new_count) = parse_unified_diff_hunk_header(line)?;
+            let (old_start, old_count, new_start, new_count) =
+                parse_unified_diff_hunk_header(line)?;
             cur_hunk = Some(UnifiedDiffHunk {
                 old_start,
                 old_count,
@@ -148,7 +159,13 @@ pub fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>, String> {
         }
     }
 
-    finish_file(&mut files, &mut cur_old, &mut cur_new, &mut cur_hunks, &mut cur_hunk);
+    finish_file(
+        &mut files,
+        &mut cur_old,
+        &mut cur_new,
+        &mut cur_hunks,
+        &mut cur_hunk,
+    );
     Ok(files)
 }
 
@@ -227,4 +244,3 @@ pub fn apply_unified_diff_to_text(
     }
     Ok(rendered)
 }
-

@@ -111,12 +111,18 @@ impl EscrowManager {
     }
 
     fn program_id(&self) -> Result<Pubkey> {
-        self.escrow_program_id
-            .ok_or_else(|| SolanaError::ConfigError("OTC escrow program id not configured".to_string()))
+        self.escrow_program_id.ok_or_else(|| {
+            SolanaError::ConfigError("OTC escrow program id not configured".to_string())
+        })
     }
 
     /// Deterministically derive the escrow PDA for a given negotiation and counterparty pair.
-    pub fn derive_address(&self, negotiation_id: Uuid, party_a: Pubkey, party_b: Pubkey) -> Result<(Pubkey, u8)> {
+    pub fn derive_address(
+        &self,
+        negotiation_id: Uuid,
+        party_a: Pubkey,
+        party_b: Pubkey,
+    ) -> Result<(Pubkey, u8)> {
         let program_id = self.program_id()?;
         Ok(derive_escrow_pda(
             &program_id,
@@ -127,7 +133,12 @@ impl EscrowManager {
     }
 
     /// Deterministically derive the receipt PDA for a given negotiation and counterparty pair.
-    pub fn derive_receipt_address(&self, negotiation_id: Uuid, party_a: Pubkey, party_b: Pubkey) -> Result<(Pubkey, u8)> {
+    pub fn derive_receipt_address(
+        &self,
+        negotiation_id: Uuid,
+        party_a: Pubkey,
+        party_b: Pubkey,
+    ) -> Result<(Pubkey, u8)> {
         let program_id = self.program_id()?;
         Ok(derive_receipt_pda(
             &program_id,
@@ -142,8 +153,13 @@ impl EscrowManager {
     }
 
     /// Create (or verify) an escrow on-chain. Idempotent if escrow already exists with matching terms.
-    pub async fn create_escrow(&self, payer: &Keypair, params: CreateEscrowParams) -> Result<(Pubkey, Signature)> {
-        self.create_escrow_with_fee_payer(payer, payer, params).await
+    pub async fn create_escrow(
+        &self,
+        payer: &Keypair,
+        params: CreateEscrowParams,
+    ) -> Result<(Pubkey, Signature)> {
+        self.create_escrow_with_fee_payer(payer, payer, params)
+            .await
     }
 
     /// Same as [`Self::create_escrow`] but allows a separate transaction fee-payer.
@@ -155,7 +171,8 @@ impl EscrowManager {
     ) -> Result<(Pubkey, Signature)> {
         let program_id = self.program_id()?;
         let terms = params.to_terms();
-        let (escrow, _bump) = self.derive_address(params.negotiation_id, params.party_a, params.party_b)?;
+        let (escrow, _bump) =
+            self.derive_address(params.negotiation_id, params.party_a, params.party_b)?;
         let (receipt, _receipt_bump) = derive_receipt_pda(
             &program_id,
             params.negotiation_id.as_bytes(),
@@ -213,9 +230,9 @@ impl EscrowManager {
 
     /// Read escrow state from chain.
     pub async fn get_escrow(&self, address: &Pubkey) -> Result<EscrowAccount> {
-        self.try_get_escrow(address)
-            .await?
-            .ok_or_else(|| SolanaError::TransactionError(format!("Escrow account not found: {address}")))
+        self.try_get_escrow(address).await?.ok_or_else(|| {
+            SolanaError::TransactionError(format!("Escrow account not found: {address}"))
+        })
     }
 
     /// Read escrow state from chain, returning `Ok(None)` if the account does not exist.
@@ -234,8 +251,9 @@ impl EscrowManager {
             )));
         }
 
-        let state = OnChainEscrowState::try_from_slice(&account.data)
-            .map_err(|e| SolanaError::TransactionError(format!("Failed to decode escrow state: {e}")))?;
+        let state = OnChainEscrowState::try_from_slice(&account.data).map_err(|e| {
+            SolanaError::TransactionError(format!("Failed to decode escrow state: {e}"))
+        })?;
 
         Ok(Some(EscrowAccount {
             address: *address,
@@ -323,7 +341,12 @@ impl EscrowManager {
     }
 
     /// Fund Party A. If this is the second fund, it will auto-settle and close escrow/vaults.
-    pub async fn fund_party_a(&self, funder: &Keypair, escrow: Pubkey, token_source: Option<Pubkey>) -> Result<Signature> {
+    pub async fn fund_party_a(
+        &self,
+        funder: &Keypair,
+        escrow: Pubkey,
+        token_source: Option<Pubkey>,
+    ) -> Result<Signature> {
         self.fund_with_fee_payer(
             funder,
             funder,
@@ -331,7 +354,7 @@ impl EscrowManager {
             drbot_otc_escrow_program::EscrowParty::PartyA,
             token_source,
         )
-            .await
+        .await
     }
 
     /// Same as [`Self::fund_party_a`] but allows a separate transaction fee-payer.
@@ -353,7 +376,12 @@ impl EscrowManager {
     }
 
     /// Fund Party B. If this is the second fund, it will auto-settle and close escrow/vaults.
-    pub async fn fund_party_b(&self, funder: &Keypair, escrow: Pubkey, token_source: Option<Pubkey>) -> Result<Signature> {
+    pub async fn fund_party_b(
+        &self,
+        funder: &Keypair,
+        escrow: Pubkey,
+        token_source: Option<Pubkey>,
+    ) -> Result<Signature> {
         self.fund_with_fee_payer(
             funder,
             funder,
@@ -361,7 +389,7 @@ impl EscrowManager {
             drbot_otc_escrow_program::EscrowParty::PartyB,
             token_source,
         )
-            .await
+        .await
     }
 
     /// Same as [`Self::fund_party_b`] but allows a separate transaction fee-payer.
@@ -586,7 +614,9 @@ fn should_create_account(err: Option<&ClientError>) -> bool {
 
 fn is_account_not_found(err: &ClientError) -> bool {
     let msg = err.to_string();
-    msg.contains("AccountNotFound") || msg.contains("could not find account") || msg.contains("could not find")
+    msg.contains("AccountNotFound")
+        || msg.contains("could not find account")
+        || msg.contains("could not find")
 }
 
 #[cfg(test)]

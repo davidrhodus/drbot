@@ -222,7 +222,8 @@ async fn openclaw_device_auth_token_fallback() {
     let public_key_b64 = b64url_no_pad(&public_key_raw);
 
     // First connect with the shared auth token (issues device token).
-    let device_token_1 = connect_with_device(port, &keypair, &device_id, &public_key_b64, "shared-secret").await;
+    let device_token_1 =
+        connect_with_device(port, &keypair, &device_id, &public_key_b64, "shared-secret").await;
 
     // Second connect with the device token (shared token is wrong, but device-token fallback should succeed).
     let device_token_2 =

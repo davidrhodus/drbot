@@ -19,8 +19,8 @@ use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const DEFAULT_ACCEPT_REPLAY_TTL: Duration = Duration::from_secs(60 * 10);
@@ -88,7 +88,8 @@ pub fn spawn_desk_settlement_service(
     fee_payer_keypair: Option<Keypair>,
     create_escrow_if_missing: bool,
 ) -> JoinHandle<()> {
-    let escrow_manager = Arc::new(EscrowManager::new(rpc_client).with_program_id(escrow_program_id));
+    let escrow_manager =
+        Arc::new(EscrowManager::new(rpc_client).with_program_id(escrow_program_id));
     let desk_keypair = Arc::new(Mutex::new(desk_keypair));
     let fee_payer_keypair = fee_payer_keypair.map(|kp| Arc::new(Mutex::new(kp)));
     let create_escrow_if_missing = Arc::new(create_escrow_if_missing);
@@ -330,7 +331,11 @@ async fn process_desk_accept(
     }
 
     // Create escrow only if it appears missing. (If it was already created, avoid paying fees.)
-    let (escrow_address, _) = match escrow_manager.derive_address(params.negotiation_id, params.party_a, params.party_b) {
+    let (escrow_address, _) = match escrow_manager.derive_address(
+        params.negotiation_id,
+        params.party_a,
+        params.party_b,
+    ) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to derive escrow address");
@@ -417,8 +422,12 @@ async fn process_desk_accept(
     // If escrow exists and our leg is already funded, do not re-fund; optionally re-notify.
     if existing.state.b_funded {
         // Best-effort: resend the last known funding signature if we have one.
-        if let Some(sig) =
-            existing_party_funding_signature(&ctx.negotiation_id, &negotiation_manager, EscrowParty::PartyB).await
+        if let Some(sig) = existing_party_funding_signature(
+            &ctx.negotiation_id,
+            &negotiation_manager,
+            EscrowParty::PartyB,
+        )
+        .await
         {
             let reply_msg = OTCMessage::EscrowFunded {
                 negotiation_id: ctx.negotiation_id,
@@ -427,7 +436,8 @@ async fn process_desk_accept(
                 funded_by: EscrowParty::PartyB,
                 reporting_wallet: desk_kp.pubkey(),
             };
-            if let Ok(env) = OTCEnvelope::new(desk_agent_id.to_string(), reply_msg).sign_with(&desk_kp)
+            if let Ok(env) =
+                OTCEnvelope::new(desk_agent_id.to_string(), reply_msg).sign_with(&desk_kp)
             {
                 let _ = hub
                     .send(otc_notification(desk_agent_id, counterparty_agent_id, env))
@@ -502,7 +512,9 @@ async fn process_desk_accept(
 
     let reply_msg = if settled {
         let (final_price, final_quantity) = match &ctx.quote {
-            OTCMessage::Quote { price, quantity, .. } => (*price, *quantity),
+            OTCMessage::Quote {
+                price, quantity, ..
+            } => (*price, *quantity),
             _ => (0.0, 0),
         };
         OTCMessage::Settled {
@@ -544,7 +556,10 @@ async fn existing_party_funding_signature(
 ) -> Option<String> {
     let negotiation = manager.get_negotiation(*negotiation_id).await?;
     negotiation.history.iter().rev().find_map(|ev| match ev {
-        super::negotiation::NegotiationEvent::EscrowFunded { party: p, signature } if *p == party => Some(signature.clone()),
+        super::negotiation::NegotiationEvent::EscrowFunded {
+            party: p,
+            signature,
+        } if *p == party => Some(signature.clone()),
         _ => None,
     })
 }

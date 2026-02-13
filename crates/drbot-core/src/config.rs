@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Main configuration for drbot.
@@ -11,6 +12,10 @@ pub struct Config {
     #[serde(default)]
     pub gateway: GatewayConfig,
 
+    /// Inbound webhook endpoints (OpenClaw parity: /hooks/*).
+    #[serde(default)]
+    pub hooks: HooksConfig,
+
     /// AI provider configurations.
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -18,6 +23,10 @@ pub struct Config {
     /// Channel configurations.
     #[serde(default)]
     pub channels: ChannelsConfig,
+
+    /// Message formatting configuration.
+    #[serde(default)]
+    pub messages: MessagesConfig,
 
     /// Storage configuration.
     #[serde(default)]
@@ -51,6 +60,16 @@ impl Config {
 
     /// Load configuration from environment and optional file.
     pub fn load() -> Result<Self> {
+        if let Ok(path) = std::env::var("DRBOT_CONFIG_PATH") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                let candidate = PathBuf::from(trimmed);
+                if candidate.exists() {
+                    return Self::from_file(candidate);
+                }
+            }
+        }
+
         // Check for config file in standard locations
         //
         // Note: the setup wizard writes to `config.toml` in the config dir, so include it here.
@@ -89,12 +108,30 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             gateway: GatewayConfig::default(),
+            hooks: HooksConfig::default(),
             providers: ProvidersConfig::default(),
             channels: ChannelsConfig::default(),
+            messages: MessagesConfig::default(),
             storage: StorageConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
+}
+
+/// Message formatting configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessagesConfig {
+    /// Optional outbound response prefix to prepend to bot replies.
+    ///
+    /// OpenClaw parity: supports `responsePrefix = "auto"` which derives a prefix from the routed
+    /// agent's identity name (e.g. "[drbot]").
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
 }
 
 /// Gateway server configuration.
@@ -138,6 +175,96 @@ impl Default for GatewayConfig {
     }
 }
 
+fn default_hooks_path() -> String {
+    "/hooks".to_string()
+}
+
+/// Inbound webhook configuration.
+///
+/// OpenClaw parity: matches `hooks.*` documented in OpenClaw's gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// Enable /hooks endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Shared secret used to authorize webhook calls.
+    pub token: Option<String>,
+
+    /// Base path for hook endpoints (default: "/hooks").
+    #[serde(default = "default_hooks_path")]
+    pub path: String,
+
+    /// Maximum webhook request body size in bytes.
+    #[serde(
+        default,
+        rename = "maxBodyBytes",
+        alias = "max_body_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_body_bytes: Option<u64>,
+
+    /// Maximum accepted message length for hook payloads.
+    #[serde(
+        default,
+        rename = "maxMessageChars",
+        alias = "max_message_chars",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_message_chars: Option<u64>,
+
+    /// Optional allowlist of agent ids that may be targeted via hooks.
+    #[serde(
+        default,
+        rename = "allowedAgentIds",
+        alias = "allowed_agent_ids",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_agent_ids: Vec<String>,
+
+    /// If true, allow callers to set sessionKey in hook requests.
+    #[serde(
+        default,
+        rename = "allowRequestSessionKey",
+        alias = "allow_request_session_key"
+    )]
+    pub allow_request_session_key: bool,
+
+    /// Default sessionKey for hooks when not provided (default: "main").
+    #[serde(
+        default,
+        rename = "defaultSessionKey",
+        alias = "default_session_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_session_key: Option<String>,
+
+    /// Optional allowlist of accepted sessionKey prefixes.
+    #[serde(
+        default,
+        rename = "allowedSessionKeyPrefixes",
+        alias = "allowed_session_key_prefixes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_session_key_prefixes: Vec<String>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: None,
+            path: default_hooks_path(),
+            max_body_bytes: None,
+            max_message_chars: None,
+            allowed_agent_ids: Vec::new(),
+            allow_request_session_key: false,
+            default_session_key: None,
+            allowed_session_key_prefixes: Vec::new(),
+        }
+    }
+}
+
 /// AI providers configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersConfig {
@@ -156,6 +283,25 @@ pub struct ProvidersConfig {
     /// Custom CLI provider configurations.
     #[serde(default)]
     pub cli: Vec<CliProviderConfig>,
+    /// Additional OpenAI-compatible providers (OpenRouter, xAI, etc).
+    #[serde(default)]
+    pub openai_compatible: Vec<OpenAICompatibleConfig>,
+}
+
+/// Configuration for an OpenAI-compatible provider (e.g. OpenRouter).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAICompatibleConfig {
+    /// Provider name used in --provider and /model (e.g. "openrouter", "xai").
+    pub name: String,
+    /// API key.
+    pub api_key: String,
+    /// Base URL for the API (should include `/v1` for OpenAI-compatible endpoints).
+    pub base_url: String,
+    /// Default model name.
+    pub default_model: Option<String>,
+    /// Additional headers to send with each request.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 /// Configuration for a custom CLI provider.
@@ -194,6 +340,9 @@ pub struct AnthropicConfig {
     pub api_key: String,
     /// Base URL (optional, for proxies).
     pub base_url: Option<String>,
+    /// Additional headers to send with each request (for gateways/proxies like Cloudflare AI Gateway).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Default model.
     pub default_model: Option<String>,
     /// Max tokens default.
@@ -207,6 +356,9 @@ pub struct OpenAIConfig {
     pub api_key: String,
     /// Base URL (optional, for proxies or Azure).
     pub base_url: Option<String>,
+    /// Additional headers to send with each request (for gateways/proxies like Cloudflare AI Gateway).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// Organization ID (optional).
     pub organization: Option<String>,
     /// Default model.
@@ -271,11 +423,35 @@ pub struct ChannelsConfig {
     pub webchat: Option<WebChatConfig>,
 }
 
+/// Per-account channel overrides (OpenClaw parity).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelAccountConfig {
+    /// Optional outbound response prefix override for this account.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+}
+
 /// Telegram channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
     /// Bot token.
     pub bot_token: String,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
     /// Allowed user IDs (empty = all).
     #[serde(default)]
     pub allowed_users: Vec<i64>,
@@ -291,6 +467,17 @@ pub struct DiscordConfig {
     pub bot_token: String,
     /// Application ID.
     pub application_id: String,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
     /// Allowed guild IDs (empty = all).
     #[serde(default)]
     pub allowed_guilds: Vec<String>,
@@ -305,6 +492,17 @@ pub struct SlackConfig {
     pub app_token: String,
     /// Signing secret.
     pub signing_secret: String,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
 }
 
 /// WhatsApp channel configuration.
@@ -315,6 +513,17 @@ pub struct WhatsAppConfig {
     /// Bridge WebSocket URL.
     #[serde(default = "default_whatsapp_bridge_url")]
     pub bridge_url: String,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
     /// Allowed phone numbers (empty = all).
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
@@ -331,6 +540,17 @@ pub struct SignalConfig {
     pub socket_path: String,
     /// Phone number to use.
     pub phone_number: String,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
     /// Allowed numbers (empty = all).
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
@@ -341,6 +561,17 @@ pub struct SignalConfig {
 pub struct IMessageConfig {
     /// Messages database path (defaults to ~/Library/Messages/chat.db).
     pub database_path: Option<PathBuf>,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
     /// Allowed contacts (empty = all).
     #[serde(default)]
     pub allowed_contacts: Vec<String>,
@@ -355,6 +586,17 @@ pub struct MatrixConfig {
     pub user_id: String,
     /// Access token.
     pub access_token: String,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
     /// Allowed rooms (empty = all).
     #[serde(default)]
     pub allowed_rooms: Vec<String>,
@@ -374,6 +616,17 @@ pub struct WebChatConfig {
     pub require_auth: bool,
     /// Authentication token (optional). If unset, callers may fall back to `gateway.auth_token`.
     pub auth_token: Option<String>,
+    /// Optional outbound response prefix override for this channel.
+    #[serde(
+        default,
+        rename = "responsePrefix",
+        alias = "response_prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_prefix: Option<String>,
+    /// Optional per-account outbound response prefix overrides (OpenClaw parity).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub accounts: HashMap<String, ChannelAccountConfig>,
 }
 
 fn default_webchat_port() -> u16 {
@@ -391,6 +644,8 @@ impl Default for WebChatConfig {
             host: default_webchat_host(),
             require_auth: false,
             auth_token: None,
+            response_prefix: None,
+            accounts: HashMap::new(),
         }
     }
 }
@@ -403,6 +658,8 @@ impl WebChatConfig {
             port,
             require_auth: false,
             auth_token: None,
+            response_prefix: None,
+            accounts: HashMap::new(),
         }
     }
 }

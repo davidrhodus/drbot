@@ -3,24 +3,22 @@
 //! This is the main entry point for the drbot binary.
 
 use anyhow::Result;
-use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use drbot_anthropic::AnthropicProvider;
 use drbot_context::{ContextConfig, ContextManager};
-use drbot_core::message::{Message, Role};
+use drbot_core::message::Message;
 use drbot_core::session::Session;
 use drbot_core::Config;
 use drbot_gateway::Gateway;
 use drbot_personas::{Persona, PersonaRegistry, PersonaStyle, PersonaTrait};
-use drbot_providers::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent};
+use drbot_providers::{ChatOptions, CliProvider, Provider, StreamEvent};
 use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
 use drbot_tui::AppConfig;
 use futures::StreamExt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::Stream;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -46,12 +44,12 @@ enum Commands {
     /// Start the gateway server
     Gateway {
         /// Host to bind to
-        #[arg(short = 'H', long, default_value = "127.0.0.1")]
-        host: String,
+        #[arg(short = 'H', long)]
+        host: Option<String>,
 
         /// Port to listen on
-        #[arg(short, long, default_value = "18789")]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Allow all bash commands for OpenClaw agent runs (dangerous)
         #[arg(long, default_value_t = false)]
@@ -184,7 +182,7 @@ enum Commands {
         #[arg(long)]
         workspace: Option<String>,
 
-        /// Output compact JSON (status only)
+        /// Output compact JSON (status/install only)
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -197,6 +195,13 @@ enum Commands {
 
     /// Run health checks
     Doctor,
+
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 /// Channels subcommands.
@@ -238,6 +243,48 @@ enum SkillsAction {
 
     /// List required bins across eligible skills for a workspace
     Bins,
+
+    /// Install a skill from ClawHub into the managed skills directory
+    ClawhubInstall {
+        /// Skill slug (or ClawHub skill URL)
+        skill: String,
+
+        /// ClawHub registry URL override
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// ClawHub site URL override
+        #[arg(long)]
+        site: Option<String>,
+
+        /// Skill version (defaults to latest)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Override the ClawHub workdir
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Override the ClawHub skills dir (relative to workdir)
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Absolute path to the skills directory (overrides workdir/dir)
+        #[arg(long)]
+        skills_dir: Option<String>,
+
+        /// Override the ClawHub CLI binary
+        #[arg(long)]
+        bin: Option<String>,
+
+        /// Overwrite existing skill directory
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Timeout in milliseconds
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -257,24 +304,40 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let mut config = if let Some(path) = &cli.config {
-        Config::from_file(path)?
+        let expanded = expand_tilde(path);
+        std::env::set_var("DRBOT_CONFIG_PATH", expanded.clone());
+        Config::from_file(expanded)?
     } else {
         Config::load().unwrap_or_default()
     };
 
     match cli.command {
+        Some(Commands::Completions { shell }) => {
+            use clap::CommandFactory as _;
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "drbot", &mut io::stdout());
+            Ok(())
+        }
         Some(Commands::Gateway {
             host,
             port,
             openclaw_agent_bash_allow_all,
             openclaw_agent_bash_allowlist,
         }) => {
-            config.gateway.host = host;
-            config.gateway.port = port;
+            if let Some(host) = host {
+                config.gateway.host = host;
+            }
+            if let Some(port) = port {
+                config.gateway.port = port;
+            }
             if openclaw_agent_bash_allow_all {
                 std::env::set_var("DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL", "1");
             }
-            if let Some(raw) = openclaw_agent_bash_allowlist.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(raw) = openclaw_agent_bash_allowlist
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 std::env::set_var("DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST", raw);
             }
             run_gateway(config).await
@@ -418,19 +481,110 @@ async fn run_gateway(config: Config) -> Result<()> {
     info!("drbot v{} starting...", env!("CARGO_PKG_VERSION"));
 
     let gateway = Gateway::new(config);
+    let state_for_shutdown = gateway.state();
+
+    const ACTION_STOP: u8 = 1;
+    const ACTION_RESTART: u8 = 2;
+    let shutdown_action = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     // Set up graceful shutdown
-    let shutdown = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C handler");
-        info!("Received shutdown signal");
+    let shutdown_action_for_shutdown = shutdown_action.clone();
+    let shutdown = async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            let mut sigusr1 =
+                signal(SignalKind::user_defined1()).expect("Failed to install SIGUSR1 handler");
+
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("signal SIGINT received");
+                        shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    v = sigterm.recv() => {
+                        if v.is_some() {
+                            info!("signal SIGTERM received");
+                            shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    v = sigusr1.recv() => {
+                        if v.is_none() {
+                            continue;
+                        }
+                        info!("signal SIGUSR1 received");
+                        let authorized = drbot_gateway::openclaw_restart::consume_sigusr1_restart_authorization();
+                        if !authorized && !drbot_gateway::openclaw_restart::is_sigusr1_restart_externally_allowed() {
+                            warn!("SIGUSR1 restart ignored (not authorized; set DRBOT_OPENCLAW_ALLOW_EXTERNAL_RESTART=1 or use the gateway tool)");
+                            continue;
+                        }
+                        info!("restart requested (SIGUSR1)");
+
+                        let drain_timeout_ms = std::env::var("DRBOT_OPENCLAW_RESTART_DRAIN_TIMEOUT_MS")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .filter(|v| *v > 0)
+                            .unwrap_or(60_000);
+                        let started = std::time::Instant::now();
+                        loop {
+                            let inflight = state_for_shutdown.openclaw_main_inflight();
+                            if inflight == 0 {
+                                break;
+                            }
+                            if started.elapsed() >= std::time::Duration::from_millis(drain_timeout_ms) {
+                                warn!(
+                                    inflight,
+                                    drain_timeout_ms,
+                                    "restart drain timeout elapsed; continuing shutdown"
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+
+                        shutdown_action_for_shutdown.store(ACTION_RESTART, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &state_for_shutdown;
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C handler");
+            info!("Received shutdown signal");
+            shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+        }
     };
 
     gateway
         .run_with_shutdown(shutdown)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    if shutdown_action.load(std::sync::atomic::Ordering::Relaxed) == ACTION_RESTART {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+
+            let exe = std::env::current_exe()?;
+            let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+            info!(exe = %exe.to_string_lossy(), "Restarting drbot via exec()");
+            let err = std::process::Command::new(exe).args(args).exec();
+            return Err(anyhow::anyhow!("failed to restart via exec(): {}", err));
+        }
+        #[cfg(not(unix))]
+        {
+            warn!("Restart requested but exec() is not supported on this platform; exiting");
+        }
+    }
 
     Ok(())
 }
@@ -458,8 +612,7 @@ async fn run_skills(
             println!("{}", raw);
         }
         SkillsAction::Sync => {
-            drbot_gateway::openclaw_skills::sync_configured_remote_skills_best_effort(config)
-                .await;
+            drbot_gateway::openclaw_skills::sync_configured_remote_skills_best_effort(config).await;
             drbot_gateway::colosseum::sync_colosseum_docs_best_effort(config).await;
             println!("ok");
         }
@@ -477,6 +630,54 @@ async fn run_skills(
             );
             for bin in bins {
                 println!("{}", bin);
+            }
+        }
+        SkillsAction::ClawhubInstall {
+            skill,
+            registry,
+            site,
+            version,
+            workdir,
+            dir,
+            skills_dir,
+            bin,
+            force,
+            timeout_ms,
+        } => {
+            let workdir = workdir.as_deref().map(|p| PathBuf::from(expand_tilde(p)));
+            let skills_dir = skills_dir
+                .as_deref()
+                .map(|p| PathBuf::from(expand_tilde(p)));
+            let params = drbot_gateway::openclaw_skills::ClawhubInstallParams {
+                skill,
+                registry,
+                site,
+                version,
+                workdir,
+                dir,
+                skills_dir,
+                bin,
+                force,
+                timeout_ms,
+            };
+            let result =
+                drbot_gateway::openclaw_skills::install_clawhub_skill(config, params).await;
+            if json {
+                let raw = serde_json::to_string(&result)?;
+                println!("{}", raw);
+            } else if result.ok {
+                println!("{}", result.message);
+            } else {
+                eprintln!("{}", result.message);
+                if !result.stderr.trim().is_empty() {
+                    eprintln!("{}", result.stderr.trim());
+                } else if !result.stdout.trim().is_empty() {
+                    eprintln!("{}", result.stdout.trim());
+                }
+            }
+
+            if !result.ok {
+                return Err(anyhow::anyhow!("{}", result.message));
             }
         }
     }
@@ -597,566 +798,6 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
     }
 }
 
-const CLI_DEFAULT_TIMEOUT_SECS: u64 = 120;
-
-/// CLI-wrapping provider that shells out to external AI CLI tools.
-struct CliProvider {
-    command: String,
-    args: Vec<String>,
-    model_flag: String,
-    default_model: String,
-    system_flag: Option<String>,
-    provider_name: String,
-    /// If true, send full conversation history via stdin instead of just the last user message.
-    send_history: bool,
-    /// Known models for this provider (used by `models()`).
-    known_models: Vec<ModelInfo>,
-    /// If true, the last element of `args` is "-" meaning prompt should be piped via stdin.
-    stdin_mode: bool,
-    /// Timeout for CLI execution.
-    timeout: std::time::Duration,
-    /// If true, add `--output-format json` and parse structured response (claude-cli).
-    json_output: bool,
-}
-
-impl CliProvider {
-    /// Create a provider that wraps `claude -p`.
-    fn claude_cli() -> Self {
-        let provider_name = "claude-cli".to_string();
-        let known_models = vec![
-            ModelInfo { id: "sonnet".into(), name: "Claude Sonnet".into(), provider: provider_name.clone(), context_window: 200_000, max_output_tokens: Some(16_384) },
-            ModelInfo { id: "opus".into(), name: "Claude Opus".into(), provider: provider_name.clone(), context_window: 200_000, max_output_tokens: Some(32_768) },
-            ModelInfo { id: "haiku".into(), name: "Claude Haiku".into(), provider: provider_name.clone(), context_window: 200_000, max_output_tokens: Some(8_192) },
-        ];
-        Self {
-            command: "claude".into(),
-            args: vec!["-p".into()],
-            model_flag: "--model".into(),
-            default_model: "sonnet".into(),
-            system_flag: Some("--system-prompt".into()),
-            provider_name,
-            send_history: false,
-            known_models,
-            stdin_mode: false,
-            timeout: std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS),
-            json_output: true,
-        }
-    }
-
-    /// Create a provider that wraps `codex exec`.
-    fn codex_cli() -> Self {
-        let provider_name = "codex-cli".to_string();
-        let known_models = vec![
-            ModelInfo { id: "o3".into(), name: "O3".into(), provider: provider_name.clone(), context_window: 200_000, max_output_tokens: None },
-            ModelInfo { id: "o4-mini".into(), name: "O4 Mini".into(), provider: provider_name.clone(), context_window: 200_000, max_output_tokens: None },
-        ];
-        Self {
-            command: "codex".into(),
-            args: vec!["exec".into(), "--full-auto".into(), "-".into()],
-            model_flag: "-m".into(),
-            default_model: "o3".into(),
-            system_flag: None,
-            provider_name,
-            send_history: false,
-            known_models,
-            stdin_mode: true,
-            timeout: std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS),
-            json_output: false,
-        }
-    }
-
-    /// Create a provider from a user-defined config.
-    fn from_config(cfg: &drbot_core::config::CliProviderConfig) -> Self {
-        let stdin_mode = cfg.args.last().map(|a| a == "-").unwrap_or(false);
-        let default_model = cfg.default_model.clone().unwrap_or_else(|| "default".into());
-        let provider_name = cfg.name.clone();
-        let known_models = vec![ModelInfo {
-            id: default_model.clone(),
-            name: default_model.clone(),
-            provider: provider_name.clone(),
-            context_window: 200_000,
-            max_output_tokens: None,
-        }];
-        let timeout_secs = cfg.timeout_secs.unwrap_or(CLI_DEFAULT_TIMEOUT_SECS);
-        Self {
-            command: cfg.command.clone(),
-            args: cfg.args.clone(),
-            model_flag: cfg.model_flag.clone(),
-            default_model,
-            system_flag: cfg.system_flag.clone(),
-            provider_name,
-            send_history: cfg.send_history,
-            known_models,
-            stdin_mode,
-            timeout: std::time::Duration::from_secs(timeout_secs),
-            json_output: false,
-        }
-    }
-
-    /// Build the command and prompt text without executing. Useful for testing.
-    fn build_command(&self, messages: &[Message], options: &ChatOptions) -> (tokio::process::Command, String) {
-        let model = options.model.clone().unwrap_or_else(|| self.default_model.clone());
-
-        let mut cmd = tokio::process::Command::new(&self.command);
-
-        // Add base args, but skip trailing "-" in stdin_mode (it's a sentinel, not a real arg
-        // for some CLIs, but for codex it IS a real arg). Keep it.
-        for arg in &self.args {
-            cmd.arg(arg);
-        }
-
-        cmd.arg(&self.model_flag).arg(&model);
-
-        if let Some(ref flag) = self.system_flag {
-            if let Some(ref system) = options.system_prompt {
-                cmd.arg(flag).arg(system);
-            }
-        }
-
-        let prompt = if self.send_history {
-            self.format_history(messages)
-        } else {
-            messages
-                .iter()
-                .rev()
-                .find(|m| m.role == Role::User)
-                .map(|m| m.text_content())
-                .unwrap_or_default()
-        };
-
-        if !self.stdin_mode {
-            cmd.arg(&prompt);
-        }
-
-        (cmd, prompt)
-    }
-
-    /// Format full conversation history as role-prefixed text.
-    fn format_history(&self, messages: &[Message]) -> String {
-        let mut out = String::new();
-        for msg in messages {
-            let prefix = match msg.role {
-                Role::System => "System",
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            let text = msg.text_content();
-            if !text.is_empty() {
-                out.push_str(prefix);
-                out.push_str(": ");
-                out.push_str(&text);
-                out.push('\n');
-            }
-        }
-        out
-    }
-
-    fn not_found_hint(&self) -> String {
-        match self.command.as_str() {
-            "claude" => format!(
-                "'claude' CLI not found. Install it with: npm install -g @anthropic-ai/claude-code"
-            ),
-            "codex" => format!(
-                "'codex' CLI not found. Install it with: npm install -g @openai/codex"
-            ),
-            _ => format!(
-                "'{}' not found. Make sure it is installed and on your PATH.",
-                self.command
-            ),
-        }
-    }
-
-    /// Check if the CLI command exists on PATH. Returns an error with install hint if not found.
-    fn check_command_exists(&self) -> Result<()> {
-        use std::process::Command;
-        let result = Command::new("which").arg(&self.command).output();
-        match result {
-            Ok(output) if output.status.success() => Ok(()),
-            _ => Err(anyhow::anyhow!("{}", self.not_found_hint())),
-        }
-    }
-
-    /// Parse JSON output from `claude -p --output-format json`.
-    fn parse_json_output(&self, raw: &str, fallback_model: &str) -> drbot_core::Result<ChatResponse> {
-        let json: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-            drbot_core::Error::Provider(format!(
-                "Failed to parse {} JSON output: {}",
-                self.command, e
-            ))
-        })?;
-
-        if json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let error_msg = json
-                .get("result")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(drbot_core::Error::Provider(format!(
-                "{}: {}", self.command, error_msg
-            )));
-        }
-
-        let content = json
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Extract actual model from modelUsage keys
-        let model = json
-            .get("modelUsage")
-            .and_then(|v| v.as_object())
-            .and_then(|m| m.keys().next())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| fallback_model.to_string());
-
-        let usage = json.get("usage").and_then(|u| {
-            let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if input > 0 || output > 0 {
-                Some(drbot_providers::Usage {
-                    input_tokens: input,
-                    output_tokens: output,
-                })
-            } else {
-                None
-            }
-        });
-
-        let cost = json.get("total_cost_usd").and_then(|v| v.as_f64());
-        if let Some(cost_usd) = cost {
-            info!("{} cost: ${:.6}", self.command, cost_usd);
-        }
-
-        Ok(ChatResponse {
-            content,
-            model,
-            usage,
-            stop_reason: Some("end_turn".into()),
-            tool_uses: vec![],
-        })
-    }
-}
-
-#[async_trait]
-impl Provider for CliProvider {
-    async fn chat(&self, messages: &[Message], options: ChatOptions) -> drbot_core::Result<ChatResponse> {
-        let model = options.model.clone().unwrap_or_else(|| self.default_model.clone());
-        let (mut cmd, prompt) = self.build_command(messages, &options);
-
-        // For chat(), use JSON output format to get structured response with usage stats
-        if self.json_output {
-            cmd.arg("--output-format").arg("json");
-        }
-
-        if self.stdin_mode {
-            cmd.stdin(std::process::Stdio::piped());
-        } else {
-            cmd.stdin(std::process::Stdio::null());
-        }
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let command_name = self.command.clone();
-        let timeout = self.timeout;
-
-        let result = tokio::time::timeout(timeout, async {
-            let mut child = cmd.spawn().map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    drbot_core::Error::Provider(self.not_found_hint())
-                } else {
-                    drbot_core::Error::Provider(format!("Failed to run {}: {}", command_name, e))
-                }
-            })?;
-
-            if self.stdin_mode {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = stdin.write_all(prompt.as_bytes()).await;
-                    drop(stdin);
-                }
-            }
-
-            let output = child.wait_with_output().await.map_err(|e| {
-                drbot_core::Error::Provider(format!("{} failed: {}", command_name, e))
-            })?;
-
-            Ok::<_, drbot_core::Error>((output, command_name.clone()))
-        })
-        .await;
-
-        let (output, _) = match result {
-            Ok(inner) => inner?,
-            Err(_) => {
-                return Err(drbot_core::Error::Timeout(format!(
-                    "{} timed out after {}s",
-                    self.command,
-                    timeout.as_secs()
-                )));
-            }
-        };
-
-        let stderr_text = String::from_utf8_lossy(&output.stderr);
-        if !stderr_text.trim().is_empty() {
-            if output.status.success() {
-                for line in stderr_text.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        warn!("{} stderr: {}", self.command, trimmed);
-                    }
-                }
-            } else {
-                return Err(drbot_core::Error::Provider(format!(
-                    "{} exited with {}: {}",
-                    self.command,
-                    output.status,
-                    stderr_text.trim()
-                )));
-            }
-        } else if !output.status.success() {
-            return Err(drbot_core::Error::Provider(format!(
-                "{} exited with {}",
-                self.command, output.status
-            )));
-        }
-
-        let raw_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        if self.json_output {
-            self.parse_json_output(&raw_stdout, &model)
-        } else {
-            Ok(ChatResponse {
-                content: raw_stdout,
-                model,
-                usage: None,
-                stop_reason: Some("end_turn".into()),
-                tool_uses: vec![],
-            })
-        }
-    }
-
-    async fn stream(
-        &self,
-        messages: &[Message],
-        options: ChatOptions,
-    ) -> drbot_core::Result<Pin<Box<dyn Stream<Item = StreamEvent> + Send>>> {
-        let model = options.model.clone().unwrap_or_else(|| self.default_model.clone());
-        let (mut cmd, prompt) = self.build_command(messages, &options);
-
-        // For streaming with JSON-capable CLIs, use stream-json for incremental deltas + usage
-        let json_stream = self.json_output;
-        if json_stream {
-            cmd.arg("--output-format").arg("stream-json");
-            cmd.arg("--include-partial-messages");
-        }
-
-        if self.stdin_mode {
-            cmd.stdin(std::process::Stdio::piped());
-        } else {
-            cmd.stdin(std::process::Stdio::null());
-        }
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                drbot_core::Error::Provider(self.not_found_hint())
-            } else {
-                drbot_core::Error::Provider(format!("Failed to run {}: {}", self.command, e))
-            }
-        })?;
-
-        if self.stdin_mode {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(prompt.as_bytes()).await;
-                drop(stdin);
-            }
-        }
-
-        let stdout = child.stdout.take().ok_or_else(|| {
-            drbot_core::Error::Provider("Failed to capture stdout".into())
-        })?;
-        let stderr = child.stderr.take();
-
-        let command_name = self.command.clone();
-        let timeout = self.timeout;
-
-        Ok(Box::pin(async_stream::stream! {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-
-            let stdout_reader = BufReader::new(stdout);
-            let mut stdout_lines = stdout_reader.lines();
-
-            // Spawn a task to collect stderr lines concurrently
-            let stderr_handle = stderr.map(|se| {
-                tokio::spawn(async move {
-                    let reader = BufReader::new(se);
-                    let mut lines = reader.lines();
-                    let mut collected = Vec::new();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let trimmed = line.trim().to_string();
-                        if !trimmed.is_empty() {
-                            collected.push(trimmed);
-                        }
-                    }
-                    collected
-                })
-            });
-
-            let mut timed_out = false;
-            let mut got_result = false;
-            let mut final_usage: Option<drbot_providers::Usage> = None;
-            let mut started = false;
-            let deadline = tokio::time::Instant::now() + timeout;
-
-            // For plain text mode, track newlines between lines
-            let mut first_text_line = true;
-
-            loop {
-                let line_result = tokio::time::timeout_at(deadline, stdout_lines.next_line()).await;
-                match line_result {
-                    Ok(Ok(Some(line))) => {
-                        if json_stream {
-                            // Parse NDJSON line
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                match msg_type {
-                                    "system" => {
-                                        // Init message — extract model if available
-                                        let m = json.get("model")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or(&model)
-                                            .to_string();
-                                        if !started {
-                                            started = true;
-                                            yield StreamEvent::Start { model: m };
-                                        }
-                                    }
-                                    "stream_event" => {
-                                        if !started {
-                                            started = true;
-                                            yield StreamEvent::Start { model: model.clone() };
-                                        }
-                                        // Extract text delta: event.delta.text
-                                        if let Some(event) = json.get("event") {
-                                            let delta_type = event
-                                                .get("delta")
-                                                .and_then(|d| d.get("type"))
-                                                .and_then(|v| v.as_str());
-                                            if delta_type == Some("text_delta") {
-                                                if let Some(text) = event
-                                                    .get("delta")
-                                                    .and_then(|d| d.get("text"))
-                                                    .and_then(|v| v.as_str())
-                                                {
-                                                    if !text.is_empty() {
-                                                        yield StreamEvent::Delta { content: text.to_string() };
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "result" => {
-                                        got_result = true;
-                                        // Extract usage from result
-                                        final_usage = json.get("usage").and_then(|u| {
-                                            let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                            let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                            if input > 0 || output > 0 {
-                                                Some(drbot_providers::Usage { input_tokens: input, output_tokens: output })
-                                            } else {
-                                                None
-                                            }
-                                        });
-
-                                        if let Some(cost) = json.get("total_cost_usd").and_then(|v| v.as_f64()) {
-                                            tracing::info!("{} cost: ${:.6}", command_name, cost);
-                                        }
-
-                                        let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                                        if is_error {
-                                            let err_msg = json.get("result").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                                            yield StreamEvent::Error { message: format!("{}: {}", command_name, err_msg) };
-                                        }
-                                    }
-                                    // "assistant", "user" — skip, we get content from stream_event deltas
-                                    _ => {}
-                                }
-                            }
-                            // Silently skip lines that aren't valid JSON
-                        } else {
-                            // Plain text mode
-                            if !started {
-                                started = true;
-                                yield StreamEvent::Start { model: model.clone() };
-                            }
-                            if first_text_line {
-                                first_text_line = false;
-                            } else {
-                                yield StreamEvent::Delta { content: "\n".into() };
-                            }
-                            yield StreamEvent::Delta { content: line };
-                        }
-                    }
-                    Ok(Ok(None)) => break, // EOF
-                    Ok(Err(e)) => {
-                        yield StreamEvent::Error {
-                            message: format!("{} stdout read error: {}", command_name, e),
-                        };
-                        break;
-                    }
-                    Err(_) => {
-                        timed_out = true;
-                        yield StreamEvent::Error {
-                            message: format!("{} timed out after {}s", command_name, timeout.as_secs()),
-                        };
-                        let _ = child.kill().await;
-                        break;
-                    }
-                }
-            }
-
-            // Ensure we emitted Start even if no lines were received
-            if !started {
-                yield StreamEvent::Start { model: model.clone() };
-            }
-
-            // Emit stderr lines as errors
-            if let Some(handle) = stderr_handle {
-                if let Ok(stderr_lines) = handle.await {
-                    for line in stderr_lines {
-                        yield StreamEvent::Error { message: format!("{} stderr: {}", command_name, line) };
-                    }
-                }
-            }
-
-            if !timed_out {
-                let status = child.wait().await;
-                if let Ok(exit) = &status {
-                    if !exit.success() {
-                        yield StreamEvent::Error {
-                            message: format!("{} exited with {}", command_name, exit),
-                        };
-                    }
-                }
-            }
-
-            yield StreamEvent::Stop {
-                reason: if timed_out { "timeout".into() } else { "end_turn".into() },
-                usage: final_usage,
-            };
-        }))
-    }
-
-    fn models(&self) -> Vec<ModelInfo> {
-        self.known_models.clone()
-    }
-
-    fn name(&self) -> &str {
-        &self.provider_name
-    }
-}
-
 /// Get the session store.
 fn get_session_store(config: &Config) -> Result<SqliteSessionStore> {
     let db_path = &config.storage.database_path;
@@ -1255,7 +896,11 @@ fn resolve_single_message(
         ));
     }
 
-    if let Some(path) = message_file.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    if let Some(path) = message_file
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         return Ok(Some(read_message_from_source(path)?));
     }
 
@@ -1432,11 +1077,7 @@ fn resolve_skill_url_max_total_bytes() -> usize {
         .unwrap_or(400_000)
 }
 
-async fn fetch_url_text(
-    client: &reqwest::Client,
-    url: &str,
-    max_bytes: usize,
-) -> Result<String> {
+async fn fetch_url_text(client: &reqwest::Client, url: &str, max_bytes: usize) -> Result<String> {
     fn cache_path_for_url(url: &str) -> Option<PathBuf> {
         let dir = Config::config_dir()?.join("skill_url_cache");
         let key = Uuid::new_v5(&Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
@@ -1447,7 +1088,10 @@ async fn fetch_url_text(
         let txt = std::fs::read_to_string(path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
         let body = v.get("body")?.as_str()?.to_string();
-        let etag = v.get("etag").and_then(|x| x.as_str()).map(|s| s.to_string());
+        let etag = v
+            .get("etag")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
         let last_modified = v
             .get("last_modified")
             .and_then(|x| x.as_str())
@@ -1480,9 +1124,7 @@ async fn fetch_url_text(
     }
 
     let cache_path = cache_path_for_url(url);
-    let cached = cache_path
-        .as_deref()
-        .and_then(|p| load_cache(p));
+    let cached = cache_path.as_deref().and_then(|p| load_cache(p));
 
     let mut req = client.get(url);
     if let Some((_, etag, last_modified)) = &cached {
@@ -1610,9 +1252,7 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
     targets.extend(drbot_core::markdown::extract_markdown_inline_link_targets(
         main_body,
     ));
-    targets.extend(drbot_core::markdown::extract_markdown_reference_definition_targets(
-        main_body,
-    ));
+    targets.extend(drbot_core::markdown::extract_markdown_reference_definition_targets(main_body));
     for target in targets {
         if docs_added >= max_relative_docs || used_bytes >= max_total_bytes {
             break;
@@ -1827,7 +1467,12 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
 
     // Fallback: some models ignore the requested code-fence language and emit a raw JSON object/array.
     // Extract the first JSON value that looks like a tool call.
-    fn extract_json_value_bounds(s: &str, start: usize, open: char, close: char) -> Option<(usize, usize)> {
+    fn extract_json_value_bounds(
+        s: &str,
+        start: usize,
+        open: char,
+        close: char,
+    ) -> Option<(usize, usize)> {
         let slice = s.get(start..)?;
         let mut depth: i64 = 0;
         let mut in_string = false;
@@ -1989,7 +1634,10 @@ fn bash_command_is_safe_for_auto_approve(command: &str, policy: &BashAutoApprove
     let allowed: Vec<String> = if let Some(list) = &policy.override_prefixes {
         list.clone()
     } else if policy.extra_prefixes.is_empty() {
-        SAFE_PREFIXES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        SAFE_PREFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
     } else {
         let mut seen = std::collections::HashSet::<String>::new();
         let mut out: Vec<String> = Vec::new();
@@ -2007,7 +1655,9 @@ fn bash_command_is_safe_for_auto_approve(command: &str, policy: &BashAutoApprove
     };
 
     let first = cmd.split_whitespace().next().unwrap_or("");
-    allowed.iter().any(|p| first == p || first.ends_with(&format!("/{}", p)))
+    allowed
+        .iter()
+        .any(|p| first == p || first.ends_with(&format!("/{}", p)))
 }
 
 fn truncate_for_context(text: &str, max_chars: usize) -> String {
@@ -2324,7 +1974,13 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>> {
 
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("--- ") {
-            finish_file(&mut files, &mut cur_old, &mut cur_new, &mut cur_hunks, &mut cur_hunk);
+            finish_file(
+                &mut files,
+                &mut cur_old,
+                &mut cur_new,
+                &mut cur_hunks,
+                &mut cur_hunk,
+            );
             let token = rest.trim().split_whitespace().next().unwrap_or("");
             if token.is_empty() {
                 return Err(anyhow::anyhow!("invalid --- line: {}", line));
@@ -2342,7 +1998,8 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>> {
         }
         if line.trim_start().starts_with("@@") {
             finish_hunk(&mut cur_hunks, &mut cur_hunk);
-            let (old_start, old_count, new_start, new_count) = parse_unified_diff_hunk_header(line)?;
+            let (old_start, old_count, new_start, new_count) =
+                parse_unified_diff_hunk_header(line)?;
             cur_hunk = Some(UnifiedDiffHunk {
                 old_start,
                 old_count,
@@ -2363,7 +2020,13 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>> {
         }
     }
 
-    finish_file(&mut files, &mut cur_old, &mut cur_new, &mut cur_hunks, &mut cur_hunk);
+    finish_file(
+        &mut files,
+        &mut cur_old,
+        &mut cur_new,
+        &mut cur_hunks,
+        &mut cur_hunk,
+    );
     Ok(files)
 }
 
@@ -2620,16 +2283,7 @@ fn should_reprompt_for_tool_calls(user_text: &str, assistant_text: &str) -> bool
         &assistant,
         &[
             "```", // code fences (often `bash` without tool JSON)
-            "$ ",
-            "cd ",
-            "pnpm ",
-            "npm ",
-            "npx ",
-            "node ",
-            "cargo ",
-            "git ",
-            "rg ",
-            "cat <<",
+            "$ ", "cd ", "pnpm ", "npm ", "npx ", "node ", "cargo ", "git ", "rg ", "cat <<",
         ],
     );
 
@@ -2881,7 +2535,11 @@ async fn run_chat(
         system.or_else(|| session.system_prompt.clone())
     };
 
-    let base_system = if let Some(skill_url) = skill_url.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let base_system = if let Some(skill_url) = skill_url
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         let skill_pack = fetch_skill_pack_from_url(skill_url).await?;
         Some(match base_system {
             Some(existing) => format!("{}\n\n---\n\n{}", existing.trim(), skill_pack.trim()),
@@ -3226,10 +2884,7 @@ async fn run_chat(
             let arg = input.strip_prefix("/model").unwrap().trim();
             if arg.is_empty() {
                 // Show current provider/model
-                let model_display = options
-                    .model
-                    .as_deref()
-                    .unwrap_or("(provider default)");
+                let model_display = options.model.as_deref().unwrap_or("(provider default)");
                 println!(
                     "\nProvider: {}\nModel: {}\n",
                     current_provider_name, model_display
@@ -3446,15 +3101,15 @@ async fn run_chat(
                                 .get("command")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let cwd = call
-                                .args
-                                .get("cwd")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let cwd = call.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
                             if cwd.trim().is_empty() {
                                 println!("[Tool] bash\n  command: {}", command);
                             } else {
-                                println!("[Tool] bash\n  cwd: {}\n  command: {}", cwd.trim(), command);
+                                println!(
+                                    "[Tool] bash\n  cwd: {}\n  command: {}",
+                                    cwd.trim(),
+                                    command
+                                );
                             }
                         }
                         "read_file" => {
@@ -3697,11 +3352,20 @@ cd app && pnpm test
     fn safe_bash_auto_approve() {
         let policy = BashAutoApprovePolicy::default();
         assert!(bash_command_is_safe_for_auto_approve("git status", &policy));
-        assert!(bash_command_is_safe_for_auto_approve("cargo test -q", &policy));
+        assert!(bash_command_is_safe_for_auto_approve(
+            "cargo test -q",
+            &policy
+        ));
         assert!(!bash_command_is_safe_for_auto_approve("rm -rf /", &policy));
         assert!(!bash_command_is_safe_for_auto_approve("sudo ls", &policy));
-        assert!(!bash_command_is_safe_for_auto_approve("dd if=/dev/zero of=/dev/null", &policy));
-        assert!(!bash_command_is_safe_for_auto_approve("./script.sh", &policy));
+        assert!(!bash_command_is_safe_for_auto_approve(
+            "dd if=/dev/zero of=/dev/null",
+            &policy
+        ));
+        assert!(!bash_command_is_safe_for_auto_approve(
+            "./script.sh",
+            &policy
+        ));
     }
 
     #[test]
@@ -3718,656 +3382,576 @@ cd app && pnpm test
     }
 }
 
-#[cfg(test)]
-mod cli_provider_tests {
-    use super::*;
-    use drbot_core::message::Message;
-    use drbot_providers::ChatOptions;
-
-    #[test]
-    fn claude_cli_basic_command() {
-        let provider = CliProvider::claude_cli();
-        let messages = vec![Message::user("What is 2+2?")];
-        let options = ChatOptions::default();
-
-        let (cmd, prompt) = provider.build_command(&messages, &options);
-        let prog = cmd.as_std().get_program().to_str().unwrap().to_string();
-        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_str().unwrap().to_string()).collect();
-
-        assert_eq!(prog, "claude");
-        assert_eq!(args, vec!["-p", "--model", "sonnet", "What is 2+2?"]);
-        assert_eq!(prompt, "What is 2+2?");
-    }
-
-    #[test]
-    fn claude_cli_with_model_override() {
-        let provider = CliProvider::claude_cli();
-        let messages = vec![Message::user("Hello")];
-        let options = ChatOptions {
-            model: Some("opus".into()),
-            ..Default::default()
-        };
-
-        let (cmd, _prompt) = provider.build_command(&messages, &options);
-        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_str().unwrap().to_string()).collect();
-
-        assert_eq!(args, vec!["-p", "--model", "opus", "Hello"]);
-    }
-
-    #[test]
-    fn claude_cli_with_system_prompt() {
-        let provider = CliProvider::claude_cli();
-        let messages = vec![Message::user("Hi")];
-        let options = ChatOptions {
-            system_prompt: Some("You are a pirate.".into()),
-            ..Default::default()
-        };
-
-        let (cmd, _prompt) = provider.build_command(&messages, &options);
-        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_str().unwrap().to_string()).collect();
-
-        assert_eq!(
-            args,
-            vec!["-p", "--model", "sonnet", "--system-prompt", "You are a pirate.", "Hi"]
-        );
-    }
-
-    #[test]
-    fn codex_cli_stdin_mode() {
-        let provider = CliProvider::codex_cli();
-        assert!(provider.stdin_mode);
-
-        let messages = vec![Message::user("Fix the bug")];
-        let options = ChatOptions::default();
-
-        let (cmd, prompt) = provider.build_command(&messages, &options);
-        let prog = cmd.as_std().get_program().to_str().unwrap().to_string();
-        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_str().unwrap().to_string()).collect();
-
-        // In stdin_mode, the prompt is NOT appended as an arg
-        assert_eq!(prog, "codex");
-        assert_eq!(args, vec!["exec", "--full-auto", "-", "-m", "o3"]);
-        assert_eq!(prompt, "Fix the bug");
-    }
-
-    #[test]
-    fn codex_cli_no_system_flag() {
-        let provider = CliProvider::codex_cli();
-        let messages = vec![Message::user("Hello")];
-        let options = ChatOptions {
-            system_prompt: Some("Be helpful".into()),
-            ..Default::default()
-        };
-
-        let (cmd, _prompt) = provider.build_command(&messages, &options);
-        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_str().unwrap().to_string()).collect();
-
-        // system_flag is None, so --system-prompt should NOT appear
-        assert!(!args.contains(&"--system-prompt".to_string()));
-        assert!(!args.contains(&"Be helpful".to_string()));
-    }
-
-    #[test]
-    fn history_mode_formats_messages() {
-        let mut provider = CliProvider::claude_cli();
-        provider.send_history = true;
-
-        let messages = vec![
-            Message::user("What is 2+2?"),
-            Message::assistant("4"),
-            Message::user("And 3+3?"),
-        ];
-
-        let history = provider.format_history(&messages);
-        assert_eq!(history, "User: What is 2+2?\nAssistant: 4\nUser: And 3+3?\n");
-    }
-
-    #[test]
-    fn history_mode_uses_full_history_as_prompt() {
-        let mut provider = CliProvider::claude_cli();
-        provider.send_history = true;
-
-        let messages = vec![
-            Message::user("Hello"),
-            Message::assistant("Hi there!"),
-            Message::user("How are you?"),
-        ];
-        let options = ChatOptions::default();
-
-        let (_cmd, prompt) = provider.build_command(&messages, &options);
-        assert!(prompt.contains("User: Hello"));
-        assert!(prompt.contains("Assistant: Hi there!"));
-        assert!(prompt.contains("User: How are you?"));
-    }
-
-    #[test]
-    fn from_config_basic() {
-        let cfg = drbot_core::config::CliProviderConfig {
-            name: "my-llm".into(),
-            command: "my-llm-cli".into(),
-            args: vec!["run".into()],
-            model_flag: "--model".into(),
-            default_model: Some("llama3".into()),
-            system_flag: Some("--system".into()),
-            send_history: false,
-            timeout_secs: None,
-        };
-
-        let provider = CliProvider::from_config(&cfg);
-        assert_eq!(provider.provider_name, "my-llm");
-        assert_eq!(provider.command, "my-llm-cli");
-        assert_eq!(provider.default_model, "llama3");
-        assert!(!provider.stdin_mode);
-        assert!(!provider.send_history);
-    }
-
-    #[test]
-    fn from_config_stdin_mode_detection() {
-        let cfg = drbot_core::config::CliProviderConfig {
-            name: "custom".into(),
-            command: "custom-ai".into(),
-            args: vec!["chat".into(), "-".into()],
-            model_flag: "-m".into(),
-            default_model: None,
-            system_flag: None,
-            send_history: true,
-            timeout_secs: None,
-        };
-
-        let provider = CliProvider::from_config(&cfg);
-        assert!(provider.stdin_mode);
-        assert!(provider.send_history);
-        assert_eq!(provider.default_model, "default");
-    }
-
-    #[test]
-    fn models_returns_known_models() {
-        let claude = CliProvider::claude_cli();
-        let models = claude.models();
-        assert_eq!(models.len(), 3);
-        assert!(models.iter().any(|m| m.id == "sonnet"));
-        assert!(models.iter().any(|m| m.id == "opus"));
-        assert!(models.iter().any(|m| m.id == "haiku"));
-
-        let codex = CliProvider::codex_cli();
-        let models = codex.models();
-        assert_eq!(models.len(), 2);
-        assert!(models.iter().any(|m| m.id == "o3"));
-        assert!(models.iter().any(|m| m.id == "o4-mini"));
-    }
-
-    #[test]
-    fn not_found_hints() {
-        let claude = CliProvider::claude_cli();
-        assert!(claude.not_found_hint().contains("npm install"));
-        assert!(claude.not_found_hint().contains("@anthropic-ai/claude-code"));
-
-        let codex = CliProvider::codex_cli();
-        assert!(codex.not_found_hint().contains("npm install"));
-        assert!(codex.not_found_hint().contains("@openai/codex"));
-
-        let custom = CliProvider::from_config(&drbot_core::config::CliProviderConfig {
-            name: "custom".into(),
-            command: "my-tool".into(),
-            args: vec![],
-            model_flag: "--model".into(),
-            default_model: None,
-            system_flag: None,
-            send_history: false,
-            timeout_secs: None,
-        });
-        assert!(custom.not_found_hint().contains("my-tool"));
-        assert!(custom.not_found_hint().contains("PATH"));
-    }
-
-    #[test]
-    fn provider_name() {
-        assert_eq!(CliProvider::claude_cli().name(), "claude-cli");
-        assert_eq!(CliProvider::codex_cli().name(), "codex-cli");
-    }
-
-    #[test]
-    fn last_user_message_is_used() {
-        let provider = CliProvider::claude_cli();
-        let messages = vec![
-            Message::user("First question"),
-            Message::assistant("First answer"),
-            Message::user("Second question"),
-        ];
-        let options = ChatOptions::default();
-        let (_cmd, prompt) = provider.build_command(&messages, &options);
-        assert_eq!(prompt, "Second question");
-    }
-
-    #[test]
-    fn default_timeout() {
-        let claude = CliProvider::claude_cli();
-        assert_eq!(claude.timeout, std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS));
-
-        let codex = CliProvider::codex_cli();
-        assert_eq!(codex.timeout, std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS));
-    }
-
-    #[test]
-    fn custom_timeout_from_config() {
-        let cfg = drbot_core::config::CliProviderConfig {
-            name: "slow-llm".into(),
-            command: "slow-llm".into(),
-            args: vec![],
-            model_flag: "--model".into(),
-            default_model: None,
-            system_flag: None,
-            send_history: false,
-            timeout_secs: Some(300),
-        };
-        let provider = CliProvider::from_config(&cfg);
-        assert_eq!(provider.timeout, std::time::Duration::from_secs(300));
-    }
-
-    #[test]
-    fn config_timeout_defaults_when_none() {
-        let cfg = drbot_core::config::CliProviderConfig {
-            name: "fast-llm".into(),
-            command: "fast-llm".into(),
-            args: vec![],
-            model_flag: "--model".into(),
-            default_model: None,
-            system_flag: None,
-            send_history: false,
-            timeout_secs: None,
-        };
-        let provider = CliProvider::from_config(&cfg);
-        assert_eq!(provider.timeout, std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS));
-    }
-
-    #[tokio::test]
-    async fn chat_timeout_fires() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), "sleep 10".into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = true; // avoid appending prompt as arg
-        provider.timeout = std::time::Duration::from_millis(100);
-
-        let messages = vec![Message::user("ignored")];
-        let options = ChatOptions::default();
-        let result = provider.chat(&messages, options).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("timed out"), "expected timeout error, got: {}", err);
-    }
-
-    #[tokio::test]
-    async fn stream_timeout_fires() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), "sleep 10".into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = true;
-        provider.timeout = std::time::Duration::from_millis(100);
-
-        let messages = vec![Message::user("ignored")];
-        let options = ChatOptions::default();
-        let stream = provider.stream(&messages, options).await.unwrap();
-
-        let events: Vec<StreamEvent> = stream.collect().await;
-        let has_timeout_error = events.iter().any(|e| matches!(e, StreamEvent::Error { message } if message.contains("timed out")));
-        assert!(has_timeout_error, "expected timeout error in stream events: {:?}", events);
-    }
-
-    #[tokio::test]
-    async fn chat_stderr_on_success_is_warning() {
-        // Use a command that writes to stderr but exits 0
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), "echo 'hello' && echo 'warning: something' >&2".into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = false;
-        provider.json_output = false; // plain text output for this test
-
-        let messages = vec![Message::user("ignored")];
-        let options = ChatOptions::default();
-        let result = provider.chat(&messages, options).await;
-
-        // Should succeed despite stderr output
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().content, "hello");
-    }
-
-    #[tokio::test]
-    async fn stream_stderr_emitted_as_error_events() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), "echo 'output' && echo 'stderr warning' >&2".into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = false;
-        provider.json_output = false;
-
-        let messages = vec![Message::user("ignored")];
-        let options = ChatOptions::default();
-        let stream = provider.stream(&messages, options).await.unwrap();
-
-        let events: Vec<StreamEvent> = stream.collect().await;
-
-        let has_output = events.iter().any(|e| matches!(e, StreamEvent::Delta { content } if content == "output"));
-        assert!(has_output, "expected 'output' delta, got: {:?}", events);
-
-        let has_stderr = events.iter().any(|e| matches!(e, StreamEvent::Error { message } if message.contains("stderr warning")));
-        assert!(has_stderr, "expected stderr error event, got: {:?}", events);
-    }
-
-    #[test]
-    fn claude_cli_has_json_output() {
-        let provider = CliProvider::claude_cli();
-        assert!(provider.json_output);
-    }
-
-    #[test]
-    fn codex_cli_no_json_output() {
-        let provider = CliProvider::codex_cli();
-        assert!(!provider.json_output);
-    }
-
-    #[test]
-    fn parse_json_output_success() {
-        let provider = CliProvider::claude_cli();
-        let json = r#"{
-            "type": "result",
-            "subtype": "success",
-            "is_error": false,
-            "result": "The answer is 42.",
-            "total_cost_usd": 0.003,
-            "usage": {
-                "input_tokens": 15,
-                "output_tokens": 8
-            },
-            "modelUsage": {
-                "claude-sonnet-4-5-20250929": {
-                    "inputTokens": 15,
-                    "outputTokens": 8
-                }
-            }
-        }"#;
-
-        let response = provider.parse_json_output(json, "sonnet").unwrap();
-        assert_eq!(response.content, "The answer is 42.");
-        assert_eq!(response.model, "claude-sonnet-4-5-20250929");
-        let usage = response.usage.unwrap();
-        assert_eq!(usage.input_tokens, 15);
-        assert_eq!(usage.output_tokens, 8);
-    }
-
-    #[test]
-    fn parse_json_output_error() {
-        let provider = CliProvider::claude_cli();
-        let json = r#"{
-            "type": "result",
-            "subtype": "error_during_execution",
-            "is_error": true,
-            "result": "Something went wrong"
-        }"#;
-
-        let result = provider.parse_json_output(json, "sonnet");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Something went wrong"));
-    }
-
-    #[test]
-    fn parse_json_output_no_usage() {
-        let provider = CliProvider::claude_cli();
-        let json = r#"{
-            "type": "result",
-            "subtype": "success",
-            "is_error": false,
-            "result": "Hello"
-        }"#;
-
-        let response = provider.parse_json_output(json, "sonnet").unwrap();
-        assert_eq!(response.content, "Hello");
-        assert_eq!(response.model, "sonnet"); // fallback since no modelUsage
-        assert!(response.usage.is_none());
-    }
-
-    #[test]
-    fn parse_json_output_invalid_json() {
-        let provider = CliProvider::claude_cli();
-        let result = provider.parse_json_output("not json at all", "sonnet");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("parse"));
-    }
-
-    #[test]
-    fn check_command_exists_for_known_binary() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into(); // bash always exists
-        assert!(provider.check_command_exists().is_ok());
-    }
-
-    #[test]
-    fn check_command_exists_for_missing_binary() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "nonexistent_binary_that_does_not_exist_12345".into();
-        let result = provider.check_command_exists();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn chat_json_output_parses_response() {
-        // Use a bash command that outputs JSON in the claude format
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"hello from json","usage":{"input_tokens":5,"output_tokens":3},"modelUsage":{"test-model":{}}}'"#.into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = true;
-
-        let messages = vec![Message::user("test")];
-        let options = ChatOptions::default();
-        let response = provider.chat(&messages, options).await.unwrap();
-
-        assert_eq!(response.content, "hello from json");
-        assert_eq!(response.model, "test-model");
-        let usage = response.usage.unwrap();
-        assert_eq!(usage.input_tokens, 5);
-        assert_eq!(usage.output_tokens, 3);
-    }
-
-    #[tokio::test]
-    async fn stream_json_parses_deltas_and_usage() {
-        // Simulate claude --output-format stream-json --include-partial-messages
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), concat!(
-            r#"echo '{"type":"system","model":"claude-sonnet-4-5-20250929","tools":[]}'"#, " && ",
-            r#"echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}'"#, " && ",
-            r#"echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}}'"#, " && ",
-            r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"Hello world","total_cost_usd":0.005,"usage":{"input_tokens":10,"output_tokens":5},"modelUsage":{"claude-sonnet-4-5-20250929":{}}}'"#
-        ).into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = true;
-
-        let messages = vec![Message::user("test")];
-        let options = ChatOptions::default();
-        let stream = provider.stream(&messages, options).await.unwrap();
-        let events: Vec<StreamEvent> = stream.collect().await;
-
-        // Should have Start with model from system init
-        let start = events.iter().find(|e| matches!(e, StreamEvent::Start { .. }));
-        assert!(start.is_some(), "expected Start event, got: {:?}", events);
-        if let Some(StreamEvent::Start { model }) = start {
-            assert_eq!(model, "claude-sonnet-4-5-20250929");
-        }
-
-        // Should have two Delta events: "Hello" and " world"
-        let deltas: Vec<&str> = events.iter().filter_map(|e| match e {
-            StreamEvent::Delta { content } => Some(content.as_str()),
-            _ => None,
-        }).collect();
-        assert_eq!(deltas, vec!["Hello", " world"]);
-
-        // Should have Stop with usage
-        let stop = events.iter().find(|e| matches!(e, StreamEvent::Stop { .. }));
-        assert!(stop.is_some(), "expected Stop event, got: {:?}", events);
-        if let Some(StreamEvent::Stop { usage, reason, .. }) = stop {
-            assert_eq!(reason, "end_turn");
-            let u = usage.as_ref().expect("expected usage in Stop event");
-            assert_eq!(u.input_tokens, 10);
-            assert_eq!(u.output_tokens, 5);
-        }
-    }
-
-    #[tokio::test]
-    async fn stream_json_error_result() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), concat!(
-            r#"echo '{"type":"system","model":"test-model","tools":[]}'"#, " && ",
-            r#"echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Something failed","usage":{"input_tokens":5,"output_tokens":0}}'"#
-        ).into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = true;
-
-        let messages = vec![Message::user("test")];
-        let options = ChatOptions::default();
-        let stream = provider.stream(&messages, options).await.unwrap();
-        let events: Vec<StreamEvent> = stream.collect().await;
-
-        let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error { message } if message.contains("Something failed")));
-        assert!(has_error, "expected error event, got: {:?}", events);
-    }
-
-    #[tokio::test]
-    async fn stream_json_skips_non_text_deltas() {
-        let mut provider = CliProvider::claude_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), concat!(
-            r#"echo '{"type":"system","model":"test-model","tools":[]}'"#, " && ",
-            r#"echo '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'"#, " && ",
-            r#"echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}}'"#, " && ",
-            r#"echo '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'"#, " && ",
-            r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"Hi","usage":{"input_tokens":3,"output_tokens":1}}'"#
-        ).into()];
-        provider.model_flag = String::new();
-        provider.default_model = String::new();
-        provider.system_flag = None;
-        provider.stdin_mode = true;
-
-        let messages = vec![Message::user("test")];
-        let options = ChatOptions::default();
-        let stream = provider.stream(&messages, options).await.unwrap();
-        let events: Vec<StreamEvent> = stream.collect().await;
-
-        let deltas: Vec<&str> = events.iter().filter_map(|e| match e {
-            StreamEvent::Delta { content } => Some(content.as_str()),
-            _ => None,
-        }).collect();
-        assert_eq!(deltas, vec!["Hi"]);
-    }
-
-    #[tokio::test]
-    async fn stream_plain_text_still_works() {
-        let mut provider = CliProvider::codex_cli();
-        provider.command = "bash".into();
-        provider.args = vec!["-c".into(), "printf 'line1\\nline2\\nline3\\n'".into()];
-        provider.model_flag = String::new();
-        provider.default_model = "test".into();
-        provider.system_flag = None;
-        provider.stdin_mode = true;
-
-        let messages = vec![Message::user("test")];
-        let options = ChatOptions::default();
-        let stream = provider.stream(&messages, options).await.unwrap();
-        let events: Vec<StreamEvent> = stream.collect().await;
-
-        let deltas: Vec<&str> = events.iter().filter_map(|e| match e {
-            StreamEvent::Delta { content } => Some(content.as_str()),
-            _ => None,
-        }).collect();
-        assert_eq!(deltas, vec!["line1", "\n", "line2", "\n", "line3"]);
-
-        let stop = events.iter().find(|e| matches!(e, StreamEvent::Stop { .. }));
-        if let Some(StreamEvent::Stop { usage, .. }) = stop {
-            assert!(usage.is_none());
-        }
-    }
-}
-
 async fn run_doctor(config: &Config) -> Result<()> {
-    println!("drbot Health Check");
-    println!("==================");
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Severity {
+        Ok,
+        Info,
+        Warning,
+        Critical,
+    }
+
+    impl Severity {
+        fn icon(self) -> &'static str {
+            match self {
+                Severity::Ok => "✓",
+                Severity::Info => "i",
+                Severity::Warning => "!",
+                Severity::Critical => "✗",
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Severity::Ok => "OK",
+                Severity::Info => "INFO",
+                Severity::Warning => "WARN",
+                Severity::Critical => "CRIT",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Finding {
+        severity: Severity,
+        title: String,
+        details: Vec<String>,
+    }
+
+    fn env_truthy(key: &str) -> bool {
+        matches!(
+            std::env::var(key)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    fn is_loopback_host(host: &str) -> bool {
+        let mut normalized = host.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        if normalized == "localhost" {
+            return true;
+        }
+        if normalized.starts_with('[') && normalized.ends_with(']') && normalized.len() >= 2 {
+            normalized = normalized[1..normalized.len() - 1].to_string();
+        }
+        normalized
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    }
+
+    fn normalize_channel_name(raw: &str) -> String {
+        let lowered = raw.trim().to_ascii_lowercase();
+        match lowered.as_str() {
+            "imsg" => "imessage".to_string(),
+            "gchat" | "google-chat" => "googlechat".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    println!("drbot Doctor");
+    println!("============");
     println!();
 
-    // Check config directory
-    print!("Config directory... ");
+    let mut findings: Vec<Finding> = Vec::new();
+
+    // --------------------------------------------
+    // Directories + state
+    // --------------------------------------------
+
     if let Some(dir) = Config::config_dir() {
         if dir.exists() {
-            println!("OK ({})", dir.display());
+            findings.push(Finding {
+                severity: Severity::Ok,
+                title: "Config directory".to_string(),
+                details: vec![dir.display().to_string()],
+            });
         } else {
-            println!("MISSING ({})", dir.display());
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Config directory missing".to_string(),
+                details: vec![
+                    dir.display().to_string(),
+                    "Create it or run `drbot config` / the wizard to initialize.".to_string(),
+                ],
+            });
         }
     } else {
-        println!("UNKNOWN");
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "Config directory unknown".to_string(),
+            details: vec!["Unable to resolve OS config dir.".to_string()],
+        });
     }
 
-    // Check data directory
-    print!("Data directory... ");
     if let Some(dir) = Config::data_dir() {
         if dir.exists() {
-            println!("OK ({})", dir.display());
+            findings.push(Finding {
+                severity: Severity::Ok,
+                title: "Data directory".to_string(),
+                details: vec![dir.display().to_string()],
+            });
         } else {
-            println!("MISSING ({})", dir.display());
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Data directory missing".to_string(),
+                details: vec![
+                    dir.display().to_string(),
+                    "Create it (or start the gateway once) so drbot can persist state.".to_string(),
+                ],
+            });
         }
-    } else {
-        println!("UNKNOWN");
     }
 
-    // Check providers
-    println!();
+    let openclaw_state_dir =
+        drbot_gateway::openclaw_paths::resolve_openclaw_state_dir(config).unwrap_or_default();
+    if openclaw_state_dir.as_os_str().is_empty() {
+        findings.push(Finding {
+            severity: Severity::Info,
+            title: "OpenClaw state dir".to_string(),
+            details: vec!["Not resolved (will fall back to defaults).".to_string()],
+        });
+    } else {
+        findings.push(Finding {
+            severity: if openclaw_state_dir.exists() {
+                Severity::Ok
+            } else {
+                Severity::Info
+            },
+            title: "OpenClaw state dir".to_string(),
+            details: vec![openclaw_state_dir.display().to_string()],
+        });
+    }
+
+    // --------------------------------------------
+    // Gateway exposure / auth
+    // --------------------------------------------
+
+    let host = config.gateway.host.trim();
+    let auth_token = config.gateway.auth_token.as_deref().unwrap_or("").trim();
+    let loopback = is_loopback_host(host);
+    let tls = config.gateway.tls_enabled;
+
+    if !loopback && auth_token.is_empty() {
+        findings.push(Finding {
+            severity: Severity::Critical,
+            title: "Gateway exposed without auth token".to_string(),
+            details: vec![
+                format!("bind: {}:{}", host, config.gateway.port),
+                "Anyone who can reach this port can fully control your agent.".to_string(),
+                "Fix: set `gateway.auth_token` or bind to 127.0.0.1.".to_string(),
+            ],
+        });
+    } else if !loopback {
+        let weak = auth_token.len() < 16
+            || matches!(
+                auth_token.to_ascii_lowercase().as_str(),
+                "changeme" | "change-me" | "password" | "token"
+            );
+        findings.push(Finding {
+            severity: if weak {
+                Severity::Warning
+            } else {
+                Severity::Info
+            },
+            title: "Gateway bound to network interface".to_string(),
+            details: vec![
+                format!("bind: {}:{}", host, config.gateway.port),
+                "Ensure your auth token is strong and kept secret.".to_string(),
+                if weak {
+                    "Auth token looks weak; use a long random token.".to_string()
+                } else {
+                    "Auth token configured.".to_string()
+                },
+            ],
+        });
+        if !tls {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Gateway TLS disabled on network bind".to_string(),
+                details: vec![
+                    "Traffic will be plaintext unless you run behind a TLS-terminating proxy."
+                        .to_string(),
+                    "Fix: set `gateway.tls_enabled=true` (and configure cert/key) or bind to localhost."
+                        .to_string(),
+                ],
+            });
+        }
+    } else {
+        findings.push(Finding {
+            severity: Severity::Ok,
+            title: "Gateway bind policy".to_string(),
+            details: vec![format!("bind: {}:{}", host, config.gateway.port)],
+        });
+    }
+
+    // --------------------------------------------
+    // SSRF / network fetch surfaces
+    // --------------------------------------------
+
+    let web_fetch_allows_private = env_truthy("DRBOT_OPENCLAW_WEB_FETCH_ALLOW_PRIVATE")
+        || env_truthy("DRBOT_WEB_FETCH_ALLOW_PRIVATE");
+    if web_fetch_allows_private {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "SSRF policy: web_fetch allows private network".to_string(),
+            details: vec![
+                "This enables fetching internal URLs (e.g. 127.0.0.1 / RFC1918).".to_string(),
+                "Fix: unset DRBOT_OPENCLAW_WEB_FETCH_ALLOW_PRIVATE / DRBOT_WEB_FETCH_ALLOW_PRIVATE."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let browser_allows_private = env_truthy("DRBOT_OPENCLAW_BROWSER_ALLOW_PRIVATE")
+        || env_truthy("DRBOT_BROWSER_ALLOW_PRIVATE");
+    if browser_allows_private {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "SSRF policy: browser requests allow private network".to_string(),
+            details: vec![
+                "This enables screenshots/status checks against internal URLs.".to_string(),
+                "Fix: unset DRBOT_OPENCLAW_BROWSER_ALLOW_PRIVATE / DRBOT_BROWSER_ALLOW_PRIVATE."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let skills_allows_private = env_truthy("DRBOT_OPENCLAW_SKILLS_ALLOW_PRIVATE")
+        || env_truthy("DRBOT_OPENCLAW_REMOTE_SKILLS_ALLOW_PRIVATE")
+        || env_truthy("DRBOT_OPENCLAW_SKILLS_INSTALL_ALLOW_PRIVATE");
+    if skills_allows_private {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "SSRF policy: remote skills allow private network".to_string(),
+            details: vec![
+                "Remote SKILL.md sync/install can fetch internal URLs.".to_string(),
+                "Fix: unset DRBOT_OPENCLAW_SKILLS_ALLOW_PRIVATE / DRBOT_OPENCLAW_REMOTE_SKILLS_ALLOW_PRIVATE / DRBOT_OPENCLAW_SKILLS_INSTALL_ALLOW_PRIVATE."
+                    .to_string(),
+            ],
+        });
+    }
+
+    // --------------------------------------------
+    // Tool exposure / approvals bypasses
+    // --------------------------------------------
+
+    let bash_allow_all = env_truthy("DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL")
+        || env_truthy("DRBOT_AGENT_BASH_ALLOW_ALL");
+    if bash_allow_all {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "Agent bash tool: allow-all enabled".to_string(),
+            details: vec![
+                "This removes the command-prefix sandbox for agent bash runs.".to_string(),
+                "If exec approvals are disabled for a session, this can be dangerous.".to_string(),
+                "Fix: unset DRBOT_OPENCLAW_AGENT_BASH_ALLOW_ALL / DRBOT_AGENT_BASH_ALLOW_ALL."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let bash_allowlist_raw = std::env::var("DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST")
+        .ok()
+        .or_else(|| std::env::var("DRBOT_AGENT_BASH_ALLOWLIST").ok())
+        .unwrap_or_default();
+    if !bash_allowlist_raw.trim().is_empty() {
+        let tokens = bash_allowlist_raw
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let has_all = tokens.iter().any(|s| s == "*" || s == "all");
+        if has_all {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Agent bash tool: allowlist contains '*'".to_string(),
+                details: vec![
+                    "This effectively enables allow-all behavior.".to_string(),
+                    "Fix: restrict DRBOT_OPENCLAW_AGENT_BASH_ALLOWLIST / DRBOT_AGENT_BASH_ALLOWLIST to a small set of prefixes."
+                        .to_string(),
+                ],
+            });
+        }
+    }
+
+    if env_truthy("DRBOT_OPENCLAW_ALLOW_EXTERNAL_RESTART") {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "External restart enabled".to_string(),
+            details: vec![
+                "DRBOT_OPENCLAW_ALLOW_EXTERNAL_RESTART allows SIGUSR1 restarts without an in-process authorization window."
+                    .to_string(),
+                "Fix: unset DRBOT_OPENCLAW_ALLOW_EXTERNAL_RESTART unless you need it.".to_string(),
+            ],
+        });
+    }
+
+    if std::env::var("DRBOT_OPENCLAW_SEND_WRITE").ok().as_deref() == Some("1") {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "Send approvals bypass enabled".to_string(),
+            details: vec![
+                "DRBOT_OPENCLAW_SEND_WRITE=1 bypasses send tool approvals when sendPolicy=ask."
+                    .to_string(),
+                "Fix: unset DRBOT_OPENCLAW_SEND_WRITE.".to_string(),
+            ],
+        });
+    }
+
+    // --------------------------------------------
+    // Channels allowlists
+    // --------------------------------------------
+
+    let enabled = config
+        .channels
+        .enabled
+        .iter()
+        .map(|c| normalize_channel_name(c))
+        .filter(|c| !c.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+
+    let is_enabled = |name: &str| enabled.contains(&normalize_channel_name(name));
+    if is_enabled("telegram") {
+        match &config.channels.telegram {
+            None => findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Telegram enabled but not configured".to_string(),
+                details: vec!["Set `channels.telegram.bot_token`.".to_string()],
+            }),
+            Some(cfg) => {
+                if cfg.allowed_users.is_empty() && cfg.allowed_chats.is_empty() {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        title: "Telegram allowlists empty".to_string(),
+                        details: vec![
+                            "Telegram will accept inbound messages from any user/chat by default."
+                                .to_string(),
+                            "Fix: set `channels.telegram.allowed_users` and/or `channels.telegram.allowed_chats`."
+                                .to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    if is_enabled("discord") {
+        match &config.channels.discord {
+            None => findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Discord enabled but not configured".to_string(),
+                details: vec![
+                    "Set `channels.discord.bot_token` and `channels.discord.application_id`."
+                        .to_string(),
+                ],
+            }),
+            Some(cfg) => {
+                if cfg.allowed_guilds.is_empty() {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        title: "Discord allowlist empty".to_string(),
+                        details: vec![
+                            "`channels.discord.allowed_guilds` is empty (allows all guilds)."
+                                .to_string(),
+                            "Fix: set allowed guild ids.".to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    if is_enabled("whatsapp") {
+        match &config.channels.whatsapp {
+            None => findings.push(Finding {
+                severity: Severity::Warning,
+                title: "WhatsApp enabled but not configured".to_string(),
+                details: vec!["Set `channels.whatsapp.session_path` (and bridge url).".to_string()],
+            }),
+            Some(cfg) => {
+                if cfg.allowed_numbers.is_empty() {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        title: "WhatsApp allowlist empty".to_string(),
+                        details: vec![
+                            "`channels.whatsapp.allowed_numbers` is empty (allows all senders)."
+                                .to_string(),
+                            "Fix: set allowed phone numbers.".to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    if is_enabled("signal") {
+        match &config.channels.signal {
+            None => findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Signal enabled but not configured".to_string(),
+                details: vec![
+                    "Set `channels.signal.socket_path` and `channels.signal.phone_number`."
+                        .to_string(),
+                ],
+            }),
+            Some(cfg) => {
+                if cfg.allowed_numbers.is_empty() {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        title: "Signal allowlist empty".to_string(),
+                        details: vec![
+                            "`channels.signal.allowed_numbers` is empty (allows all senders)."
+                                .to_string(),
+                            "Fix: set allowed phone numbers.".to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    if is_enabled("imessage") {
+        match &config.channels.imessage {
+            None => findings.push(Finding {
+                severity: Severity::Warning,
+                title: "iMessage enabled but not configured".to_string(),
+                details: vec![
+                    "Set `channels.imessage.allowed_contacts` (optional db path).".to_string(),
+                ],
+            }),
+            Some(cfg) => {
+                if cfg.allowed_contacts.is_empty() {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        title: "iMessage allowlist empty".to_string(),
+                        details: vec![
+                            "`channels.imessage.allowed_contacts` is empty (allows all contacts)."
+                                .to_string(),
+                            "Fix: set allowed contacts.".to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    if is_enabled("matrix") {
+        match &config.channels.matrix {
+            None => findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Matrix enabled but not configured".to_string(),
+                details: vec![
+                    "Set `channels.matrix.homeserver_url`, `user_id`, `access_token`.".to_string(),
+                ],
+            }),
+            Some(cfg) => {
+                if cfg.allowed_rooms.is_empty() {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        title: "Matrix allowlist empty".to_string(),
+                        details: vec![
+                            "`channels.matrix.allowed_rooms` is empty (allows all rooms)."
+                                .to_string(),
+                            "Fix: set allowed room ids.".to_string(),
+                        ],
+                    });
+                }
+            }
+        }
+    }
+
+    if is_enabled("slack") && config.channels.slack.is_none() {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "Slack enabled but not configured".to_string(),
+            details: vec![
+                "Set `channels.slack.bot_token`, `app_token`, and `signing_secret`.".to_string(),
+            ],
+        });
+    }
+
+    // --------------------------------------------
+    // Providers (best-effort)
+    // --------------------------------------------
+
     println!("Providers:");
-
-    print!("  Anthropic... ");
-    if config.providers.anthropic.is_some() {
-        println!("configured");
-    } else {
-        println!("not configured");
-    }
-
-    print!("  OpenAI... ");
-    if config.providers.openai.is_some() {
-        println!("configured");
-    } else {
-        println!("not configured");
-    }
-
-    print!("  Ollama... ");
+    println!(
+        "  Anthropic: {}",
+        if config.providers.anthropic.is_some() {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+    println!(
+        "  OpenAI: {}",
+        if config.providers.openai.is_some() {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
     if let Some(ollama) = &config.providers.ollama {
-        // Actually check if Ollama is running
         match check_ollama_health(&ollama.url).await {
-            Ok(true) => println!("running ({})", ollama.url),
-            Ok(false) => println!("configured but not responding ({})", ollama.url),
-            Err(e) => println!("error checking ({}): {}", ollama.url, e),
+            Ok(true) => println!("  Ollama: running ({})", ollama.url),
+            Ok(false) => println!("  Ollama: configured but not responding ({})", ollama.url),
+            Err(e) => println!("  Ollama: error checking ({}): {}", ollama.url, e),
         }
     } else {
-        println!("not configured");
+        println!("  Ollama: not configured");
+    }
+    println!();
+
+    // --------------------------------------------
+    // Report
+    // --------------------------------------------
+
+    let mut crit = 0usize;
+    let mut warn = 0usize;
+    let mut info = 0usize;
+    for f in &findings {
+        match f.severity {
+            Severity::Critical => crit += 1,
+            Severity::Warning => warn += 1,
+            Severity::Info => info += 1,
+            Severity::Ok => {}
+        }
+    }
+
+    println!("Checks:");
+    for f in &findings {
+        println!(
+            "  {} [{}] {}",
+            f.severity.icon(),
+            f.severity.label(),
+            f.title
+        );
+        for line in &f.details {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            println!("      {}", trimmed);
+        }
     }
 
     println!();
-    println!("All checks complete!");
+    if crit == 0 && warn == 0 {
+        println!("Summary: OK ({} info)", info);
+    } else {
+        println!(
+            "Summary: {} critical, {} warnings, {} info",
+            crit, warn, info
+        );
+    }
 
     Ok(())
 }
@@ -4457,6 +4041,7 @@ async fn run_wizard() -> Result<()> {
                 api_key,
                 default_model: Some(model),
                 base_url: None,
+                headers: Default::default(),
                 max_tokens: None,
             });
             println!("  Anthropic configured.");
@@ -4512,6 +4097,7 @@ async fn run_wizard() -> Result<()> {
                 api_key,
                 default_model: Some(model),
                 base_url: None,
+                headers: Default::default(),
                 organization: None,
             });
             println!("  OpenAI configured.");

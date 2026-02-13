@@ -1,8 +1,8 @@
-use drbot_otc_escrow_program::{
-    derive_escrow_pda, derive_receipt_pda, EscrowInstruction, EscrowParty, EscrowTerms, Leg,
-    EscrowReceiptState, LegKind, ReceiptStatus,
-};
 use borsh::BorshDeserialize;
+use drbot_otc_escrow_program::{
+    derive_escrow_pda, derive_receipt_pda, EscrowInstruction, EscrowParty, EscrowReceiptState,
+    EscrowTerms, Leg, LegKind, ReceiptStatus,
+};
 use solana_program_test::ProgramTest;
 use solana_sdk::account::ReadableAccount;
 use solana_sdk::program_pack::Pack;
@@ -32,7 +32,9 @@ async fn escrow_sol_for_spl_token_autosettles_on_second_fund() {
     pt.add_program(
         "spl_associated_token_account",
         spl_associated_token_account::id(),
-        solana_program_test::processor!(spl_associated_token_account::processor::process_instruction),
+        solana_program_test::processor!(
+            spl_associated_token_account::processor::process_instruction
+        ),
     );
 
     let mut ctx = pt.start_with_context().await;
@@ -65,10 +67,14 @@ async fn escrow_sol_for_spl_token_autosettles_on_second_fund() {
     )
     .await;
 
-    let a_usdc_ata =
-        spl_associated_token_account::get_associated_token_address(&party_a.pubkey(), &usdc_mint.pubkey());
-    let b_usdc_ata =
-        spl_associated_token_account::get_associated_token_address(&party_b.pubkey(), &usdc_mint.pubkey());
+    let a_usdc_ata = spl_associated_token_account::get_associated_token_address(
+        &party_a.pubkey(),
+        &usdc_mint.pubkey(),
+    );
+    let b_usdc_ata = spl_associated_token_account::get_associated_token_address(
+        &party_b.pubkey(),
+        &usdc_mint.pubkey(),
+    );
 
     create_ata(&mut ctx, &payer, &party_a.pubkey(), &usdc_mint.pubkey()).await;
     create_ata(&mut ctx, &payer, &party_b.pubkey(), &usdc_mint.pubkey()).await;
@@ -94,11 +100,22 @@ async fn escrow_sol_for_spl_token_autosettles_on_second_fund() {
         expiry_unix_ts: i64::MAX,
     };
 
-    let (escrow_pda, _bump) = derive_escrow_pda(&program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
-    let (receipt_pda, _receipt_bump) =
-        derive_receipt_pda(&program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
-    let vault_ata =
-        spl_associated_token_account::get_associated_token_address(&escrow_pda, &usdc_mint.pubkey());
+    let (escrow_pda, _bump) = derive_escrow_pda(
+        &program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
+    let (receipt_pda, _receipt_bump) = derive_receipt_pda(
+        &program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
+    let vault_ata = spl_associated_token_account::get_associated_token_address(
+        &escrow_pda,
+        &usdc_mint.pubkey(),
+    );
 
     // Create escrow (payer can be either party; use party A).
     let create_ix = solana_sdk::instruction::Instruction {
@@ -111,8 +128,14 @@ async fn escrow_sol_for_spl_token_autosettles_on_second_fund() {
             solana_sdk::instruction::AccountMeta::new_readonly(party_b.pubkey(), false),
             solana_sdk::instruction::AccountMeta::new_readonly(system_program::id(), false),
             solana_sdk::instruction::AccountMeta::new_readonly(spl_token::id(), false),
-            solana_sdk::instruction::AccountMeta::new_readonly(spl_associated_token_account::id(), false),
-            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                spl_associated_token_account::id(),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                solana_sdk::sysvar::rent::id(),
+                false,
+            ),
             solana_sdk::instruction::AccountMeta::new_readonly(usdc_mint.pubkey(), false),
             solana_sdk::instruction::AccountMeta::new(vault_ata, false),
         ],
@@ -249,7 +272,9 @@ async fn create_escrow_rejects_party_mismatch() {
     pt.add_program(
         "spl_associated_token_account",
         spl_associated_token_account::id(),
-        solana_program_test::processor!(spl_associated_token_account::processor::process_instruction),
+        solana_program_test::processor!(
+            spl_associated_token_account::processor::process_instruction
+        ),
     );
 
     let ctx = pt.start_with_context().await;
@@ -261,7 +286,11 @@ async fn create_escrow_rejects_party_mismatch() {
 
     // Fund attacker so they can pay fees.
     let fund_tx = Transaction::new_signed_with_payer(
-        &[sys_ix::transfer(&payer.pubkey(), &attacker.pubkey(), 1_000_000_000)],
+        &[sys_ix::transfer(
+            &payer.pubkey(),
+            &attacker.pubkey(),
+            1_000_000_000,
+        )],
         Some(&payer.pubkey()),
         &[&payer],
         ctx.last_blockhash,
@@ -278,9 +307,18 @@ async fn create_escrow_rejects_party_mismatch() {
         expiry_unix_ts: i64::MAX,
     };
 
-    let (escrow_pda, _bump) = derive_escrow_pda(&program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
-    let (receipt_pda, _receipt_bump) =
-        derive_receipt_pda(&program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
+    let (escrow_pda, _bump) = derive_escrow_pda(
+        &program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
+    let (receipt_pda, _receipt_bump) = derive_receipt_pda(
+        &program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
 
     // Attacker attempts to create escrow but substitutes themselves as the Party A account meta.
     let create_ix = solana_sdk::instruction::Instruction {
@@ -293,8 +331,14 @@ async fn create_escrow_rejects_party_mismatch() {
             solana_sdk::instruction::AccountMeta::new_readonly(party_b.pubkey(), false),
             solana_sdk::instruction::AccountMeta::new_readonly(system_program::id(), false),
             solana_sdk::instruction::AccountMeta::new_readonly(spl_token::id(), false),
-            solana_sdk::instruction::AccountMeta::new_readonly(spl_associated_token_account::id(), false),
-            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                spl_associated_token_account::id(),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                solana_sdk::sysvar::rent::id(),
+                false,
+            ),
         ],
         data: borsh::to_vec(&EscrowInstruction::CreateEscrow { terms }).unwrap(),
     };
@@ -325,8 +369,12 @@ fn fund_ix(
     token_source: Option<&Pubkey>,
     party: EscrowParty,
 ) -> solana_sdk::instruction::Instruction {
-    let (receipt, _receipt_bump) =
-        derive_receipt_pda(&program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
+    let (receipt, _receipt_bump) = derive_receipt_pda(
+        &program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
     let mut accounts = vec![
         solana_sdk::instruction::AccountMeta::new(*funder, true),
         solana_sdk::instruction::AccountMeta::new(escrow, false),
@@ -441,11 +489,13 @@ async fn mint_to(
     ctx.banks_client.process_transaction(tx).await.unwrap();
 }
 
-async fn token_balance(
-    ctx: &mut solana_program_test::ProgramTestContext,
-    account: &Pubkey,
-) -> u64 {
-    let acct = ctx.banks_client.get_account(*account).await.unwrap().unwrap();
+async fn token_balance(ctx: &mut solana_program_test::ProgramTestContext, account: &Pubkey) -> u64 {
+    let acct = ctx
+        .banks_client
+        .get_account(*account)
+        .await
+        .unwrap()
+        .unwrap();
     let token = spl_token::state::Account::unpack(acct.data()).unwrap();
     token.amount
 }

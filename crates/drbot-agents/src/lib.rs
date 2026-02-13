@@ -47,7 +47,7 @@ pub use background::{
 pub use executor::{ExecutionResult, Executor};
 pub use planner::{Plan, Planner, Step};
 pub use sandbox::{Sandbox, SandboxConfig};
-pub use tools::{AgentTool, BuiltinTools};
+pub use tools::{AgentTool, BuiltinTools, BuiltinToolsOptions};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

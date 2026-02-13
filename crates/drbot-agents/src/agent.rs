@@ -12,6 +12,88 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+fn resolve_tool_result_max_chars() -> usize {
+    const DEFAULT: usize = 20_000;
+    const MIN: usize = 1_000;
+    const MAX: usize = 1_000_000;
+
+    std::env::var("DRBOT_AGENT_TOOL_RESULT_MAX_CHARS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(MIN, MAX))
+        .unwrap_or(DEFAULT)
+}
+
+fn truncate_tool_result_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 128 {
+        let head = text.chars().take(max_chars).collect::<String>();
+        return format!(
+            "{}\n\n… [tool result truncated: kept {} of {} chars] …",
+            head, max_chars, total_chars
+        );
+    }
+
+    let head_len = max_chars.saturating_mul(2).saturating_div(3);
+    let tail_len = max_chars.saturating_sub(head_len).max(1);
+
+    let head = text.chars().take(head_len).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+
+    format!(
+        "{}\n\n… [tool result truncated: kept {}+{} of {} chars] …\n\n{}",
+        head, head_len, tail_len, total_chars, tail
+    )
+}
+
+fn sanitize_tool_result_for_model(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return raw.to_string();
+    }
+
+    // OpenClaw v2026.2.12 hardening: strip toolResult.details from model-facing transcripts
+    // to reduce prompt-injection replay risk.
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(obj) = value.as_object_mut() {
+            if obj.contains_key("content") && obj.contains_key("details") {
+                obj.remove("details");
+                if let Ok(out) = serde_json::to_string_pretty(&value) {
+                    return out;
+                }
+            }
+        }
+    }
+
+    // Best-effort fallback for truncated/invalid JSON: drop everything after the `details` key.
+    if trimmed.contains("\"content\"") && trimmed.contains("\"details\"") {
+        if let Some(idx) = trimmed.find("\"details\"") {
+            let mut prefix = trimmed[..idx].trim_end();
+            prefix = prefix.strip_suffix(',').unwrap_or(prefix).trim_end();
+            let mut out = prefix.to_string();
+            if !out.trim_end().ends_with('}') {
+                out.push_str("\n}\n");
+            }
+            return out;
+        }
+    }
+
+    raw.to_string()
+}
+
 /// Agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -170,7 +252,7 @@ impl Agent {
                     // Add tool result to messages
                     self.messages.push(AgentMessage {
                         role: AgentRole::Tool,
-                        content: result.content.clone(),
+                        content: sanitize_tool_result_for_model(&result.content),
                         tool_calls: None,
                         tool_result: Some(result),
                     });
@@ -203,11 +285,11 @@ impl Agent {
 
     /// Call the LLM.
     async fn call_llm(&self) -> Result<AgentMessage> {
+        use chrono::Utc;
         use drbot_core::message::Message;
         use drbot_core::message::{Content, Role};
         use drbot_providers::ChatOptions;
         use serde_json::Map;
-        use chrono::Utc;
 
         // Convert agent messages to provider messages
         let messages: Vec<Message> = self
@@ -249,7 +331,7 @@ impl Agent {
                             role: Role::User,
                             content: vec![Content::ToolResult {
                                 tool_use_id: result.tool_call_id.clone(),
-                                content: result.content.clone(),
+                                content: sanitize_tool_result_for_model(&result.content),
                                 is_error: result.is_error,
                             }],
                             created_at: Utc::now(),
@@ -460,21 +542,26 @@ impl Agent {
             i = end;
         }
 
-        if calls.is_empty() { None } else { Some(calls) }
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
     }
 
     /// Execute a tool.
     async fn execute_tool(&self, call: &ToolCall) -> ToolResult {
+        let max_chars = resolve_tool_result_max_chars();
         match self.tools.get(&call.name) {
             Some(tool) => match tool.execute(call.arguments.clone()).await {
                 Ok(result) => ToolResult {
                     tool_call_id: call.id.clone(),
-                    content: result,
+                    content: truncate_tool_result_text(&result, max_chars),
                     is_error: false,
                 },
                 Err(e) => ToolResult {
                     tool_call_id: call.id.clone(),
-                    content: e.to_string(),
+                    content: truncate_tool_result_text(&e.to_string(), max_chars),
                     is_error: true,
                 },
             },
@@ -496,5 +583,27 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.max_iterations, 10);
         assert!(config.use_planning);
+    }
+
+    #[test]
+    fn truncates_tool_results_by_char_count() {
+        let input = "x".repeat(500);
+        let out = truncate_tool_result_text(&input, 128);
+        assert!(out.len() < input.len());
+        assert!(out.contains("tool result truncated"));
+        assert!(out.contains("kept"));
+    }
+
+    #[test]
+    fn strips_tool_result_details_from_openclaw_json() {
+        let input = r#"{
+  "content": [{ "type": "text", "text": "ok" }],
+  "details": { "status": "completed", "html": "<script>alert('xss')</script>" },
+  "meta": { "tool": "web_fetch" }
+}"#;
+        let out = sanitize_tool_result_for_model(input);
+        assert!(out.contains("\"content\""));
+        assert!(!out.contains("\"details\""));
+        assert!(out.contains("\"meta\""));
     }
 }

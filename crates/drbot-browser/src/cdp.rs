@@ -16,6 +16,9 @@ pub struct CdpRequest {
     pub id: u64,
     /// Method name.
     pub method: String,
+    /// Optional session ID (when attached to a target with `flatten: true`).
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
@@ -48,6 +51,9 @@ pub struct CdpError {
 pub struct CdpEvent {
     /// Event method.
     pub method: String,
+    /// Optional session ID (when attached to a target with `flatten: true`).
+    #[serde(rename = "sessionId", default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Event parameters.
     pub params: Option<serde_json::Value>,
 }
@@ -140,10 +146,21 @@ impl CdpConnection {
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> drbot_core::Result<serde_json::Value> {
+        self.send_with_session(method, params, None).await
+    }
+
+    /// Send a CDP command scoped to a specific target session.
+    pub async fn send_with_session(
+        &self,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        session_id: Option<&str>,
+    ) -> drbot_core::Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = CdpRequest {
             id,
             method: method.into(),
+            session_id: session_id.map(|s| s.to_string()),
             params,
         };
 
@@ -184,11 +201,13 @@ mod tests {
         let req = CdpRequest {
             id: 1,
             method: "Page.navigate".to_string(),
+            session_id: Some("session123".to_string()),
             params: Some(serde_json::json!({"url": "https://example.com"})),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("Page.navigate"));
         assert!(json.contains("example.com"));
+        assert!(json.contains("sessionId"));
     }
 
     #[test]
@@ -204,5 +223,13 @@ mod tests {
         let json = r#"{"method": "Page.loadEventFired", "params": {"timestamp": 12345.0}}"#;
         let event: CdpEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.method, "Page.loadEventFired");
+    }
+
+    #[test]
+    fn test_cdp_event_with_session_deserialize() {
+        let json = r#"{"sessionId":"session123","method":"Runtime.consoleAPICalled","params":{"type":"log"}}"#;
+        let event: CdpEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.session_id.as_deref(), Some("session123"));
+        assert_eq!(event.method, "Runtime.consoleAPICalled");
     }
 }

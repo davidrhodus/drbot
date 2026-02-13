@@ -114,7 +114,7 @@ impl EscrowState {
         + (1 + 32 + 8)       // b_owes
         + 1                  // a_funded
         + 1                  // b_funded
-        + 8;                 // expiry_unix_ts (i64)
+        + 8; // expiry_unix_ts (i64)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -188,8 +188,13 @@ pub fn derive_receipt_pda(
 
 entrypoint!(process_instruction);
 
-pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let ix = EscrowInstruction::try_from_slice(data).map_err(|_| EscrowError::InvalidInstruction)?;
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    let ix =
+        EscrowInstruction::try_from_slice(data).map_err(|_| EscrowError::InvalidInstruction)?;
     match ix {
         EscrowInstruction::CreateEscrow { terms } => create_escrow(program_id, accounts, terms),
         EscrowInstruction::Fund { party } => fund(program_id, accounts, party),
@@ -197,7 +202,11 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     }
 }
 
-fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTerms) -> ProgramResult {
+fn create_escrow(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    terms: EscrowTerms,
+) -> ProgramResult {
     let mut ai = accounts.iter();
     let payer = next_account_info(&mut ai)?;
     let escrow = next_account_info(&mut ai)?;
@@ -222,14 +231,22 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
         return Err(EscrowError::InvalidTokenProgram.into());
     }
 
-    let (expected_escrow, bump) =
-        derive_escrow_pda(program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
+    let (expected_escrow, bump) = derive_escrow_pda(
+        program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
     if &expected_escrow != escrow.key {
         return Err(EscrowError::InvalidPda.into());
     }
 
-    let (expected_receipt, receipt_bump) =
-        derive_receipt_pda(program_id, &terms.negotiation_id, &terms.party_a, &terms.party_b);
+    let (expected_receipt, receipt_bump) = derive_receipt_pda(
+        program_id,
+        &terms.negotiation_id,
+        &terms.party_a,
+        &terms.party_b,
+    );
     if &expected_receipt != receipt.key {
         return Err(EscrowError::InvalidPda.into());
     }
@@ -280,8 +297,8 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
 
     // If already initialized, verify terms match and return Ok.
     if escrow.owner == program_id && !escrow.data_is_empty() {
-        let existing =
-            EscrowState::try_from_slice(&escrow.data.borrow()).map_err(|_| EscrowError::TermsMismatch)?;
+        let existing = EscrowState::try_from_slice(&escrow.data.borrow())
+            .map_err(|_| EscrowError::TermsMismatch)?;
         let desired = EscrowState {
             version: EscrowState::VERSION,
             bump: existing.bump,
@@ -351,11 +368,20 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
         if mint.key != &terms.a_owes.mint {
             return Err(EscrowError::TermsMismatch.into());
         }
-        let expected_vault = spl_associated_token_account::get_associated_token_address(escrow.key, mint.key);
+        let expected_vault =
+            spl_associated_token_account::get_associated_token_address(escrow.key, mint.key);
         if &expected_vault != vault.key {
             return Err(EscrowError::TermsMismatch.into());
         }
-        create_ata_if_missing(payer, vault, escrow, mint, system_program, token_program, ata_program)?;
+        create_ata_if_missing(
+            payer,
+            vault,
+            escrow,
+            mint,
+            system_program,
+            token_program,
+            ata_program,
+        )?;
     }
     if terms.b_owes.kind == LegKind::SplToken {
         let mint = next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?;
@@ -363,11 +389,20 @@ fn create_escrow(program_id: &Pubkey, accounts: &[AccountInfo], terms: EscrowTer
         if mint.key != &terms.b_owes.mint {
             return Err(EscrowError::TermsMismatch.into());
         }
-        let expected_vault = spl_associated_token_account::get_associated_token_address(escrow.key, mint.key);
+        let expected_vault =
+            spl_associated_token_account::get_associated_token_address(escrow.key, mint.key);
         if &expected_vault != vault.key {
             return Err(EscrowError::TermsMismatch.into());
         }
-        create_ata_if_missing(payer, vault, escrow, mint, system_program, token_program, ata_program)?;
+        create_ata_if_missing(
+            payer,
+            vault,
+            escrow,
+            mint,
+            system_program,
+            token_program,
+            ata_program,
+        )?;
     }
 
     Ok(())
@@ -432,25 +467,33 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    let mut state =
-        EscrowState::try_from_slice(&escrow.data.borrow()).map_err(|_| EscrowError::InvalidInstruction)?;
+    let mut state = EscrowState::try_from_slice(&escrow.data.borrow())
+        .map_err(|_| EscrowError::InvalidInstruction)?;
 
     // Verify expected accounts.
-    let (expected_escrow, _bump) =
-        derive_escrow_pda(program_id, &state.negotiation_id, &state.party_a, &state.party_b);
+    let (expected_escrow, _bump) = derive_escrow_pda(
+        program_id,
+        &state.negotiation_id,
+        &state.party_a,
+        &state.party_b,
+    );
     if &expected_escrow != escrow.key {
         return Err(EscrowError::InvalidPda.into());
     }
-    let (expected_receipt, _receipt_bump) =
-        derive_receipt_pda(program_id, &state.negotiation_id, &state.party_a, &state.party_b);
+    let (expected_receipt, _receipt_bump) = derive_receipt_pda(
+        program_id,
+        &state.negotiation_id,
+        &state.party_a,
+        &state.party_b,
+    );
     if &expected_receipt != receipt.key {
         return Err(EscrowError::InvalidPda.into());
     }
     if receipt.owner != program_id || receipt.data_is_empty() {
         return Err(EscrowError::TermsMismatch.into());
     }
-    let mut receipt_state =
-        EscrowReceiptState::try_from_slice(&receipt.data.borrow()).map_err(|_| EscrowError::TermsMismatch)?;
+    let mut receipt_state = EscrowReceiptState::try_from_slice(&receipt.data.borrow())
+        .map_err(|_| EscrowError::TermsMismatch)?;
     if receipt_state.version != EscrowReceiptState::VERSION {
         return Err(EscrowError::TermsMismatch.into());
     }
@@ -486,13 +529,17 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
     if state.a_owes.kind == LegKind::SplToken {
         a_vault = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
         a_recipient = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
-        let expected_vault =
-            spl_associated_token_account::get_associated_token_address(escrow.key, &state.a_owes.mint);
+        let expected_vault = spl_associated_token_account::get_associated_token_address(
+            escrow.key,
+            &state.a_owes.mint,
+        );
         if a_vault.unwrap().key != &expected_vault {
             return Err(EscrowError::TermsMismatch.into());
         }
-        let expected_recipient =
-            spl_associated_token_account::get_associated_token_address(&state.party_b, &state.a_owes.mint);
+        let expected_recipient = spl_associated_token_account::get_associated_token_address(
+            &state.party_b,
+            &state.a_owes.mint,
+        );
         if a_recipient.unwrap().key != &expected_recipient {
             return Err(EscrowError::TermsMismatch.into());
         }
@@ -502,13 +549,17 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
     if state.b_owes.kind == LegKind::SplToken {
         b_vault = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
         b_recipient = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
-        let expected_vault =
-            spl_associated_token_account::get_associated_token_address(escrow.key, &state.b_owes.mint);
+        let expected_vault = spl_associated_token_account::get_associated_token_address(
+            escrow.key,
+            &state.b_owes.mint,
+        );
         if b_vault.unwrap().key != &expected_vault {
             return Err(EscrowError::TermsMismatch.into());
         }
-        let expected_recipient =
-            spl_associated_token_account::get_associated_token_address(&state.party_a, &state.b_owes.mint);
+        let expected_recipient = spl_associated_token_account::get_associated_token_address(
+            &state.party_a,
+            &state.b_owes.mint,
+        );
         if b_recipient.unwrap().key != &expected_recipient {
             return Err(EscrowError::TermsMismatch.into());
         }
@@ -518,7 +569,10 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
     match owed_leg.kind {
         LegKind::NativeSol => {
             let ix = system_instruction::transfer(funder.key, escrow.key, owed_leg.amount);
-            invoke(&ix, &[funder.clone(), escrow.clone(), system_program.clone()])?;
+            invoke(
+                &ix,
+                &[funder.clone(), escrow.clone(), system_program.clone()],
+            )?;
         }
         LegKind::SplToken => {
             let source = next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?;
@@ -537,7 +591,15 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
                 &[],
                 owed_leg.amount,
             )?;
-            invoke(&ix, &[source.clone(), vault.clone(), funder.clone(), token_program.clone()])?;
+            invoke(
+                &ix,
+                &[
+                    source.clone(),
+                    vault.clone(),
+                    funder.clone(),
+                    token_program.clone(),
+                ],
+            )?;
         }
     }
 
@@ -547,7 +609,19 @@ fn fund(program_id: &Pubkey, accounts: &[AccountInfo], party: EscrowParty) -> Pr
     // Auto-settle on second fund.
     if state.a_funded && state.b_funded {
         msg!("Escrow fully funded; settling");
-        settle(program_id, escrow, &state, party_a, party_b, rent_refund, token_program, a_vault, a_recipient, b_vault, b_recipient)?;
+        settle(
+            program_id,
+            escrow,
+            &state,
+            party_a,
+            party_b,
+            rent_refund,
+            token_program,
+            a_vault,
+            a_recipient,
+            b_vault,
+            b_recipient,
+        )?;
         receipt_state.status = ReceiptStatus::Settled;
         receipt_state.serialize(&mut &mut receipt.data.borrow_mut()[..])?;
     }
@@ -593,7 +667,15 @@ fn settle<'a>(
         LegKind::SplToken => {
             let vault = a_vault.ok_or(EscrowError::MissingAccounts)?;
             let recipient = a_recipient.ok_or(EscrowError::MissingAccounts)?;
-            token_transfer_from_escrow(program_id, escrow, token_program, vault, recipient, state.a_owes.amount, state)?;
+            token_transfer_from_escrow(
+                program_id,
+                escrow,
+                token_program,
+                vault,
+                recipient,
+                state.a_owes.amount,
+                state,
+            )?;
             token_close_from_escrow(program_id, escrow, token_program, vault, rent_refund, state)?;
         }
     }
@@ -606,7 +688,15 @@ fn settle<'a>(
         LegKind::SplToken => {
             let vault = b_vault.ok_or(EscrowError::MissingAccounts)?;
             let recipient = b_recipient.ok_or(EscrowError::MissingAccounts)?;
-            token_transfer_from_escrow(program_id, escrow, token_program, vault, recipient, state.b_owes.amount, state)?;
+            token_transfer_from_escrow(
+                program_id,
+                escrow,
+                token_program,
+                vault,
+                recipient,
+                state.b_owes.amount,
+                state,
+            )?;
             token_close_from_escrow(program_id, escrow, token_program, vault, rent_refund, state)?;
         }
     }
@@ -679,7 +769,12 @@ fn token_close_from_escrow<'a>(
     ];
     invoke_signed(
         &ix,
-        &[vault.clone(), destination.clone(), escrow.clone(), token_program.clone()],
+        &[
+            vault.clone(),
+            destination.clone(),
+            escrow.clone(),
+            token_program.clone(),
+        ],
         &[&seeds],
     )?;
     Ok(())
@@ -728,21 +823,25 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    let state =
-        EscrowState::try_from_slice(&escrow.data.borrow()).map_err(|_| EscrowError::InvalidInstruction)?;
+    let state = EscrowState::try_from_slice(&escrow.data.borrow())
+        .map_err(|_| EscrowError::InvalidInstruction)?;
     if party_a.key != &state.party_a || party_b.key != &state.party_b {
         return Err(EscrowError::InvalidParty.into());
     }
-    let (expected_receipt, _receipt_bump) =
-        derive_receipt_pda(program_id, &state.negotiation_id, &state.party_a, &state.party_b);
+    let (expected_receipt, _receipt_bump) = derive_receipt_pda(
+        program_id,
+        &state.negotiation_id,
+        &state.party_a,
+        &state.party_b,
+    );
     if &expected_receipt != receipt.key {
         return Err(EscrowError::InvalidPda.into());
     }
     if receipt.owner != program_id || receipt.data_is_empty() {
         return Err(EscrowError::TermsMismatch.into());
     }
-    let mut receipt_state =
-        EscrowReceiptState::try_from_slice(&receipt.data.borrow()).map_err(|_| EscrowError::TermsMismatch)?;
+    let mut receipt_state = EscrowReceiptState::try_from_slice(&receipt.data.borrow())
+        .map_err(|_| EscrowError::TermsMismatch)?;
     if receipt_state.version != EscrowReceiptState::VERSION {
         return Err(EscrowError::TermsMismatch.into());
     }
@@ -767,13 +866,17 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if state.a_owes.kind == LegKind::SplToken {
         a_vault = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
         a_refund = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
-        let expected_vault =
-            spl_associated_token_account::get_associated_token_address(escrow.key, &state.a_owes.mint);
+        let expected_vault = spl_associated_token_account::get_associated_token_address(
+            escrow.key,
+            &state.a_owes.mint,
+        );
         if a_vault.unwrap().key != &expected_vault {
             return Err(EscrowError::TermsMismatch.into());
         }
-        let expected_refund =
-            spl_associated_token_account::get_associated_token_address(&state.party_a, &state.a_owes.mint);
+        let expected_refund = spl_associated_token_account::get_associated_token_address(
+            &state.party_a,
+            &state.a_owes.mint,
+        );
         if a_refund.unwrap().key != &expected_refund {
             return Err(EscrowError::TermsMismatch.into());
         }
@@ -783,13 +886,17 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if state.b_owes.kind == LegKind::SplToken {
         b_vault = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
         b_refund = Some(next_account_info(&mut ai).map_err(|_| EscrowError::MissingAccounts)?);
-        let expected_vault =
-            spl_associated_token_account::get_associated_token_address(escrow.key, &state.b_owes.mint);
+        let expected_vault = spl_associated_token_account::get_associated_token_address(
+            escrow.key,
+            &state.b_owes.mint,
+        );
         if b_vault.unwrap().key != &expected_vault {
             return Err(EscrowError::TermsMismatch.into());
         }
-        let expected_refund =
-            spl_associated_token_account::get_associated_token_address(&state.party_b, &state.b_owes.mint);
+        let expected_refund = spl_associated_token_account::get_associated_token_address(
+            &state.party_b,
+            &state.b_owes.mint,
+        );
         if b_refund.unwrap().key != &expected_refund {
             return Err(EscrowError::TermsMismatch.into());
         }
@@ -801,7 +908,15 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             LegKind::SplToken => {
                 let vault = a_vault.ok_or(EscrowError::MissingAccounts)?;
                 let refund = a_refund.ok_or(EscrowError::MissingAccounts)?;
-                token_transfer_from_escrow(program_id, escrow, token_program, vault, refund, state.a_owes.amount, &state)?;
+                token_transfer_from_escrow(
+                    program_id,
+                    escrow,
+                    token_program,
+                    vault,
+                    refund,
+                    state.a_owes.amount,
+                    &state,
+                )?;
             }
         }
     }
@@ -811,7 +926,15 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             LegKind::SplToken => {
                 let vault = b_vault.ok_or(EscrowError::MissingAccounts)?;
                 let refund = b_refund.ok_or(EscrowError::MissingAccounts)?;
-                token_transfer_from_escrow(program_id, escrow, token_program, vault, refund, state.b_owes.amount, &state)?;
+                token_transfer_from_escrow(
+                    program_id,
+                    escrow,
+                    token_program,
+                    vault,
+                    refund,
+                    state.b_owes.amount,
+                    &state,
+                )?;
             }
         }
     }
@@ -819,11 +942,25 @@ fn cancel(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // Close token vaults (regardless of funded; should be empty after refund).
     if state.a_owes.kind == LegKind::SplToken {
         let vault = a_vault.ok_or(EscrowError::MissingAccounts)?;
-        token_close_from_escrow(program_id, escrow, token_program, vault, rent_refund, &state)?;
+        token_close_from_escrow(
+            program_id,
+            escrow,
+            token_program,
+            vault,
+            rent_refund,
+            &state,
+        )?;
     }
     if state.b_owes.kind == LegKind::SplToken {
         let vault = b_vault.ok_or(EscrowError::MissingAccounts)?;
-        token_close_from_escrow(program_id, escrow, token_program, vault, rent_refund, &state)?;
+        token_close_from_escrow(
+            program_id,
+            escrow,
+            token_program,
+            vault,
+            rent_refund,
+            &state,
+        )?;
     }
 
     receipt_state.status = ReceiptStatus::Cancelled;

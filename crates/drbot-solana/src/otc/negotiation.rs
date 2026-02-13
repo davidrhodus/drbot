@@ -12,11 +12,11 @@ use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::RwLock;
 use tokio::sync::Notify;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -158,7 +158,12 @@ impl OTCNegotiationManager {
     }
 
     /// Record that a funding tx occurred (local observation).
-    pub async fn record_escrow_funded_local(&self, negotiation_id: Uuid, party: EscrowParty, signature: String) {
+    pub async fn record_escrow_funded_local(
+        &self,
+        negotiation_id: Uuid,
+        party: EscrowParty,
+        signature: String,
+    ) {
         let mut negotiations = self.negotiations.write().await;
         let Some(neg) = negotiations.get_mut(&negotiation_id) else {
             return;

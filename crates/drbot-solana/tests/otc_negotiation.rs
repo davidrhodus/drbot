@@ -37,13 +37,13 @@ fn test_otc_message_quote() {
     let rfq_id = Uuid::new_v4();
     let msg = OTCMessage::quote(
         rfq_id,
-        100.0,           // price
-        100_000_000_000, // quantity
+        100.0,              // price
+        100_000_000_000,    // quantity
         10_000_000_000_000, // settlement amount (micros)
         "USDC",
         Pubkey::new_unique(),
         Pubkey::new_unique(), // maker wallet
-        120, // valid for 2 minutes
+        120,                  // valid for 2 minutes
     );
 
     match msg {

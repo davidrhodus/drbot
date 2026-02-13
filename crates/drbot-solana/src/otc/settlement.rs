@@ -50,9 +50,7 @@ pub fn build_escrow_params(rfq: &OTCMessage, quote: &OTCMessage) -> Result<Creat
         ));
     }
     if *quantity == 0 || *settlement_amount == 0 {
-        return Err(SolanaError::OTCError(
-            "Invalid quote amounts".to_string(),
-        ));
+        return Err(SolanaError::OTCError("Invalid quote amounts".to_string()));
     }
     if *quantity > *rfq_amount {
         return Err(SolanaError::OTCError(
@@ -87,7 +85,11 @@ pub fn build_escrow_params(rfq: &OTCMessage, quote: &OTCMessage) -> Result<Creat
 fn min_timestamp(a: &DateTime<chrono::Utc>, b: &DateTime<chrono::Utc>) -> i64 {
     let a_ts = a.timestamp();
     let b_ts = b.timestamp();
-    if a_ts <= b_ts { a_ts } else { b_ts }
+    if a_ts <= b_ts {
+        a_ts
+    } else {
+        b_ts
+    }
 }
 
 /// Determine whether a mint should be treated as native SOL for escrow legs.
@@ -136,7 +138,13 @@ mod tests {
         let params = build_escrow_params(&rfq, &quote).unwrap();
         assert_eq!(params.party_a, initiator);
         assert_eq!(params.party_b, maker);
-        assert_eq!(params.a_owes.kind, drbot_otc_escrow_program::LegKind::SplToken);
-        assert_eq!(params.b_owes.kind, drbot_otc_escrow_program::LegKind::NativeSol);
+        assert_eq!(
+            params.a_owes.kind,
+            drbot_otc_escrow_program::LegKind::SplToken
+        );
+        assert_eq!(
+            params.b_owes.kind,
+            drbot_otc_escrow_program::LegKind::NativeSol
+        );
     }
 }

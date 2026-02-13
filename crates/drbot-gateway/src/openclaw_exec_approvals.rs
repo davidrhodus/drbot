@@ -169,11 +169,36 @@ pub fn tool_writes_allowed(tool: &str) -> bool {
         return false;
     }
     let file = load_exec_approvals_json();
-    file.get("drbotTools")
-        .and_then(|v| v.get(tool))
-        .and_then(|v| v.get("allowWrites"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    let tools = file.get("drbotTools").and_then(|v| v.as_object());
+    let Some(tools) = tools else {
+        return false;
+    };
+
+    let mut keys: Vec<&str> = Vec::new();
+    keys.push(tool);
+    match tool {
+        "bash" | "exec" => {
+            keys.push("bash");
+            keys.push("exec");
+        }
+        "write_file" | "write" => {
+            keys.push("write_file");
+            keys.push("write");
+        }
+        "http" | "web_fetch" => {
+            keys.push("http");
+            keys.push("web_fetch");
+        }
+        _ => {}
+    }
+
+    keys.into_iter().any(|key| {
+        tools
+            .get(key)
+            .and_then(|v| v.get("allowWrites"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    })
 }
 
 pub fn set_tool_writes_allowed(tool: &str, allow: bool) -> Result<(), String> {
@@ -196,15 +221,72 @@ pub fn set_tool_writes_allowed(tool: &str, allow: bool) -> Result<(), String> {
     }
 
     let tools_obj = tools_val.as_object_mut().unwrap();
-    let entry_val = tools_obj.entry(tool.to_string()).or_insert_with(|| json!({}));
-    if !entry_val.is_object() {
-        *entry_val = json!({});
+
+    let mut keys: Vec<&str> = Vec::new();
+    keys.push(tool);
+    match tool {
+        "bash" | "exec" => {
+            keys.push("bash");
+            keys.push("exec");
+        }
+        "write_file" | "write" => {
+            keys.push("write_file");
+            keys.push("write");
+        }
+        "http" | "web_fetch" => {
+            keys.push("http");
+            keys.push("web_fetch");
+        }
+        _ => {}
     }
-    if let Some(map) = entry_val.as_object_mut() {
-        map.insert("allowWrites".to_string(), json!(allow));
+
+    for key in keys {
+        let entry_val = tools_obj
+            .entry(key.to_string())
+            .or_insert_with(|| json!({}));
+        if !entry_val.is_object() {
+            *entry_val = json!({});
+        }
+        if let Some(map) = entry_val.as_object_mut() {
+            map.insert("allowWrites".to_string(), json!(allow));
+        }
     }
 
     write_exec_approvals_json_atomic(&serde_json::Value::Object(obj.clone()))
+}
+
+/// Best-effort OpenClaw parity: resolve whether exec approvals are configured
+/// to auto-allow skill CLIs for a given agent.
+///
+/// OpenClaw stores this under `defaults.autoAllowSkills` and/or `agents.<id>.autoAllowSkills`.
+pub fn exec_approvals_auto_allow_skills(agent_id: Option<&str>) -> bool {
+    let file = load_exec_approvals_json();
+    let defaults = file
+        .get("defaults")
+        .and_then(|v| v.get("autoAllowSkills"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let agent_id = agent_id.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let mut override_val = agent_id.and_then(|id| {
+        file.get("agents")
+            .and_then(|v| v.get(id))
+            .and_then(|v| v.get("autoAllowSkills"))
+            .and_then(|v| v.as_bool())
+    });
+
+    // Back-compat: OpenClaw's legacy default agent id is "main"; drbot uses "default".
+    if override_val.is_none() {
+        if let Some("default") = agent_id {
+            override_val = file
+                .get("agents")
+                .and_then(|v| v.get("main"))
+                .and_then(|v| v.get("autoAllowSkills"))
+                .and_then(|v| v.as_bool());
+        }
+    }
+
+    override_val.unwrap_or(defaults)
 }
 
 /// Ensure a side-effectful write is allowed for a tool.
@@ -253,16 +335,12 @@ pub async fn ensure_tool_write_allowed(
             let _ = set_tool_writes_allowed(tool, true);
             Ok(())
         }
-        Some("deny") => Err(ErrorShape::new(
-            error_codes::UNAVAILABLE,
-            "request denied",
-        )
-        .with_details(json!({ "tool": tool, "approvalId": record.id }))),
-        _ => Err(ErrorShape::new(
-            error_codes::UNAVAILABLE,
-            "approval timed out",
-        )
-        .with_details(json!({ "tool": tool, "approvalId": record.id }))),
+        Some("deny") => Err(ErrorShape::new(error_codes::UNAVAILABLE, "request denied")
+            .with_details(json!({ "tool": tool, "approvalId": record.id }))),
+        _ => Err(
+            ErrorShape::new(error_codes::UNAVAILABLE, "approval timed out")
+                .with_details(json!({ "tool": tool, "approvalId": record.id })),
+        ),
     }
 }
 
@@ -292,4 +370,3 @@ pub fn exec_approvals_get_payload() -> serde_json::Value {
         "file": file,
     })
 }
-
