@@ -89,7 +89,10 @@ impl bindings::drbot::iron::host::Host for HostState {
     }
 
     async fn tool_invoke(&mut self, name: String, args_json: String) -> String {
-        let res: IronToolResult = self.tools.tool_invoke(name.as_str(), args_json.as_str()).await;
+        let res: IronToolResult = self
+            .tools
+            .tool_invoke(name.as_str(), args_json.as_str())
+            .await;
         res.to_json_string()
     }
 }
@@ -142,6 +145,12 @@ pub struct IronLoadedWorkflow {
     component: Component,
 }
 
+#[derive(Debug, Clone)]
+pub struct IronRunOutput {
+    pub output: String,
+    pub fuel_consumed: Option<u64>,
+}
+
 impl IronRunner {
     pub fn new() -> anyhow::Result<Self> {
         let mut cfg = Config::new();
@@ -172,14 +181,36 @@ impl IronRunner {
         Ok(IronLoadedWorkflow { component })
     }
 
+    pub async fn run_file_with_stats(
+        &self,
+        component_path: &Path,
+        event_json: &str,
+        cfg: IronRunnerConfig,
+    ) -> anyhow::Result<IronRunOutput> {
+        let loaded = self.load_file(component_path)?;
+        self.run_loaded_with_stats(&loaded, event_json, cfg).await
+    }
+
     pub async fn run_file(
         &self,
         component_path: &Path,
         event_json: &str,
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
-        let loaded = self.load_file(component_path)?;
-        self.run_loaded(&loaded, event_json, cfg).await
+        Ok(self
+            .run_file_with_stats(component_path, event_json, cfg)
+            .await?
+            .output)
+    }
+
+    pub async fn run_bytes_with_stats(
+        &self,
+        bytes: &[u8],
+        event_json: &str,
+        cfg: IronRunnerConfig,
+    ) -> anyhow::Result<IronRunOutput> {
+        let loaded = self.load_bytes(bytes)?;
+        self.run_loaded_with_stats(&loaded, event_json, cfg).await
     }
 
     pub async fn run_bytes(
@@ -188,8 +219,20 @@ impl IronRunner {
         event_json: &str,
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
-        let loaded = self.load_bytes(bytes)?;
-        self.run_loaded(&loaded, event_json, cfg).await
+        Ok(self
+            .run_bytes_with_stats(bytes, event_json, cfg)
+            .await?
+            .output)
+    }
+
+    pub async fn run_loaded_with_stats(
+        &self,
+        loaded: &IronLoadedWorkflow,
+        event_json: &str,
+        cfg: IronRunnerConfig,
+    ) -> anyhow::Result<IronRunOutput> {
+        self.run_component_with_stats(&loaded.component, event_json, cfg)
+            .await
     }
 
     pub async fn run_loaded(
@@ -198,7 +241,10 @@ impl IronRunner {
         event_json: &str,
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
-        self.run_component(&loaded.component, event_json, cfg).await
+        Ok(self
+            .run_loaded_with_stats(loaded, event_json, cfg)
+            .await?
+            .output)
     }
 
     fn timeout_to_epoch_ticks(&self, timeout: Duration) -> u64 {
@@ -211,17 +257,22 @@ impl IronRunner {
         ticks.max(1)
     }
 
-    async fn run_component(
+    async fn run_component_with_stats(
         &self,
         component: &Component,
         event_json: &str,
         cfg: IronRunnerConfig,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<IronRunOutput> {
+        let timeout = cfg.timeout;
+        let fuel = cfg.fuel;
+        let max_memory_bytes = cfg.max_memory_bytes;
+        let tools_cfg = cfg.tools;
+
         let mut linker = Linker::new(&self.engine);
         wasmtime_wasi::add_to_linker_async(&mut linker).context("failed to add wasi to linker")?;
         bindings::drbot::iron::host::add_to_linker(&mut linker, |s: &mut HostState| s)?;
 
-        let limits = match cfg.max_memory_bytes {
+        let limits = match max_memory_bytes {
             Some(bytes) => wasmtime::StoreLimitsBuilder::new()
                 .memory_size(bytes)
                 .trap_on_grow_failure(true)
@@ -229,12 +280,12 @@ impl IronRunner {
             None => wasmtime::StoreLimitsBuilder::new().build(),
         };
 
-        let mut store = Store::new(&self.engine, HostState::new(cfg.tools, limits));
+        let mut store = Store::new(&self.engine, HostState::new(tools_cfg, limits));
         store.limiter(|s: &mut HostState| &mut s.limits);
         store.epoch_deadline_trap();
-        store.set_epoch_deadline(self.timeout_to_epoch_ticks(cfg.timeout));
+        store.set_epoch_deadline(self.timeout_to_epoch_ticks(timeout));
 
-        if let Some(fuel) = cfg.fuel {
+        if let Some(fuel) = fuel {
             store.set_fuel(fuel).context("failed to add fuel")?;
         }
 
@@ -243,7 +294,19 @@ impl IronRunner {
             .context("failed to instantiate workflow")?;
 
         match workflow.call_run(&mut store, event_json).await {
-            Ok(out) => Ok(out),
+            Ok(out) => {
+                let fuel_consumed = match fuel {
+                    Some(initial) => store
+                        .get_fuel()
+                        .ok()
+                        .map(|remaining| initial.saturating_sub(remaining)),
+                    None => None,
+                };
+                Ok(IronRunOutput {
+                    output: out,
+                    fuel_consumed,
+                })
+            }
             Err(e) => {
                 for cause in e.chain() {
                     if let Some(trap) = cause.downcast_ref::<wasmtime::Trap>() {

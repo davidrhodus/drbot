@@ -3,6 +3,7 @@
 //! This is the main entry point for the drbot binary.
 
 use anyhow::Result;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use drbot_anthropic::AnthropicProvider;
@@ -16,8 +17,11 @@ use drbot_providers::{ChatOptions, CliProvider, Provider, StreamEvent};
 use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
 use drbot_tui::AppConfig;
 use futures::StreamExt;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -293,7 +297,6 @@ enum SkillsAction {
     },
 }
 
-
 /// Iron workflow subcommands.
 #[derive(Subcommand)]
 enum IronAction {
@@ -329,7 +332,6 @@ enum IronAction {
         rust_dir: String,
     },
 
-
     /// Bundle an Iron workflow for distribution (.tar.gz)
     Bundle {
         /// Path to a workflow directory (containing iron.json)
@@ -354,6 +356,10 @@ enum IronAction {
         /// Exclude WIT from the bundle
         #[arg(long, default_value_t = false)]
         no_wit: bool,
+
+        /// Sign the bundle manifest with an Ed25519 seed key file (32 raw bytes, or base64/hex text)
+        #[arg(long)]
+        sign_key: Option<String>,
     },
     /// Run an Iron workflow component
     Run {
@@ -396,8 +402,136 @@ enum IronAction {
         #[arg(long, default_value_t = false)]
         allow_bash_all: bool,
 
+        /// Allow HTTP requests to these domains (repeatable)
+        #[arg(long = "allow-http-domain")]
+        allow_http_domains: Vec<String>,
+
+        /// HTTP timeout in milliseconds
+        #[arg(long, default_value_t = 20_000)]
+        http_timeout_ms: u64,
+
+        /// Maximum HTTP response bytes
+        #[arg(long, default_value_t = 1_000_000)]
+        http_max_bytes: u64,
+
+        /// Path to a SQLite file to enable kv.* tools
+        #[arg(long)]
+        kv_path: Option<String>,
+
+        /// KV namespace (defaults to "default")
+        #[arg(long)]
+        kv_namespace: Option<String>,
+
+        /// Maximum KV value size in bytes
+        #[arg(long, default_value_t = 1_000_000)]
+        kv_max_value_bytes: u64,
+
+        /// Provide a secret as NAME=VALUE (repeatable)
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+
+        /// Read secrets from a JSON file ({"NAME":"VALUE", ...})
+        #[arg(long)]
+        secrets_file: Option<String>,
+
+        /// Require the workflow to be signed by a trusted key
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
+
+        /// Trusted Ed25519 public key (base64 or base64:<...>) (repeatable)
+        #[arg(long = "trust-pubkey")]
+        trust_pubkeys: Vec<String>,
+
+        /// Read a trusted Ed25519 public key from a file (repeatable)
+        #[arg(long = "trust-pubkey-file")]
+        trust_pubkey_files: Vec<String>,
     },
 
+    /// Run a directory of JSON fixtures against a workflow
+    Test {
+        /// Path to a workflow directory (containing iron.json), a .wasm component, or a .iron.tgz bundle
+        path: String,
+
+        /// Fixtures directory (defaults to <workflow_dir>/fixtures)
+        #[arg(long)]
+        fixtures: Option<String>,
+
+        /// Write expected outputs for fixtures
+        #[arg(long, default_value_t = false)]
+        update: bool,
+
+        /// Timeout in milliseconds
+        #[arg(long, default_value_t = 120_000)]
+        timeout_ms: u64,
+
+        /// Fuel limit for deterministic execution (instruction units)
+        #[arg(long)]
+        fuel: Option<u64>,
+
+        /// Maximum linear memory per guest memory (MB)
+        #[arg(long)]
+        max_memory_mb: Option<u64>,
+
+        /// Working directory for relative paths
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Allow filesystem roots for fs.* tools (repeatable)
+        #[arg(long = "fs-root")]
+        fs_roots: Vec<String>,
+
+        /// Allow bash commands starting with these prefixes (repeatable)
+        #[arg(long = "allow-bash-prefix")]
+        allow_bash_prefixes: Vec<String>,
+
+        /// Allow any bash command (dangerous)
+        #[arg(long, default_value_t = false)]
+        allow_bash_all: bool,
+
+        /// Allow HTTP requests to these domains (repeatable)
+        #[arg(long = "allow-http-domain")]
+        allow_http_domains: Vec<String>,
+
+        /// HTTP timeout in milliseconds
+        #[arg(long, default_value_t = 20_000)]
+        http_timeout_ms: u64,
+
+        /// Maximum HTTP response bytes
+        #[arg(long, default_value_t = 1_000_000)]
+        http_max_bytes: u64,
+
+        /// Path to a SQLite file to enable kv.* tools
+        #[arg(long)]
+        kv_path: Option<String>,
+
+        /// KV namespace (defaults to "default")
+        #[arg(long)]
+        kv_namespace: Option<String>,
+
+        /// Maximum KV value size in bytes
+        #[arg(long, default_value_t = 1_000_000)]
+        kv_max_value_bytes: u64,
+
+        /// Provide a secret as NAME=VALUE (repeatable)
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+
+        /// Read secrets from a JSON file ({"NAME":"VALUE", ...})
+        #[arg(long)]
+        secrets_file: Option<String>,
+
+        /// Require the workflow to be signed by a trusted key
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
+
+        /// Trusted Ed25519 public key (base64 or base64:<...>) (repeatable)
+        #[arg(long = "trust-pubkey")]
+        trust_pubkeys: Vec<String>,
+
+        /// Read a trusted Ed25519 public key from a file (repeatable)
+        #[arg(long = "trust-pubkey-file")]
+        trust_pubkey_files: Vec<String>,
+    },
 
     /// Serve an Iron workflow over HTTP (local worker)
     Serve {
@@ -411,6 +545,10 @@ enum IronAction {
         /// Port to listen on
         #[arg(long, default_value_t = 18790)]
         port: u16,
+
+        /// Reload the workflow when the compiled WASM changes
+        #[arg(long, default_value_t = false)]
+        watch: bool,
 
         /// Timeout in milliseconds (per run)
         #[arg(long, default_value_t = 120_000)]
@@ -440,6 +578,53 @@ enum IronAction {
         #[arg(long, default_value_t = false)]
         allow_bash_all: bool,
 
+        /// Allow HTTP requests to these domains (repeatable)
+        #[arg(long = "allow-http-domain")]
+        allow_http_domains: Vec<String>,
+
+        /// HTTP timeout in milliseconds
+        #[arg(long, default_value_t = 20_000)]
+        http_timeout_ms: u64,
+
+        /// Maximum HTTP response bytes
+        #[arg(long, default_value_t = 1_000_000)]
+        http_max_bytes: u64,
+
+        /// Path to a SQLite file to enable kv.* tools
+        #[arg(long)]
+        kv_path: Option<String>,
+
+        /// KV namespace (defaults to "default")
+        #[arg(long)]
+        kv_namespace: Option<String>,
+
+        /// Maximum KV value size in bytes
+        #[arg(long, default_value_t = 1_000_000)]
+        kv_max_value_bytes: u64,
+
+        /// Provide a secret as NAME=VALUE (repeatable)
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+
+        /// Read secrets from a JSON file ({"NAME":"VALUE", ...})
+        #[arg(long)]
+        secrets_file: Option<String>,
+
+        /// Require this bearer token for /run (recommended with --public)
+        #[arg(long, env = "DRBOT_IRON_AUTH_TOKEN")]
+        auth_token: Option<String>,
+
+        /// Read bearer token from a file (safer than CLI args)
+        #[arg(long)]
+        auth_token_file: Option<String>,
+
+        /// TLS certificate PEM path (enables HTTPS)
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// TLS private key PEM path (enables HTTPS)
+        #[arg(long)]
+        tls_key: Option<String>,
 
         /// Allow binding to non-local addresses (dangerous)
         #[arg(long, default_value_t = false)]
@@ -456,12 +641,44 @@ enum IronAction {
         /// Maximum concurrent /run requests
         #[arg(long, default_value_t = 4)]
         max_concurrency: usize,
+
+        /// Enable Prometheus-style metrics at /metrics
+        #[arg(long, default_value_t = false)]
+        metrics: bool,
+
+        /// Rate limit (requests per second). 0 disables.
+        #[arg(long, default_value_t = 0)]
+        rate_limit_rps: u64,
+
+        /// Rate limit burst capacity (tokens)
+        #[arg(long, default_value_t = 20)]
+        rate_limit_burst: u64,
+
+        /// Require the workflow to be signed by a trusted key
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
+
+        /// Trusted Ed25519 public key (base64 or base64:<...>) (repeatable)
+        #[arg(long = "trust-pubkey")]
+        trust_pubkeys: Vec<String>,
+
+        /// Read a trusted Ed25519 public key from a file (repeatable)
+        #[arg(long = "trust-pubkey-file")]
+        trust_pubkey_files: Vec<String>,
     },
 
     /// Call an Iron workflow HTTP server (/run)
     Call {
         /// Server URL (e.g., http://127.0.0.1:18790)
         url: String,
+
+        /// Bearer token to send (if server requires auth)
+        #[arg(long, env = "DRBOT_IRON_AUTH_TOKEN")]
+        auth_token: Option<String>,
+
+        /// Read bearer token from a file (safer than CLI args)
+        #[arg(long)]
+        auth_token_file: Option<String>,
 
         /// Event JSON string (defaults to {"type":"manual"})
         #[arg(long)]
@@ -876,56 +1093,630 @@ async fn run_skills(
     Ok(())
 }
 
+fn hash_to_u64<T: Hash>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
 
+struct IronHttpMetrics {
+    start: std::time::Instant,
+    request_id_seq: AtomicU64,
 
-#[derive(Clone)]
+    run_requests_total: AtomicU64,
+    run_ok_total: AtomicU64,
+    run_error_total: AtomicU64,
+    run_unauthorized_total: AtomicU64,
+    run_busy_total: AtomicU64,
+    run_rate_limited_total: AtomicU64,
+    run_bad_request_total: AtomicU64,
+
+    metrics_scrapes_total: AtomicU64,
+
+    run_bytes_in_total: AtomicU64,
+    run_output_bytes_total: AtomicU64,
+    run_output_truncated_total: AtomicU64,
+    run_exec_duration_ms_total: AtomicU64,
+    run_exec_duration_ms_count: AtomicU64,
+    run_fuel_consumed_total: AtomicU64,
+}
+
+impl IronHttpMetrics {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            request_id_seq: AtomicU64::new(1),
+            run_requests_total: AtomicU64::new(0),
+            run_ok_total: AtomicU64::new(0),
+            run_error_total: AtomicU64::new(0),
+            run_unauthorized_total: AtomicU64::new(0),
+            run_busy_total: AtomicU64::new(0),
+            run_rate_limited_total: AtomicU64::new(0),
+            run_bad_request_total: AtomicU64::new(0),
+            metrics_scrapes_total: AtomicU64::new(0),
+            run_bytes_in_total: AtomicU64::new(0),
+            run_output_bytes_total: AtomicU64::new(0),
+            run_output_truncated_total: AtomicU64::new(0),
+            run_exec_duration_ms_total: AtomicU64::new(0),
+            run_exec_duration_ms_count: AtomicU64::new(0),
+            run_fuel_consumed_total: AtomicU64::new(0),
+        }
+    }
+
+    fn next_request_id(&self) -> String {
+        let n = self.request_id_seq.fetch_add(1, Ordering::Relaxed);
+        format!("{:016x}", n)
+    }
+
+    fn record_run_exec(&self, duration: std::time::Duration) {
+        let ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        self.run_exec_duration_ms_total
+            .fetch_add(ms, Ordering::Relaxed);
+        self.run_exec_duration_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render_prometheus(&self) -> String {
+        use std::fmt::Write as _;
+
+        fn u(v: &AtomicU64) -> u64 {
+            v.load(Ordering::Relaxed)
+        }
+
+        let uptime = self.start.elapsed().as_secs_f64();
+        let mut out = String::new();
+
+        let _ = writeln!(
+            &mut out,
+            "# HELP drbot_iron_http_uptime_seconds Uptime of the Iron HTTP server in seconds.",
+        );
+        let _ = writeln!(&mut out, "# TYPE drbot_iron_http_uptime_seconds gauge");
+        let _ = writeln!(&mut out, "drbot_iron_http_uptime_seconds {:.3}", uptime);
+
+        macro_rules! counter {
+            ($name:literal, $help:literal, $value:expr) => {{
+                let _ = writeln!(&mut out, "# HELP {} {}", $name, $help);
+                let _ = writeln!(&mut out, "# TYPE {} counter", $name);
+                let _ = writeln!(&mut out, "{} {}", $name, $value);
+            }};
+        }
+
+        counter!(
+            "drbot_iron_http_run_requests_total",
+            "Total /run requests received.",
+            u(&self.run_requests_total)
+        );
+        counter!(
+            "drbot_iron_http_run_ok_total",
+            "Total /run responses with ok=true.",
+            u(&self.run_ok_total)
+        );
+        counter!(
+            "drbot_iron_http_run_error_total",
+            "Total /run responses with ok=false (including timeouts).",
+            u(&self.run_error_total)
+        );
+        counter!(
+            "drbot_iron_http_run_unauthorized_total",
+            "Total unauthorized /run requests.",
+            u(&self.run_unauthorized_total)
+        );
+        counter!(
+            "drbot_iron_http_run_busy_total",
+            "Total busy /run requests (concurrency limit).",
+            u(&self.run_busy_total)
+        );
+        counter!(
+            "drbot_iron_http_run_rate_limited_total",
+            "Total rate limited /run requests.",
+            u(&self.run_rate_limited_total)
+        );
+        counter!(
+            "drbot_iron_http_run_bad_request_total",
+            "Total bad request /run requests (invalid body/json).",
+            u(&self.run_bad_request_total)
+        );
+        counter!(
+            "drbot_iron_http_metrics_scrapes_total",
+            "Total /metrics scrapes.",
+            u(&self.metrics_scrapes_total)
+        );
+        counter!(
+            "drbot_iron_http_run_bytes_in_total",
+            "Total request body bytes read for /run.",
+            u(&self.run_bytes_in_total)
+        );
+        counter!(
+            "drbot_iron_http_run_output_bytes_total",
+            "Total workflow output bytes produced (pre-truncation).",
+            u(&self.run_output_bytes_total)
+        );
+        counter!(
+            "drbot_iron_http_run_output_truncated_total",
+            "Total /run responses with output truncated.",
+            u(&self.run_output_truncated_total)
+        );
+        counter!(
+            "drbot_iron_http_run_exec_duration_ms_total",
+            "Total execution time spent in WASM for /run, in milliseconds.",
+            u(&self.run_exec_duration_ms_total)
+        );
+        counter!(
+            "drbot_iron_http_run_exec_duration_ms_count",
+            "Count of WASM executions for /run.",
+            u(&self.run_exec_duration_ms_count)
+        );
+        counter!(
+            "drbot_iron_http_run_fuel_consumed_total",
+            "Total fuel consumed for /run (when fuel metering is enabled).",
+            u(&self.run_fuel_consumed_total)
+        );
+
+        out
+    }
+}
+
+struct IronRateLimiter {
+    rps: f64,
+    burst: f64,
+    inner: tokio::sync::Mutex<IronRateLimiterInner>,
+}
+
+struct IronRateLimiterInner {
+    last_prune: std::time::Instant,
+    clients: HashMap<u64, IronRateLimiterClient>,
+}
+
+struct IronRateLimiterClient {
+    tokens: f64,
+    last_refill: std::time::Instant,
+    last_seen: std::time::Instant,
+}
+
+struct IronRateLimitDecision {
+    allowed: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+impl IronRateLimiter {
+    fn new(rps: u64, burst: u64) -> Self {
+        let rps = rps.max(1) as f64;
+        let burst = burst.max(1) as f64;
+        Self {
+            rps,
+            burst,
+            inner: tokio::sync::Mutex::new(IronRateLimiterInner {
+                last_prune: std::time::Instant::now(),
+                clients: HashMap::new(),
+            }),
+        }
+    }
+
+    async fn check(&self, key: u64) -> IronRateLimitDecision {
+        let now = std::time::Instant::now();
+        let mut inner = self.inner.lock().await;
+
+        if inner.last_prune.elapsed() > std::time::Duration::from_secs(30) {
+            let ttl = std::time::Duration::from_secs(5 * 60);
+            inner
+                .clients
+                .retain(|_, c| now.saturating_duration_since(c.last_seen) <= ttl);
+            inner.last_prune = now;
+        }
+
+        let client = inner
+            .clients
+            .entry(key)
+            .or_insert_with(|| IronRateLimiterClient {
+                tokens: self.burst,
+                last_refill: now,
+                last_seen: now,
+            });
+
+        let elapsed = now
+            .saturating_duration_since(client.last_refill)
+            .as_secs_f64();
+        if elapsed > 0.0 {
+            client.tokens = (client.tokens + elapsed * self.rps).min(self.burst);
+            client.last_refill = now;
+        }
+
+        client.last_seen = now;
+
+        if client.tokens >= 1.0 {
+            client.tokens -= 1.0;
+            return IronRateLimitDecision {
+                allowed: true,
+                retry_after: None,
+            };
+        }
+
+        let needed = 1.0 - client.tokens;
+        let wait_secs = needed / self.rps;
+        let retry_after = if wait_secs.is_finite() && wait_secs > 0.0 {
+            Some(std::time::Duration::from_secs_f64(wait_secs))
+        } else {
+            None
+        };
+
+        IronRateLimitDecision {
+            allowed: false,
+            retry_after,
+        }
+    }
+}
+
 struct IronHttpState {
     runner: Arc<drbot_iron::IronRunner>,
-    workflow: Arc<drbot_iron::IronLoadedWorkflow>,
+    workflow: tokio::sync::RwLock<Arc<drbot_iron::IronLoadedWorkflow>>,
     cfg: drbot_iron::IronRunnerConfig,
+    auth_token: Option<String>,
+    max_event_bytes: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
     max_output_bytes: usize,
+    metrics: Arc<IronHttpMetrics>,
+    rate_limiter: Option<Arc<IronRateLimiter>>,
 }
 
 async fn iron_http_healthz() -> &'static str {
     "ok"
 }
 
+fn iron_extract_request_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    use axum::http::header;
+
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().strip_prefix("Bearer "))
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+    let alt = headers
+        .get("x-drbot-iron-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+
+    bearer.or(alt)
+}
+
+fn iron_set_request_id(resp: &mut axum::response::Response, request_id: &str) {
+    use axum::http::HeaderValue;
+
+    resp.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(request_id).expect("request_id must be a valid header value"),
+    );
+}
+
+fn iron_json_response(
+    request_id: &str,
+    status: axum::http::StatusCode,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let mut resp = (status, axum::Json(body)).into_response();
+    iron_set_request_id(&mut resp, request_id);
+    resp
+}
+
+fn iron_text_response(
+    request_id: &str,
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+
+    let mut resp = axum::response::Response::new(axum::body::Body::from(body));
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    iron_set_request_id(&mut resp, request_id);
+    resp
+}
+
+async fn iron_http_metrics(
+    axum::extract::State(state): axum::extract::State<Arc<IronHttpState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let request_id = state.metrics.next_request_id();
+    let started = std::time::Instant::now();
+    let (parts, _body) = req.into_parts();
+
+    if let Some(expected) = state.auth_token.as_deref() {
+        let token = iron_extract_request_token(&parts.headers);
+        if token != Some(expected) {
+            let resp = iron_text_response(
+                request_id.as_str(),
+                StatusCode::UNAUTHORIZED,
+                "text/plain; charset=utf-8",
+                "unauthorized".to_string(),
+            );
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::UNAUTHORIZED.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /metrics"
+            );
+            return resp;
+        }
+    }
+
+    state
+        .metrics
+        .metrics_scrapes_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    let body = state.metrics.render_prometheus();
+    let resp = iron_text_response(
+        request_id.as_str(),
+        StatusCode::OK,
+        "text/plain; version=0.0.4; charset=utf-8",
+        body,
+    );
+
+    info!(
+        request_id = %request_id,
+        client_ip = %addr.ip(),
+        status = %StatusCode::OK.as_u16(),
+        duration_ms = %started.elapsed().as_millis(),
+        "iron http /metrics"
+    );
+    resp
+}
+
 async fn iron_http_run(
     axum::extract::State(state): axum::extract::State<Arc<IronHttpState>>,
-    axum::Json(event): axum::Json<serde_json::Value>,
-) -> impl axum::response::IntoResponse {
-    use axum::http::StatusCode;
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+
+    let request_id = state.metrics.next_request_id();
+    let started = std::time::Instant::now();
+    state
+        .metrics
+        .run_requests_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    let (parts, body) = req.into_parts();
+    let token = iron_extract_request_token(&parts.headers);
+
+    if let Some(expected) = state.auth_token.as_deref() {
+        if token != Some(expected) {
+            state
+                .metrics
+                .run_unauthorized_total
+                .fetch_add(1, Ordering::Relaxed);
+
+            let resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "unauthorized",
+                    "request_id": request_id,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::UNAUTHORIZED.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /run"
+            );
+            return resp;
+        }
+    }
+
+    if let Some(limiter) = state.rate_limiter.as_ref() {
+        let key = if state.auth_token.is_some() {
+            token
+                .map(|t| hash_to_u64(&t))
+                .unwrap_or_else(|| hash_to_u64(&addr.ip()))
+        } else {
+            hash_to_u64(&addr.ip())
+        };
+
+        let decision = limiter.check(key).await;
+        if !decision.allowed {
+            state
+                .metrics
+                .run_rate_limited_total
+                .fetch_add(1, Ordering::Relaxed);
+
+            let mut body_json = serde_json::json!({
+                "ok": false,
+                "error": "rate limited",
+                "request_id": request_id,
+            });
+
+            if let Some(retry_after) = decision.retry_after {
+                let ms = retry_after.as_millis().min(u64::MAX as u128) as u64;
+                body_json["retry_after_ms"] = serde_json::Value::from(ms);
+            }
+
+            let mut resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::TOO_MANY_REQUESTS,
+                body_json,
+            );
+
+            if let Some(retry_after) = decision.retry_after {
+                let secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+                if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /run"
+            );
+            return resp;
+        }
+    }
 
     let _permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            let body = serde_json::json!({
-                "ok": false,
-                "error": "server busy (concurrency limit reached)",
-            });
-            return (StatusCode::TOO_MANY_REQUESTS, axum::Json(body));
+            state.metrics.run_busy_total.fetch_add(1, Ordering::Relaxed);
+
+            let resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "server busy (concurrency limit reached)",
+                    "request_id": request_id,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /run"
+            );
+            return resp;
+        }
+    };
+
+    let bytes = match axum::body::to_bytes(body, state.max_event_bytes).await {
+        Ok(v) => v,
+        Err(e) => {
+            state
+                .metrics
+                .run_bad_request_total
+                .fetch_add(1, Ordering::Relaxed);
+
+            let resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to read request body: {}", e),
+                    "request_id": request_id,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /run"
+            );
+            return resp;
+        }
+    };
+
+    state
+        .metrics
+        .run_bytes_in_total
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+
+    let event: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            state
+                .metrics
+                .run_bad_request_total
+                .fetch_add(1, Ordering::Relaxed);
+
+            let resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid JSON: {}", e),
+                    "request_id": request_id,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::BAD_REQUEST.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /run"
+            );
+            return resp;
         }
     };
 
     let event_json = match serde_json::to_string(&event) {
         Ok(v) => v,
         Err(e) => {
-            let body = serde_json::json!({ "ok": false, "error": format!("invalid JSON: {}", e) });
-            return (StatusCode::BAD_REQUEST, axum::Json(body));
+            state
+                .metrics
+                .run_bad_request_total
+                .fetch_add(1, Ordering::Relaxed);
+
+            let resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid JSON: {}", e),
+                    "request_id": request_id,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::BAD_REQUEST.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                "iron http /run"
+            );
+            return resp;
         }
     };
 
+    let workflow = { state.workflow.read().await.clone() };
+
+    let exec_started = std::time::Instant::now();
     let res = state
         .runner
-        .run_loaded(state.workflow.as_ref(), event_json.as_str(), state.cfg.clone())
+        .run_loaded_with_stats(workflow.as_ref(), event_json.as_str(), state.cfg.clone())
         .await;
+    let exec_duration = exec_started.elapsed();
+    state.metrics.record_run_exec(exec_duration);
 
     match res {
-        Ok(mut out) => {
+        Ok(run_out) => {
+            state.metrics.run_ok_total.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .run_output_bytes_total
+                .fetch_add(run_out.output.len() as u64, Ordering::Relaxed);
+            if let Some(fuel) = run_out.fuel_consumed {
+                state
+                    .metrics
+                    .run_fuel_consumed_total
+                    .fetch_add(fuel, Ordering::Relaxed);
+            }
+
+            let mut out = run_out.output;
             let original_len = out.len();
             let truncated = if out.len() > state.max_output_bytes {
                 out.truncate(state.max_output_bytes);
+                state
+                    .metrics
+                    .run_output_truncated_total
+                    .fetch_add(1, Ordering::Relaxed);
                 true
             } else {
                 false
@@ -937,33 +1728,80 @@ async fn iron_http_run(
                 serde_json::from_str::<serde_json::Value>(&out).ok()
             };
 
-            let body = serde_json::json!({
-                "ok": true,
-                "output": out,
-                "output_json": output_json,
-                "truncated": truncated,
-                "output_len": original_len,
-            });
-            (StatusCode::OK, axum::Json(body))
+            let resp = iron_json_response(
+                request_id.as_str(),
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "request_id": request_id,
+                    "output": out,
+                    "output_json": output_json,
+                    "truncated": truncated,
+                    "output_len": original_len,
+                    "fuel_consumed": run_out.fuel_consumed,
+                    "exec_ms": exec_duration.as_millis().min(u64::MAX as u128) as u64,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %StatusCode::OK.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                exec_ms = %exec_duration.as_millis(),
+                output_len = %original_len,
+                truncated = %truncated,
+                fuel_consumed = ?run_out.fuel_consumed,
+                "iron http /run"
+            );
+            resp
         }
         Err(e) => {
+            state
+                .metrics
+                .run_error_total
+                .fetch_add(1, Ordering::Relaxed);
+
             let msg = e.to_string();
             let status = if msg.contains("timed out") {
                 StatusCode::REQUEST_TIMEOUT
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            let body = serde_json::json!({ "ok": false, "error": msg });
-            (status, axum::Json(body))
+
+            let resp = iron_json_response(
+                request_id.as_str(),
+                status,
+                serde_json::json!({
+                    "ok": false,
+                    "error": msg,
+                    "request_id": request_id,
+                    "exec_ms": exec_duration.as_millis().min(u64::MAX as u128) as u64,
+                }),
+            );
+
+            info!(
+                request_id = %request_id,
+                client_ip = %addr.ip(),
+                status = %status.as_u16(),
+                duration_ms = %started.elapsed().as_millis(),
+                exec_ms = %exec_duration.as_millis(),
+                "iron http /run"
+            );
+            resp
         }
     }
 }
 
-
 async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
     let _ = config;
     match action {
-        IronAction::Init { name, dir, force, rust } => {
+        IronAction::Init {
+            name,
+            dir,
+            force,
+            rust,
+        } => {
             let base = dir
                 .as_deref()
                 .map(|p| PathBuf::from(expand_tilde(p)))
@@ -971,7 +1809,11 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             init_iron_workflow_template(&base, &name, force, rust)?;
             println!("{}", base.display());
         }
-        IronAction::Build { path, release, rust_dir } => {
+        IronAction::Build {
+            path,
+            release,
+            rust_dir,
+        } => {
             let path = PathBuf::from(expand_tilde(&path));
             let workflow_dir = resolve_iron_workflow_dir(&path)?;
             let out = build_iron_rust_workflow(&workflow_dir, &rust_dir, release).await?;
@@ -984,6 +1826,7 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             release,
             rust_dir,
             no_wit,
+            sign_key,
         } => {
             let path = PathBuf::from(expand_tilde(&path));
             let workflow_dir = resolve_iron_workflow_dir(&path)?;
@@ -1003,13 +1846,23 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
                 .map(|p| PathBuf::from(expand_tilde(p)))
                 .unwrap_or_else(|| workflow_dir.join(default_name));
 
-            drbot_iron::create_bundle_tar_gz(&workflow_dir, &out_path, !no_wit)?;
+            if let Some(p) = sign_key
+                .as_deref()
+                .map(|s| expand_tilde(s))
+                .filter(|s| !s.trim().is_empty())
+            {
+                let seed = read_ed25519_seed_from_file(Path::new(p.as_str()))?;
+                drbot_iron::create_bundle_tar_gz_signed(&workflow_dir, &out_path, !no_wit, &seed)?;
+            } else {
+                drbot_iron::create_bundle_tar_gz(&workflow_dir, &out_path, !no_wit)?;
+            }
             println!("{}", out_path.display());
         }
         IronAction::Serve {
             path,
             host,
             port,
+            watch,
             timeout_ms,
             fuel,
             max_memory_mb,
@@ -1017,10 +1870,28 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             fs_roots,
             allow_bash_prefixes,
             allow_bash_all,
+            allow_http_domains,
+            http_timeout_ms,
+            http_max_bytes,
+            kv_path,
+            kv_namespace,
+            kv_max_value_bytes,
+            secrets,
+            secrets_file,
+            auth_token,
+            auth_token_file,
+            tls_cert,
+            tls_key,
             public,
             max_event_bytes,
             max_output_bytes,
             max_concurrency,
+            metrics,
+            rate_limit_rps,
+            rate_limit_burst,
+            require_signature,
+            trust_pubkeys,
+            trust_pubkey_files,
         } => {
             if !public {
                 let host_lower = host.trim().to_ascii_lowercase();
@@ -1038,17 +1909,26 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             }
 
             let path = PathBuf::from(expand_tilde(&path));
+            let source_path = path.clone();
             let (path_for_run, bundle_tmp) = if is_iron_bundle_path(&path) {
-                let tmp = std::env::temp_dir().join(format!(
-                    "drbot-iron-bundle-{}",
-                    Uuid::new_v4()
-                ));
+                let tmp =
+                    std::env::temp_dir().join(format!("drbot-iron-bundle-{}", Uuid::new_v4()));
                 std::fs::create_dir_all(&tmp)?;
                 drbot_iron::unpack_bundle_tar_gz(&path, &tmp)?;
                 (tmp.clone(), Some(TempDirGuard::new(tmp)))
             } else {
                 (path, None)
             };
+
+            let bundle_tmp_dir = bundle_tmp.as_ref().map(|g| g.path.clone());
+
+            let trusted_pubkeys = read_trusted_ed25519_pubkeys(trust_pubkeys, trust_pubkey_files)?;
+            let manifest_for_policy = try_load_iron_manifest(&path_for_run)?;
+            enforce_iron_signature_policy(
+                manifest_for_policy.as_ref(),
+                trusted_pubkeys.as_slice(),
+                require_signature,
+            )?;
 
             let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path_for_run)?;
 
@@ -1076,43 +1956,276 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
                 .collect();
             tool_cfg.bash_allow_prefixes = allow_bash_prefixes;
             tool_cfg.bash_allow_all = allow_bash_all;
+
+            tool_cfg.http_allow_domains = allow_http_domains;
+            tool_cfg.http_timeout = std::time::Duration::from_millis(http_timeout_ms.max(1));
+            tool_cfg.http_max_bytes = http_max_bytes.max(1).min(usize::MAX as u64) as usize;
+
+            tool_cfg.kv_path = kv_path
+                .as_deref()
+                .map(|p| expand_tilde(p))
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from);
+            tool_cfg.kv_namespace = kv_namespace;
+            tool_cfg.kv_max_value_bytes = kv_max_value_bytes.max(1).min(usize::MAX as u64) as usize;
+
+            tool_cfg.secrets = load_iron_secrets(secrets, secrets_file)?;
+
+            if let Some(manifest) = manifest_for_policy.as_ref() {
+                apply_iron_manifest_capabilities(manifest, &mut tool_cfg)?;
+            }
+
             run_cfg.tools = tool_cfg;
+
+            let auth_token = match auth_token
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                Some(v) => Some(v.to_string()),
+                None => match auth_token_file
+                    .as_deref()
+                    .map(|p| expand_tilde(p))
+                    .filter(|p| !p.trim().is_empty())
+                {
+                    Some(p) => {
+                        let raw = std::fs::read_to_string(&p).map_err(|e| {
+                            anyhow::anyhow!("failed to read auth token file '{}': {}", p, e)
+                        })?;
+                        let t = raw.trim().to_string();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    }
+                    None => None,
+                },
+            };
+
+            if public && auth_token.is_none() {
+                return Err(anyhow::anyhow!(
+                    "--public requires --auth-token (or --auth-token-file)"
+                ));
+            }
+
+            let tls_cert = tls_cert
+                .as_deref()
+                .map(|p| expand_tilde(p))
+                .filter(|p| !p.trim().is_empty());
+            let tls_key = tls_key
+                .as_deref()
+                .map(|p| expand_tilde(p))
+                .filter(|p| !p.trim().is_empty());
+            let use_tls = tls_cert.is_some() || tls_key.is_some();
+            if use_tls && (tls_cert.is_none() || tls_key.is_none()) {
+                return Err(anyhow::anyhow!(
+                    "--tls-cert and --tls-key must be provided together"
+                ));
+            }
 
             let max_event_bytes = max_event_bytes.max(1).min(usize::MAX as u64) as usize;
             let max_output_bytes = max_output_bytes.max(1).min(usize::MAX as u64) as usize;
             let max_concurrency = max_concurrency.max(1);
             let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
 
-            let runner = drbot_iron::IronRunner::new()?;
+            let runner = Arc::new(drbot_iron::IronRunner::new()?);
             let loaded = runner.load_file(&wasm_path)?;
+
+            let http_metrics = Arc::new(IronHttpMetrics::new());
+            let rate_limiter = if rate_limit_rps > 0 {
+                Some(Arc::new(IronRateLimiter::new(
+                    rate_limit_rps,
+                    rate_limit_burst,
+                )))
+            } else {
+                None
+            };
+
             let state = Arc::new(IronHttpState {
-                runner: Arc::new(runner),
-                workflow: Arc::new(loaded),
+                runner: runner.clone(),
+                workflow: tokio::sync::RwLock::new(Arc::new(loaded)),
                 cfg: run_cfg,
+                auth_token,
+                max_event_bytes,
                 semaphore,
                 max_output_bytes,
+                metrics: http_metrics,
+                rate_limiter,
             });
 
-            let app = axum::Router::new()
+            if watch {
+                let state_for_watch = state.clone();
+                let source_path_for_watch = source_path.clone();
+                let path_for_run_for_watch = path_for_run.clone();
+                let bundle_tmp_dir_for_watch = bundle_tmp_dir.clone();
+
+                tokio::spawn(async move {
+                    fn stamp(path: &Path) -> Option<(u128, u64)> {
+                        let meta = std::fs::metadata(path).ok()?;
+                        let modified = meta.modified().ok()?;
+                        let nanos = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()?
+                            .as_nanos();
+                        Some((nanos, meta.len()))
+                    }
+
+                    let mut last: Option<(u128, u64)> = None;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                        let loaded = if is_iron_bundle_path(&source_path_for_watch) {
+                            let Some(tmp_dir) = bundle_tmp_dir_for_watch.as_ref() else {
+                                warn!("watch enabled, but bundle tmp dir is missing");
+                                return;
+                            };
+
+                            let current = match stamp(&source_path_for_watch) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if last == Some(current) {
+                                continue;
+                            }
+                            last = Some(current);
+
+                            let runner = state_for_watch.runner.clone();
+                            let bundle_path = source_path_for_watch.clone();
+                            let tmp_dir = tmp_dir.clone();
+                            let res = tokio::task::spawn_blocking(
+                                move || -> Result<drbot_iron::IronLoadedWorkflow> {
+                                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                                    std::fs::create_dir_all(&tmp_dir)?;
+                                    drbot_iron::unpack_bundle_tar_gz(&bundle_path, &tmp_dir)?;
+                                    let (wasm_path, _) = resolve_iron_wasm_path(&tmp_dir)?;
+                                    runner.load_file(&wasm_path)
+                                },
+                            )
+                            .await;
+
+                            match res {
+                                Ok(Ok(loaded)) => Some(loaded),
+                                Ok(Err(e)) => {
+                                    warn!("watch reload failed: {}", e);
+                                    None
+                                }
+                                Err(e) => {
+                                    warn!("watch reload join error: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
+                            let wasm_path = if path_for_run_for_watch.is_dir() {
+                                match resolve_iron_wasm_path(&path_for_run_for_watch) {
+                                    Ok((p, _)) => p,
+                                    Err(e) => {
+                                        warn!("watch: failed to resolve workflow wasm: {}", e);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                path_for_run_for_watch.clone()
+                            };
+
+                            let current = match stamp(&wasm_path) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if last == Some(current) {
+                                continue;
+                            }
+                            last = Some(current);
+
+                            let runner = state_for_watch.runner.clone();
+                            let wasm_path = wasm_path.clone();
+                            let res =
+                                tokio::task::spawn_blocking(move || runner.load_file(&wasm_path))
+                                    .await;
+
+                            match res {
+                                Ok(Ok(loaded)) => Some(loaded),
+                                Ok(Err(e)) => {
+                                    warn!("watch reload failed: {}", e);
+                                    None
+                                }
+                                Err(e) => {
+                                    warn!("watch reload join error: {}", e);
+                                    None
+                                }
+                            }
+                        };
+
+                        if let Some(loaded) = loaded {
+                            let mut w = state_for_watch.workflow.write().await;
+                            *w = Arc::new(loaded);
+                            info!("workflow reloaded");
+                        }
+                    }
+                });
+            }
+
+            let mut app = axum::Router::new()
                 .route("/healthz", axum::routing::get(iron_http_healthz))
-                .route("/run", axum::routing::post(iron_http_run))
+                .route("/run", axum::routing::post(iron_http_run));
+
+            if metrics {
+                app = app.route("/metrics", axum::routing::get(iron_http_metrics));
+            }
+
+            let app = app
                 .layer(axum::extract::DefaultBodyLimit::max(max_event_bytes))
                 .with_state(state);
 
             let bind = format!("{}:{}", host, port);
-            let listener = tokio::net::TcpListener::bind(&bind).await?;
-            let addr = listener.local_addr()?;
-            println!("listening on http://{}/run", addr);
 
             let _bundle_tmp = bundle_tmp;
-            axum::serve(listener, app)
+            if use_tls {
+                let cert = tls_cert.expect("tls_cert must be set when use_tls is true");
+                let key = tls_key.expect("tls_key must be set when use_tls is true");
+                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+
+                let listener = std::net::TcpListener::bind(&bind)?;
+                listener.set_nonblocking(true)?;
+                let addr = listener.local_addr()?;
+                println!("listening on https://{}/run", addr);
+                if metrics {
+                    println!("metrics on https://{}/metrics", addr);
+                }
+
+                let handle = axum_server::Handle::new();
+                let handle_for_shutdown = handle.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    handle_for_shutdown.graceful_shutdown(None);
+                });
+
+                axum_server::from_tcp_rustls(listener, tls)?
+                    .handle(handle)
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
+            } else {
+                let listener = tokio::net::TcpListener::bind(&bind).await?;
+                let addr = listener.local_addr()?;
+                println!("listening on http://{}/run", addr);
+                if metrics {
+                    println!("metrics on http://{}/metrics", addr);
+                }
+
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;
                 })
                 .await?;
+            }
         }
         IronAction::Call {
             url,
+            auth_token,
+            auth_token_file,
             event,
             event_file,
             timeout_ms,
@@ -1140,7 +2253,38 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
                 .timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
                 .build()?;
 
-            let resp = client.post(endpoint).json(&event_value).send().await?;
+            let auth_token = match auth_token
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                Some(v) => Some(v.to_string()),
+                None => match auth_token_file
+                    .as_deref()
+                    .map(|p| expand_tilde(p))
+                    .filter(|p| !p.trim().is_empty())
+                {
+                    Some(p) => {
+                        let raw = std::fs::read_to_string(&p).map_err(|e| {
+                            anyhow::anyhow!("failed to read auth token file '{}': {}", p, e)
+                        })?;
+                        let t = raw.trim().to_string();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    }
+                    None => None,
+                },
+            };
+
+            let mut req = client.post(endpoint).json(&event_value);
+            if let Some(token) = auth_token {
+                req = req.bearer_auth(token);
+            }
+
+            let resp = req.send().await?;
             let status = resp.status();
             let txt = resp.text().await?;
             if !status.is_success() {
@@ -1153,6 +2297,256 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
                 println!("{}", txt);
             }
         }
+        IronAction::Test {
+            path,
+            fixtures,
+            update,
+            timeout_ms,
+            fuel,
+            max_memory_mb,
+            workdir,
+            fs_roots,
+            allow_bash_prefixes,
+            allow_bash_all,
+            allow_http_domains,
+            http_timeout_ms,
+            http_max_bytes,
+            kv_path,
+            kv_namespace,
+            kv_max_value_bytes,
+            secrets,
+            secrets_file,
+            require_signature,
+            trust_pubkeys,
+            trust_pubkey_files,
+        } => {
+            let path = PathBuf::from(expand_tilde(&path));
+            let (path_for_run, _bundle_tmp) = if is_iron_bundle_path(&path) {
+                let tmp =
+                    std::env::temp_dir().join(format!("drbot-iron-bundle-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(&tmp)?;
+                drbot_iron::unpack_bundle_tar_gz(&path, &tmp)?;
+                (tmp.clone(), Some(TempDirGuard::new(tmp)))
+            } else {
+                (path, None)
+            };
+
+            let trusted_pubkeys = read_trusted_ed25519_pubkeys(trust_pubkeys, trust_pubkey_files)?;
+            let manifest_for_policy = try_load_iron_manifest(&path_for_run)?;
+            enforce_iron_signature_policy(
+                manifest_for_policy.as_ref(),
+                trusted_pubkeys.as_slice(),
+                require_signature,
+            )?;
+
+            let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path_for_run)?;
+
+            let fixtures_dir = if let Some(dir) = fixtures
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                PathBuf::from(expand_tilde(dir))
+            } else if path_for_run.is_dir() {
+                path_for_run.join("fixtures")
+            } else {
+                return Err(anyhow::anyhow!(
+                    "--fixtures is required when path is not a workflow directory"
+                ));
+            };
+
+            if !fixtures_dir.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "fixtures dir not found: {}",
+                    fixtures_dir.display()
+                ));
+            }
+
+            let mut run_cfg = drbot_iron::IronRunnerConfig::default();
+            run_cfg.timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+            if let Some(f) = fuel {
+                run_cfg.fuel = Some(f);
+            }
+            if let Some(mb) = max_memory_mb {
+                if mb == 0 {
+                    run_cfg.max_memory_bytes = None;
+                } else {
+                    let bytes = mb.saturating_mul(1024 * 1024);
+                    let bytes = bytes.min(usize::MAX as u64) as usize;
+                    run_cfg.max_memory_bytes = Some(bytes);
+                }
+            }
+
+            let mut tool_cfg = drbot_iron::IronToolHostConfig::default();
+            if let Some(wd) = workdir.as_deref() {
+                tool_cfg.workdir = PathBuf::from(expand_tilde(wd));
+            }
+            tool_cfg.fs_roots = fs_roots
+                .iter()
+                .map(|p| PathBuf::from(expand_tilde(p)))
+                .collect();
+            tool_cfg.bash_allow_prefixes = allow_bash_prefixes;
+            tool_cfg.bash_allow_all = allow_bash_all;
+
+            tool_cfg.http_allow_domains = allow_http_domains;
+            tool_cfg.http_timeout = std::time::Duration::from_millis(http_timeout_ms.max(1));
+            tool_cfg.http_max_bytes = http_max_bytes.max(1).min(usize::MAX as u64) as usize;
+
+            tool_cfg.kv_path = kv_path
+                .as_deref()
+                .map(|p| expand_tilde(p))
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from);
+            tool_cfg.kv_namespace = kv_namespace;
+            tool_cfg.kv_max_value_bytes = kv_max_value_bytes.max(1).min(usize::MAX as u64) as usize;
+
+            tool_cfg.secrets = load_iron_secrets(secrets, secrets_file)?;
+
+            if let Some(manifest) = manifest_for_policy.as_ref() {
+                apply_iron_manifest_capabilities(manifest, &mut tool_cfg)?;
+            }
+
+            run_cfg.tools = tool_cfg;
+
+            let runner = drbot_iron::IronRunner::new()?;
+            let loaded = runner.load_file(&wasm_path)?;
+
+            let mut inputs: Vec<PathBuf> = Vec::new();
+            for entry in std::fs::read_dir(&fixtures_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if name.ends_with(".out.json") || name.ends_with(".out.txt") {
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                inputs.push(path);
+            }
+            inputs.sort();
+
+            if inputs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "no fixture inputs found under {}",
+                    fixtures_dir.display()
+                ));
+            }
+
+            let mut failures: usize = 0;
+            for input_path in inputs {
+                let name = input_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(unknown)");
+
+                let event_json = std::fs::read_to_string(&input_path).map_err(|e| {
+                    anyhow::anyhow!("failed to read fixture {}: {}", input_path.display(), e)
+                })?;
+
+                let _: serde_json::Value =
+                    serde_json::from_str(event_json.as_str()).map_err(|e| {
+                        anyhow::anyhow!("invalid JSON in fixture {}: {}", input_path.display(), e)
+                    })?;
+
+                let out = runner
+                    .run_loaded(&loaded, event_json.as_str(), run_cfg.clone())
+                    .await;
+
+                let out = match out {
+                    Ok(v) => v,
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("[FAIL] {}: {}", name, e);
+                        continue;
+                    }
+                };
+
+                let expected_json = input_path.with_extension("out.json");
+                let expected_txt = input_path.with_extension("out.txt");
+
+                let out_json = serde_json::from_str::<serde_json::Value>(&out).ok();
+
+                if update {
+                    if let Some(v) = out_json.as_ref() {
+                        let pretty = serde_json::to_string_pretty(v)?;
+                        std::fs::write(
+                            &expected_json,
+                            pretty
+                                + "
+",
+                        )?;
+                        println!("[UPDATE] {} -> {}", name, expected_json.display());
+                    } else {
+                        std::fs::write(&expected_txt, out.clone())?;
+                        println!("[UPDATE] {} -> {}", name, expected_txt.display());
+                    }
+                    continue;
+                }
+
+                if expected_json.exists() {
+                    let raw = std::fs::read_to_string(&expected_json).map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to read expected output {}: {}",
+                            expected_json.display(),
+                            e
+                        )
+                    })?;
+                    let expected: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                        anyhow::anyhow!("invalid expected JSON {}: {}", expected_json.display(), e)
+                    })?;
+                    let Some(actual) = out_json else {
+                        failures += 1;
+                        eprintln!("[FAIL] {}: output is not JSON", name);
+                        continue;
+                    };
+                    if actual != expected {
+                        failures += 1;
+                        eprintln!("[FAIL] {}: JSON mismatch", name);
+                        continue;
+                    }
+                    println!("[OK] {}", name);
+                    continue;
+                }
+
+                if expected_txt.exists() {
+                    let expected = std::fs::read_to_string(&expected_txt).map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to read expected output {}: {}",
+                            expected_txt.display(),
+                            e
+                        )
+                    })?;
+                    if expected.trim_end() != out.trim_end() {
+                        failures += 1;
+                        eprintln!("[FAIL] {}: output mismatch", name);
+                        continue;
+                    }
+                    println!("[OK] {}", name);
+                    continue;
+                }
+
+                failures += 1;
+                eprintln!(
+                    "[FAIL] {}: missing expected output (create {} or {} or pass --update)",
+                    name,
+                    expected_json.display(),
+                    expected_txt.display()
+                );
+            }
+
+            if failures > 0 {
+                return Err(anyhow::anyhow!("{} fixture(s) failed", failures));
+            }
+        }
+
         IronAction::Run {
             path,
             event,
@@ -1164,19 +2558,36 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             fs_roots,
             allow_bash_prefixes,
             allow_bash_all,
+            allow_http_domains,
+            http_timeout_ms,
+            http_max_bytes,
+            kv_path,
+            kv_namespace,
+            kv_max_value_bytes,
+            secrets,
+            secrets_file,
+            require_signature,
+            trust_pubkeys,
+            trust_pubkey_files,
         } => {
             let path = PathBuf::from(expand_tilde(&path));
             let (path_for_run, _bundle_tmp) = if is_iron_bundle_path(&path) {
-                let tmp = std::env::temp_dir().join(format!(
-                    "drbot-iron-bundle-{}",
-                    Uuid::new_v4()
-                ));
+                let tmp =
+                    std::env::temp_dir().join(format!("drbot-iron-bundle-{}", Uuid::new_v4()));
                 std::fs::create_dir_all(&tmp)?;
                 drbot_iron::unpack_bundle_tar_gz(&path, &tmp)?;
                 (tmp.clone(), Some(TempDirGuard::new(tmp)))
             } else {
                 (path, None)
             };
+
+            let trusted_pubkeys = read_trusted_ed25519_pubkeys(trust_pubkeys, trust_pubkey_files)?;
+            let manifest_for_policy = try_load_iron_manifest(&path_for_run)?;
+            enforce_iron_signature_policy(
+                manifest_for_policy.as_ref(),
+                trusted_pubkeys.as_slice(),
+                require_signature,
+            )?;
 
             let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path_for_run)?;
             let event_json = if let Some(raw) = event {
@@ -1214,10 +2625,31 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
                 .collect();
             tool_cfg.bash_allow_prefixes = allow_bash_prefixes;
             tool_cfg.bash_allow_all = allow_bash_all;
+
+            tool_cfg.http_allow_domains = allow_http_domains;
+            tool_cfg.http_timeout = std::time::Duration::from_millis(http_timeout_ms.max(1));
+            tool_cfg.http_max_bytes = http_max_bytes.max(1).min(usize::MAX as u64) as usize;
+
+            tool_cfg.kv_path = kv_path
+                .as_deref()
+                .map(|p| expand_tilde(p))
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from);
+            tool_cfg.kv_namespace = kv_namespace;
+            tool_cfg.kv_max_value_bytes = kv_max_value_bytes.max(1).min(usize::MAX as u64) as usize;
+
+            tool_cfg.secrets = load_iron_secrets(secrets, secrets_file)?;
+
+            if let Some(manifest) = manifest_for_policy.as_ref() {
+                apply_iron_manifest_capabilities(manifest, &mut tool_cfg)?;
+            }
+
             run_cfg.tools = tool_cfg;
 
             let runner = drbot_iron::IronRunner::new()?;
-            let out = runner.run_file(&wasm_path, event_json.as_str(), run_cfg).await?;
+            let out = runner
+                .run_file(&wasm_path, event_json.as_str(), run_cfg)
+                .await?;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
@@ -1335,10 +2767,366 @@ fn is_iron_bundle_path(path: &Path) -> bool {
     name.ends_with(".iron.tgz") || name.ends_with(".tgz") || name.ends_with(".tar.gz")
 }
 
+fn decode_base64_maybe_prefixed(input: &str) -> Result<Vec<u8>> {
+    let raw = input.trim();
+    let raw = raw
+        .strip_prefix("base64:")
+        .or_else(|| raw.strip_prefix("b64:"))
+        .unwrap_or(raw)
+        .trim();
+
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(raw))
+        .map_err(|e| anyhow::anyhow!("invalid base64: {}", e))
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let raw = input.trim();
+    let raw = raw.strip_prefix("hex:").unwrap_or(raw).trim();
+    let bytes = raw.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err(anyhow::anyhow!("invalid hex length"));
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_val(bytes[i]).ok_or_else(|| anyhow::anyhow!("invalid hex"))?;
+        let lo = hex_val(bytes[i + 1]).ok_or_else(|| anyhow::anyhow!("invalid hex"))?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn read_key_material_from_file(path: &Path) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read key file '{}': {}", path.display(), e))?;
+
+    if bytes.len() == 32 || bytes.len() == 64 {
+        return Ok(bytes);
+    }
+
+    let txt = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("key file is not UTF-8 and is not 32/64 raw bytes"))?;
+    let txt = txt.trim();
+    if txt.is_empty() {
+        return Err(anyhow::anyhow!("key file is empty: {}", path.display()));
+    }
+
+    if txt.starts_with("hex:") {
+        decode_hex(txt)
+    } else {
+        decode_base64_maybe_prefixed(txt)
+    }
+}
+
+fn read_ed25519_seed_from_file(path: &Path) -> Result<[u8; 32]> {
+    let bytes = read_key_material_from_file(path)?;
+    if bytes.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&bytes);
+        return Ok(seed);
+    }
+    if bytes.len() == 64 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&bytes[..32]);
+        return Ok(seed);
+    }
+    Err(anyhow::anyhow!(
+        "expected an Ed25519 seed (32 bytes) (or 64-byte keypair), got {} bytes",
+        bytes.len()
+    ))
+}
+
+fn read_trusted_ed25519_pubkeys(
+    trust_pubkeys: Vec<String>,
+    trust_pubkey_files: Vec<String>,
+) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+
+    for raw in trust_pubkeys {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let bytes = if raw.starts_with("hex:") {
+            decode_hex(raw)?
+        } else {
+            decode_base64_maybe_prefixed(raw)?
+        };
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "trusted Ed25519 public key must be 32 bytes (got {})",
+                bytes.len()
+            ));
+        }
+        out.push(bytes);
+    }
+
+    for file in trust_pubkey_files {
+        let file = file.trim();
+        if file.is_empty() {
+            continue;
+        }
+        let file = expand_tilde(file);
+        let bytes = read_key_material_from_file(Path::new(&file))?;
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "trusted Ed25519 public key file must contain 32 bytes (got {})",
+                bytes.len()
+            ));
+        }
+        out.push(bytes);
+    }
+
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn try_load_iron_manifest(path: &Path) -> Result<Option<drbot_iron::IronWorkflowManifest>> {
+    if !path.is_dir() {
+        return Ok(None);
+    }
+    let manifest_path = path.join("iron.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(drbot_iron::IronWorkflowManifest::load(
+        &manifest_path,
+    )?))
+}
+
+fn enforce_iron_signature_policy(
+    manifest: Option<&drbot_iron::IronWorkflowManifest>,
+    trusted_pubkeys: &[Vec<u8>],
+    require_signature: bool,
+) -> Result<()> {
+    if require_signature && trusted_pubkeys.is_empty() {
+        return Err(anyhow::anyhow!(
+            "--require-signature requires at least one --trust-pubkey (or --trust-pubkey-file)"
+        ));
+    }
+
+    let Some(manifest) = manifest else {
+        if require_signature || !trusted_pubkeys.is_empty() {
+            return Err(anyhow::anyhow!(
+                "signature policy requires a workflow directory with iron.json (a .wasm file has no manifest to verify)"
+            ));
+        }
+        return Ok(());
+    };
+
+    if manifest.signature.is_none() {
+        if require_signature || !trusted_pubkeys.is_empty() {
+            return Err(anyhow::anyhow!("workflow is not signed"));
+        }
+        return Ok(());
+    }
+
+    let public_key = manifest.verify_embedded_signature()?;
+
+    if trusted_pubkeys.is_empty() {
+        warn!(
+            "workflow manifest is signed, but no trusted public keys were provided; signature is not checked for trust"
+        );
+        return Ok(());
+    }
+
+    let trusted = trusted_pubkeys
+        .iter()
+        .any(|k| k.as_slice() == public_key.as_slice());
+    if !trusted {
+        return Err(anyhow::anyhow!(
+            "workflow signed by an untrusted key (provide its public key via --trust-pubkey)"
+        ));
+    }
+
+    Ok(())
+}
+
+fn load_iron_secrets(
+    secrets: Vec<String>,
+    secrets_file: Option<String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Some(file) = secrets_file
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let file = expand_tilde(file);
+        let raw = std::fs::read_to_string(&file)
+            .map_err(|e| anyhow::anyhow!("failed to read secrets file '{}': {}", file, e))?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid secrets JSON ({}): {}", file, e))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("secrets file must be a JSON object: {}", file))?;
+
+        for (k, v) in obj {
+            let name = k.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let val = v
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string());
+            out.insert(name.to_string(), val);
+        }
+    }
+
+    for raw in secrets {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (name, value) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--secret must be NAME=VALUE"))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("--secret name is empty"));
+        }
+        out.insert(name.to_string(), value.to_string());
+    }
+
+    Ok(out)
+}
+
+fn is_supported_iron_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.read" | "fs.write" | "bash" | "http.fetch" | "kv.get" | "kv.put" | "secrets.get"
+    )
+}
+
+fn is_iron_tool_enabled_by_host(cfg: &drbot_iron::IronToolHostConfig, tool: &str) -> bool {
+    match tool {
+        "fs.read" | "fs.write" => !cfg.fs_roots.is_empty(),
+        "bash" => cfg.bash_allow_all || !cfg.bash_allow_prefixes.is_empty(),
+        "http.fetch" => !cfg.http_allow_domains.is_empty(),
+        "kv.get" | "kv.put" => cfg.kv_path.is_some(),
+        "secrets.get" => !cfg.secrets.is_empty(),
+        _ => false,
+    }
+}
+
+fn apply_iron_manifest_capabilities(
+    manifest: &drbot_iron::IronWorkflowManifest,
+    tool_cfg: &mut drbot_iron::IronToolHostConfig,
+) -> Result<()> {
+    let mut required_tools: BTreeSet<String> = manifest
+        .capabilities
+        .tools
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if manifest.capabilities.http.is_some() {
+        required_tools.insert("http.fetch".to_string());
+    }
+
+    if !manifest.capabilities.secrets.is_empty() {
+        required_tools.insert("secrets.get".to_string());
+    }
+
+    if !required_tools.is_empty() {
+        for tool in required_tools.iter() {
+            if !is_supported_iron_tool(tool.as_str()) {
+                return Err(anyhow::anyhow!(
+                    "manifest requires unsupported tool: {}",
+                    tool
+                ));
+            }
+            if !is_iron_tool_enabled_by_host(tool_cfg, tool.as_str()) {
+                return Err(anyhow::anyhow!(
+                    "manifest requires tool '{}' but it is not enabled by the host",
+                    tool
+                ));
+            }
+        }
+
+        tool_cfg.allowed_tools = Some(required_tools);
+    }
+
+    if !manifest.capabilities.secrets.is_empty() {
+        let allowed: BTreeSet<String> = manifest
+            .capabilities
+            .secrets
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !allowed.is_empty() {
+            tool_cfg.allowed_secret_names = Some(allowed);
+        }
+    }
+
+    if let Some(http) = manifest.capabilities.http.as_ref() {
+        if !http.allow_domains.is_empty() {
+            let required_domains: BTreeSet<String> = http
+                .allow_domains
+                .iter()
+                .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let host_domains: BTreeSet<String> = tool_cfg
+                .http_allow_domains
+                .iter()
+                .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let mut intersection: Vec<String> = host_domains
+                .intersection(&required_domains)
+                .cloned()
+                .collect();
+            intersection.sort();
+
+            if intersection.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "manifest requires http.allowDomains, but none are permitted by the host"
+                ));
+            }
+
+            tool_cfg.http_allow_domains = intersection;
+        }
+
+        if let Some(timeout_ms) = http.timeout_ms {
+            let t = std::time::Duration::from_millis(timeout_ms.max(1));
+            if t < tool_cfg.http_timeout {
+                tool_cfg.http_timeout = t;
+            }
+        }
+
+        if let Some(max_bytes) = http.max_bytes {
+            let m = max_bytes.max(1).min(usize::MAX as u64) as usize;
+            tool_cfg.http_max_bytes = tool_cfg.http_max_bytes.min(m);
+        }
+    }
+
+    Ok(())
+}
+
 fn read_rust_package_name(cargo_toml: &Path) -> Result<String> {
-    let raw = std::fs::read_to_string(cargo_toml).map_err(|e| {
-        anyhow::anyhow!("failed to read {}: {}", cargo_toml.display(), e)
-    })?;
+    let raw = std::fs::read_to_string(cargo_toml)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {}", cargo_toml.display(), e))?;
     let parsed: toml::Value = toml::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("invalid Cargo.toml ({}): {}", cargo_toml.display(), e))?;
     let name = parsed
@@ -1398,16 +3186,22 @@ async fn build_iron_rust_workflow(
 {}{}",
             output.status.code().unwrap_or(-1),
             if !stdout.trim().is_empty() {
-                format!("stdout:
+                format!(
+                    "stdout:
 {}
-", stdout.trim_end())
+",
+                    stdout.trim_end()
+                )
             } else {
                 String::new()
             },
             if !stderr.trim().is_empty() {
-                format!("stderr:
+                format!(
+                    "stderr:
 {}
-", stderr.trim_end())
+",
+                    stderr.trim_end()
+                )
             } else {
                 String::new()
             },
@@ -1442,16 +3236,12 @@ async fn build_iron_rust_workflow(
             None
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "built wasm artifact not found under {}",
-                out_dir.display()
-            )
+            anyhow::anyhow!("built wasm artifact not found under {}", out_dir.display())
         })?;
 
     let parent = out_wasm_path.parent().unwrap_or(workflow_dir);
-    std::fs::create_dir_all(parent).map_err(|e| {
-        anyhow::anyhow!("failed to create {}: {}", parent.display(), e)
-    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {}", parent.display(), e))?;
     std::fs::copy(&artifact, &out_wasm_path).map_err(|e| {
         anyhow::anyhow!(
             "failed to copy {} to {}: {}",
@@ -1481,9 +3271,15 @@ fn init_iron_workflow_template(dir: &Path, name: &str, force: bool, rust: bool) 
         version: "0.1.0".to_string(),
         wasm_file: "dist/workflow.wasm".to_string(),
         description: Some("Iron workflow".to_string()),
+        capabilities: Default::default(),
+        integrity: None,
+        signature: None,
     };
     drbot_iron::IronWorkflowManifest::write(&dir.join("iron.json"), &manifest)?;
-    std::fs::write(dir.join("wit").join("workflow.wit"), drbot_iron::IRON_WORKFLOW_WIT)?;
+    std::fs::write(
+        dir.join("wit").join("workflow.wit"),
+        drbot_iron::IRON_WORKFLOW_WIT,
+    )?;
 
     if rust {
         init_iron_rust_component_template(dir, force)?;
@@ -1586,9 +3382,15 @@ export!(Component);
 
     std::fs::write(rust_dir.join("Cargo.toml"), cargo_toml)?;
     std::fs::write(rust_dir.join("src").join("lib.rs"), lib_rs)?;
-    std::fs::write(rust_dir.join("wit").join("workflow.wit"), drbot_iron::IRON_WORKFLOW_WIT)?;
-    std::fs::write(rust_dir.join(".gitignore"), "/target
-")?;
+    std::fs::write(
+        rust_dir.join("wit").join("workflow.wit"),
+        drbot_iron::IRON_WORKFLOW_WIT,
+    )?;
+    std::fs::write(
+        rust_dir.join(".gitignore"),
+        "/target
+",
+    )?;
 
     Ok(())
 }
