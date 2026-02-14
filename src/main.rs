@@ -309,6 +309,24 @@ enum IronAction {
         /// Overwrite existing files
         #[arg(long, default_value_t = false)]
         force: bool,
+
+        /// Create a Rust component template in <dir>/rust
+        #[arg(long, default_value_t = false)]
+        rust: bool,
+    },
+
+    /// Build an Iron workflow (e.g., from the bundled Rust template)
+    Build {
+        /// Path to a workflow directory (containing iron.json)
+        path: String,
+
+        /// Build in release mode
+        #[arg(long, default_value_t = false)]
+        release: bool,
+
+        /// Rust project directory name (defaults to "rust")
+        #[arg(long, default_value = "rust")]
+        rust_dir: String,
     },
 
     /// Run an Iron workflow component
@@ -757,13 +775,19 @@ async fn run_skills(
 async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
     let _ = config;
     match action {
-        IronAction::Init { name, dir, force } => {
+        IronAction::Init { name, dir, force, rust } => {
             let base = dir
                 .as_deref()
                 .map(|p| PathBuf::from(expand_tilde(p)))
                 .unwrap_or_else(|| PathBuf::from("iron").join(&name));
-            init_iron_workflow_template(&base, &name, force)?;
+            init_iron_workflow_template(&base, &name, force, rust)?;
             println!("{}", base.display());
+        }
+        IronAction::Build { path, release, rust_dir } => {
+            let path = PathBuf::from(expand_tilde(&path));
+            let workflow_dir = resolve_iron_workflow_dir(&path)?;
+            let out = build_iron_rust_workflow(&workflow_dir, &rust_dir, release).await?;
+            println!("{}", out.display());
         }
         IronAction::Run {
             path,
@@ -862,13 +886,169 @@ fn resolve_iron_wasm_path(path: &Path) -> Result<(PathBuf, String)> {
     Ok((wasm_path, manifest.name))
 }
 
-fn init_iron_workflow_template(dir: &Path, name: &str, force: bool) -> Result<()> {
-    if dir.exists() && !force {
-        return Err(anyhow::anyhow!("{} already exists (pass --force to overwrite)", dir.display()));
+fn resolve_iron_workflow_dir(path: &Path) -> Result<PathBuf> {
+    if path.is_dir() {
+        return Ok(path.to_path_buf());
     }
+
+    if path.is_file() {
+        if path.file_name().and_then(|s| s.to_str()) == Some("iron.json") {
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid path: {}", path.display()))?;
+            return Ok(parent.to_path_buf());
+        }
+
+        return Err(anyhow::anyhow!(
+            "expected a workflow directory (or iron.json), got file: {}",
+            path.display()
+        ));
+    }
+
+    Err(anyhow::anyhow!("path not found: {}", path.display()))
+}
+
+fn read_rust_package_name(cargo_toml: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(cargo_toml).map_err(|e| {
+        anyhow::anyhow!("failed to read {}: {}", cargo_toml.display(), e)
+    })?;
+    let parsed: toml::Value = toml::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("invalid Cargo.toml ({}): {}", cargo_toml.display(), e))?;
+    let name = parsed
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Cargo.toml missing [package].name: {}",
+            cargo_toml.display()
+        ));
+    }
+    Ok(name.to_string())
+}
+
+async fn build_iron_rust_workflow(
+    workflow_dir: &Path,
+    rust_dir_name: &str,
+    release: bool,
+) -> Result<PathBuf> {
+    use tokio::process::Command;
+
+    let manifest_path = workflow_dir.join("iron.json");
+    let manifest = drbot_iron::IronWorkflowManifest::load(&manifest_path)?;
+    let out_wasm_path = workflow_dir.join(manifest.wasm_file.as_str());
+
+    let rust_dir = workflow_dir.join(rust_dir_name);
+    if !rust_dir.is_dir() {
+        return Err(anyhow::anyhow!(
+            "rust workflow project not found: {}",
+            rust_dir.display()
+        ));
+    }
+
+    let cargo_toml = rust_dir.join("Cargo.toml");
+    let pkg_name = read_rust_package_name(&cargo_toml)?;
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build").arg("--target").arg("wasm32-wasip2");
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.current_dir(&rust_dir);
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("cargo build timed out"))?
+        .map_err(|e| anyhow::anyhow!("failed to run cargo build: {}", e))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(anyhow::anyhow!(
+            "cargo build failed (exit={}):
+{}{}",
+            output.status.code().unwrap_or(-1),
+            if !stdout.trim().is_empty() {
+                format!("stdout:
+{}
+", stdout.trim_end())
+            } else {
+                String::new()
+            },
+            if !stderr.trim().is_empty() {
+                format!("stderr:
+{}
+", stderr.trim_end())
+            } else {
+                String::new()
+            },
+        ));
+    }
+
+    let profile = if release { "release" } else { "debug" };
+    let out_dir = rust_dir.join("target").join("wasm32-wasip2").join(profile);
+
+    let candidates = [
+        out_dir.join(format!("{}.wasm", pkg_name)),
+        out_dir.join(format!("{}.wasm", pkg_name.replace('-', "_"))),
+    ];
+
+    let artifact = candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .or_else(|| {
+            let mut matches = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&out_dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                        matches.append(&mut vec![p]);
+                    }
+                }
+            }
+            if matches.len() == 1 {
+                return Some(matches.remove(0));
+            }
+            None
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "built wasm artifact not found under {}",
+                out_dir.display()
+            )
+        })?;
+
+    let parent = out_wasm_path.parent().unwrap_or(workflow_dir);
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!("failed to create {}: {}", parent.display(), e)
+    })?;
+    std::fs::copy(&artifact, &out_wasm_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to copy {} to {}: {}",
+            artifact.display(),
+            out_wasm_path.display(),
+            e
+        )
+    })?;
+
+    Ok(out_wasm_path)
+}
+
+fn init_iron_workflow_template(dir: &Path, name: &str, force: bool, rust: bool) -> Result<()> {
+    if dir.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "{} already exists (pass --force to overwrite)",
+            dir.display()
+        ));
+    }
+
     std::fs::create_dir_all(dir)?;
     std::fs::create_dir_all(dir.join("wit"))?;
     std::fs::create_dir_all(dir.join("dist"))?;
+
     let manifest = drbot_iron::IronWorkflowManifest {
         name: name.to_string(),
         version: "0.1.0".to_string(),
@@ -877,8 +1057,34 @@ fn init_iron_workflow_template(dir: &Path, name: &str, force: bool) -> Result<()
     };
     drbot_iron::IronWorkflowManifest::write(&dir.join("iron.json"), &manifest)?;
     std::fs::write(dir.join("wit").join("workflow.wit"), drbot_iron::IRON_WORKFLOW_WIT)?;
-    std::fs::write(
-        dir.join("README.md"),
+
+    if rust {
+        init_iron_rust_component_template(dir, force)?;
+    }
+
+    let readme = if rust {
+        format!(
+            "# {}
+
+This is an Iron (WASM-only) workflow for drbot.
+
+- ABI: `wit/workflow.wit`
+- Manifest: `iron.json`
+- Build output: `dist/workflow.wasm`
+- Rust component project: `rust/`
+
+Quickstart (Rust):
+1. `drbot iron build . --release`
+2. `drbot iron run . --fs-root .`
+
+Notes:
+- Install the Rust target once: `rustup target add wasm32-wasip2`
+- Tool access is host-controlled (pass `--fs-root` / `--allow-bash-prefix` to `drbot iron run`)
+
+",
+            name
+        )
+    } else {
         format!(
             "# {}
 
@@ -894,11 +1100,71 @@ Next steps:
 
 ",
             name
-        ),
-    )?;
+        )
+    };
+
+    std::fs::write(dir.join("README.md"), readme)?;
     Ok(())
 }
 
+fn init_iron_rust_component_template(workflow_dir: &Path, force: bool) -> Result<()> {
+    let rust_dir = workflow_dir.join("rust");
+    if rust_dir.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "{} already exists (pass --force to overwrite)",
+            rust_dir.display()
+        ));
+    }
+
+    std::fs::create_dir_all(rust_dir.join("src"))?;
+    std::fs::create_dir_all(rust_dir.join("wit"))?;
+
+    let cargo_toml = r#"[package]
+name = "workflow"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+serde_json = "1"
+"#;
+
+    let lib_rs = r#"wit_bindgen::generate!({
+    path: "wit",
+    world: "workflow",
+});
+
+struct Component;
+
+impl Guest for Component {
+    fn run(event_json: String) -> String {
+        drbot::iron::host::log("info", "iron workflow: run()");
+
+        let event: serde_json::Value = serde_json::from_str(&event_json)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": event_json }));
+
+        serde_json::json!({
+            "ok": true,
+            "event": event,
+        })
+        .to_string()
+    }
+}
+
+export!(Component);
+"#;
+
+    std::fs::write(rust_dir.join("Cargo.toml"), cargo_toml)?;
+    std::fs::write(rust_dir.join("src").join("lib.rs"), lib_rs)?;
+    std::fs::write(rust_dir.join("wit").join("workflow.wit"), drbot_iron::IRON_WORKFLOW_WIT)?;
+    std::fs::write(rust_dir.join(".gitignore"), "/target
+")?;
+
+    Ok(())
+}
 /// Create a provider from config.
 fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provider>> {
     use drbot_ollama::OllamaProvider;

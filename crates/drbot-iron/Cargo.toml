@@ -15,3 +15,4 @@ uuid.workspace = true
 async-trait.workspace = true
 
 wasmtime = { version = "27", features = ["async", "component-model"] }
+wasmtime-wasi = { version = "27" }

@@ -375,3 +375,75 @@ impl IronToolHost {
         }))
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fs_read_denied_without_roots() {
+        let mut host = IronToolHost::new(IronToolHostConfig {
+            fs_roots: Vec::new(),
+            ..Default::default()
+        });
+
+        let res = host
+            .tool_invoke("fs.read", r#"{"path":"Cargo.toml"}"#)
+            .await;
+        assert!(!res.ok);
+    }
+
+    #[tokio::test]
+    async fn fs_write_and_read_with_root() {
+        let root = std::env::temp_dir().join(format!("drbot-iron-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+
+        let mut host = IronToolHost::new(IronToolHostConfig {
+            workdir: root.clone(),
+            fs_roots: vec![root.clone()],
+            ..Default::default()
+        });
+
+        let write_args = serde_json::json!({
+            "path": "hello.txt",
+            "content": "hello"
+        })
+        .to_string();
+        let wrote = host.tool_invoke("fs.write", &write_args).await;
+        assert!(wrote.ok);
+
+        let read_args = serde_json::json!({"path":"hello.txt"}).to_string();
+        let read = host.tool_invoke("fs.read", &read_args).await;
+        assert!(read.ok);
+
+        let content = read
+            .payload
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn bash_denied_by_default() {
+        let mut host = IronToolHost::new(IronToolHostConfig::default());
+        let res = host
+            .tool_invoke("bash", r#"{"command":"echo hi"}"#)
+            .await;
+        assert!(!res.ok);
+    }
+
+    #[tokio::test]
+    async fn bash_allowed_with_prefix() {
+        let mut host = IronToolHost::new(IronToolHostConfig {
+            bash_allow_prefixes: vec!["echo".to_string()],
+            ..Default::default()
+        });
+
+        let res = host
+            .tool_invoke("bash", r#"{"command":"echo hi"}"#)
+            .await;
+        assert!(res.ok);
+    }
+}

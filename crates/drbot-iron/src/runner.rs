@@ -3,8 +3,9 @@ use anyhow::Context;
 use std::path::Path;
 use std::time::Duration;
 use tracing::{debug, info, warn};
-use wasmtime::{Config, Engine, Store};
 use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -34,16 +35,36 @@ impl Default for IronRunnerConfig {
 }
 
 struct HostState {
+    wasi: WasiCtx,
+    table: ResourceTable,
     tools: IronToolHost,
     limits: wasmtime::StoreLimits,
 }
 
 impl HostState {
     fn new(cfg: IronToolHostConfig, limits: wasmtime::StoreLimits) -> Self {
+        let mut wasi_builder = WasiCtxBuilder::new();
+        // Inherit stdio so guest code using `std` doesn't immediately fail when
+        // touching stdin/stdout/stderr.
+        wasi_builder.inherit_stdio();
+        let wasi = wasi_builder.build();
+
         Self {
+            wasi,
+            table: ResourceTable::new(),
             tools: IronToolHost::new(cfg),
             limits,
         }
+    }
+}
+
+impl WasiView for HostState {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
     }
 }
 
@@ -60,11 +81,7 @@ impl bindings::drbot::iron::host::Host for HostState {
         }
     }
 
-    async fn tool_invoke(
-        &mut self,
-        name: String,
-        args_json: String,
-    ) -> String {
+    async fn tool_invoke(&mut self, name: String, args_json: String) -> String {
         let res: IronToolResult = self.tools.tool_invoke(name.as_str(), args_json.as_str()).await;
         res.to_json_string()
     }
@@ -103,8 +120,7 @@ impl IronRunner {
         event_json: &str,
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
-        let component = Component::new(&self.engine, bytes)
-            .context("failed to load component bytes")?;
+        let component = Component::new(&self.engine, bytes).context("failed to load component bytes")?;
         self.run_component(&component, event_json, cfg).await
     }
 
@@ -115,6 +131,7 @@ impl IronRunner {
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
         let mut linker = Linker::new(&self.engine);
+        wasmtime_wasi::add_to_linker_async(&mut linker).context("failed to add wasi to linker")?;
         bindings::drbot::iron::host::add_to_linker(&mut linker, |s: &mut HostState| s)?;
 
         let limits = match cfg.max_memory_bytes {
@@ -128,9 +145,7 @@ impl IronRunner {
         let mut store = Store::new(&self.engine, HostState::new(cfg.tools, limits));
         store.limiter(|s: &mut HostState| &mut s.limits);
         if let Some(fuel) = cfg.fuel {
-            store
-                .set_fuel(fuel)
-                .context("failed to add fuel")?;
+            store.set_fuel(fuel).context("failed to add fuel")?;
         }
 
         let workflow = bindings::Workflow::instantiate_async(&mut store, component, &linker)

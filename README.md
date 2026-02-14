@@ -81,6 +81,7 @@ drbot gateway              # Start WebSocket gateway server
 drbot chat                 # Interactive chat with AI
 drbot tui                  # Terminal UI chat interface
 drbot skills               # Manage OpenClaw-style skills (status/sync/prompt)
+drbot iron                 # WASM-only Iron workflows (init/build/run)
 drbot skills clawhub-install # Install a ClawHub skill into the managed skills dir
 drbot config               # Show current configuration
 drbot doctor               # Run health checks
