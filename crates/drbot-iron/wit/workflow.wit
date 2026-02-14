@@ -1,0 +1,11 @@
+package drbot:iron@0.1.0;
+
+interface host {
+  log: func(level: string, message: string);
+  tool-invoke: func(name: string, args-json: string) -> string;
+}
+
+world workflow {
+  import host;
+  export run: func(event-json: string) -> string;
+}

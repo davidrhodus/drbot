@@ -187,6 +187,12 @@ enum Commands {
         json: bool,
     },
 
+    /// Run and manage Iron (WASM-only) workflows
+    Iron {
+        #[command(subcommand)]
+        action: IronAction,
+    },
+
     /// Interactive setup wizard
     Wizard,
 
@@ -284,6 +290,67 @@ enum SkillsAction {
         /// Timeout in milliseconds
         #[arg(long)]
         timeout_ms: Option<u64>,
+    },
+}
+
+
+/// Iron workflow subcommands.
+#[derive(Subcommand)]
+enum IronAction {
+    /// Create a new Iron workflow template on disk
+    Init {
+        /// Workflow name (also used as directory name)
+        name: String,
+
+        /// Target directory (defaults to ./iron/<name>)
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Overwrite existing files
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Run an Iron workflow component
+    Run {
+        /// Path to a workflow directory (containing iron.json) or a .wasm component
+        path: String,
+
+        /// Event JSON string (defaults to {"type":"manual"})
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Read event JSON from a file (or "-" for stdin)
+        #[arg(long)]
+        event_file: Option<String>,
+
+        /// Timeout in milliseconds
+        #[arg(long, default_value_t = 120_000)]
+        timeout_ms: u64,
+
+        /// Fuel limit for deterministic execution (instruction units)
+        #[arg(long)]
+        fuel: Option<u64>,
+
+        /// Maximum linear memory per guest memory (MB)
+        #[arg(long)]
+        max_memory_mb: Option<u64>,
+
+        /// Working directory for relative paths
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Allow filesystem roots for fs.* tools (repeatable)
+        #[arg(long = "fs-root")]
+        fs_roots: Vec<String>,
+
+        /// Allow bash commands starting with these prefixes (repeatable)
+        #[arg(long = "allow-bash-prefix")]
+        allow_bash_prefixes: Vec<String>,
+
+        /// Allow any bash command (dangerous)
+        #[arg(long, default_value_t = false)]
+        allow_bash_all: bool,
     },
 }
 
@@ -406,6 +473,7 @@ async fn main() -> Result<()> {
             workspace,
             json,
         }) => run_skills(&config, action, workspace, json).await,
+        Some(Commands::Iron { action }) => run_iron(&config, action).await,
         Some(Commands::Wizard) => run_wizard().await,
         Some(Commands::Config) => {
             show_config(&config);
@@ -682,6 +750,152 @@ async fn run_skills(
         }
     }
 
+    Ok(())
+}
+
+
+async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
+    let _ = config;
+    match action {
+        IronAction::Init { name, dir, force } => {
+            let base = dir
+                .as_deref()
+                .map(|p| PathBuf::from(expand_tilde(p)))
+                .unwrap_or_else(|| PathBuf::from("iron").join(&name));
+            init_iron_workflow_template(&base, &name, force)?;
+            println!("{}", base.display());
+        }
+        IronAction::Run {
+            path,
+            event,
+            event_file,
+            timeout_ms,
+            fuel,
+            max_memory_mb,
+            workdir,
+            fs_roots,
+            allow_bash_prefixes,
+            allow_bash_all,
+        } => {
+            let path = PathBuf::from(expand_tilde(&path));
+            let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path)?;
+            let event_json = if let Some(raw) = event {
+                raw
+            } else if let Some(src) = event_file.as_deref() {
+                read_message_from_source(src)?
+            } else {
+                "{\"type\":\"manual\"}".to_string()
+            };
+            // Validate JSON early for nicer errors.
+            let _: serde_json::Value = serde_json::from_str(event_json.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid --event JSON: {}", e))?;
+
+            let mut run_cfg = drbot_iron::IronRunnerConfig::default();
+            run_cfg.timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+            if let Some(f) = fuel {
+                run_cfg.fuel = Some(f);
+            }
+            if let Some(mb) = max_memory_mb {
+                if mb == 0 {
+                    run_cfg.max_memory_bytes = None;
+                } else {
+                    let bytes = mb.saturating_mul(1024 * 1024);
+                    let bytes = bytes.min(usize::MAX as u64) as usize;
+                    run_cfg.max_memory_bytes = Some(bytes);
+                }
+            }
+            let mut tool_cfg = drbot_iron::IronToolHostConfig::default();
+            if let Some(wd) = workdir.as_deref() {
+                tool_cfg.workdir = PathBuf::from(expand_tilde(wd));
+            }
+            tool_cfg.fs_roots = fs_roots
+                .iter()
+                .map(|p| PathBuf::from(expand_tilde(p)))
+                .collect();
+            tool_cfg.bash_allow_prefixes = allow_bash_prefixes;
+            tool_cfg.bash_allow_all = allow_bash_all;
+            run_cfg.tools = tool_cfg;
+
+            let runner = drbot_iron::IronRunner::new()?;
+            let out = runner.run_file(&wasm_path, event_json.as_str(), run_cfg).await?;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}", out);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_iron_wasm_path(path: &Path) -> Result<(PathBuf, String)> {
+    if path.is_file() {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext != "wasm" {
+            return Err(anyhow::anyhow!(
+                "expected a .wasm file or workflow directory, got: {}",
+                path.display()
+            ));
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("workflow")
+            .to_string();
+        return Ok((path.to_path_buf(), name));
+    }
+
+    if !path.is_dir() {
+        return Err(anyhow::anyhow!("path not found: {}", path.display()));
+    }
+
+    let manifest_path = path.join("iron.json");
+    let manifest = drbot_iron::IronWorkflowManifest::load(&manifest_path)?;
+    let wasm_path = path.join(manifest.wasm_file.as_str());
+    if !wasm_path.exists() {
+        return Err(anyhow::anyhow!(
+            "workflow wasmFile not found: {}",
+            wasm_path.display()
+        ));
+    }
+    Ok((wasm_path, manifest.name))
+}
+
+fn init_iron_workflow_template(dir: &Path, name: &str, force: bool) -> Result<()> {
+    if dir.exists() && !force {
+        return Err(anyhow::anyhow!("{} already exists (pass --force to overwrite)", dir.display()));
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir.join("wit"))?;
+    std::fs::create_dir_all(dir.join("dist"))?;
+    let manifest = drbot_iron::IronWorkflowManifest {
+        name: name.to_string(),
+        version: "0.1.0".to_string(),
+        wasm_file: "dist/workflow.wasm".to_string(),
+        description: Some("Iron workflow".to_string()),
+    };
+    drbot_iron::IronWorkflowManifest::write(&dir.join("iron.json"), &manifest)?;
+    std::fs::write(dir.join("wit").join("workflow.wit"), drbot_iron::IRON_WORKFLOW_WIT)?;
+    std::fs::write(
+        dir.join("README.md"),
+        format!(
+            "# {}
+
+This is an Iron (WASM-only) workflow for drbot.
+
+- ABI: `wit/workflow.wit`
+- Manifest: `iron.json`
+- Build output: `dist/workflow.wasm`
+
+Next steps:
+1. Implement a component that matches the WIT world `workflow`.
+2. Run it: `drbot iron run . --fs-root .`
+
+",
+            name
+        ),
+    )?;
     Ok(())
 }
 

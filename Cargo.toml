@@ -47,6 +47,7 @@ members = [
     "crates/drbot-agents",
     "crates/drbot-voice",
     "crates/drbot-workflows",
+    "crates/drbot-iron",
     "crates/drbot-context",
     "crates/drbot-personas",
     "crates/drbot-proactive",
@@ -785,6 +786,7 @@ drbot-knowledge = { path = "crates/drbot-knowledge" }
 drbot-agents = { path = "crates/drbot-agents" }
 drbot-voice = { path = "crates/drbot-voice" }
 drbot-workflows = { path = "crates/drbot-workflows" }
+drbot-iron = { path = "crates/drbot-iron" }
 drbot-context = { path = "crates/drbot-context" }
 drbot-personas = { path = "crates/drbot-personas" }
 drbot-proactive = { path = "crates/drbot-proactive" }
@@ -1410,6 +1412,7 @@ drbot-sessions.workspace = true
 drbot-context.workspace = true
 drbot-personas.workspace = true
 drbot-router.workspace = true
+drbot-iron.workspace = true
 drbot-tui.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
