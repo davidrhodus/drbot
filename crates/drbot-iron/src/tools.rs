@@ -335,6 +335,11 @@ impl IronToolHost {
             .unwrap_or(self.cfg.bash_timeout);
 
         let mut cmd = Command::new("sh");
+        cmd.env_clear();
+        cmd.env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        );
         cmd.arg("-lc").arg(&command);
         if let Some(cwd) = cwd.as_ref() {
             cmd.current_dir(cwd);

@@ -1,11 +1,18 @@
 use crate::tools::{IronToolHost, IronToolHostConfig, IronToolResult};
 use anyhow::Context;
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+const DEFAULT_EPOCH_TICK: Duration = Duration::from_millis(10);
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -87,9 +94,47 @@ impl bindings::drbot::iron::host::Host for HostState {
     }
 }
 
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Arc<Engine>, tick: Duration) -> anyhow::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+
+        let join = thread::Builder::new()
+            .name("drbot-iron-epoch".to_string())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    thread::sleep(tick);
+                    engine.increment_epoch();
+                }
+            })
+            .context("failed to spawn Iron epoch tick thread")?;
+
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 /// Runs Iron workflow WASM components.
 pub struct IronRunner {
-    engine: Engine,
+    engine: Arc<Engine>,
+    epoch_tick: Duration,
+    _epoch: EpochTicker,
 }
 
 /// A workflow component loaded/compiled against a specific [`IronRunner`] engine.
@@ -103,9 +148,16 @@ impl IronRunner {
         cfg.async_support(true);
         cfg.consume_fuel(true);
         cfg.wasm_component_model(true);
+        cfg.epoch_interruption(true);
 
-        let engine = Engine::new(&cfg).context("failed to initialize wasmtime engine")?;
-        Ok(Self { engine })
+        let engine = Arc::new(Engine::new(&cfg).context("failed to initialize wasmtime engine")?);
+        let epoch_tick = DEFAULT_EPOCH_TICK;
+        let epoch = EpochTicker::start(engine.clone(), epoch_tick)?;
+        Ok(Self {
+            engine,
+            epoch_tick,
+            _epoch: epoch,
+        })
     }
 
     pub fn load_file(&self, component_path: &Path) -> anyhow::Result<IronLoadedWorkflow> {
@@ -149,6 +201,16 @@ impl IronRunner {
         self.run_component(&loaded.component, event_json, cfg).await
     }
 
+    fn timeout_to_epoch_ticks(&self, timeout: Duration) -> u64 {
+        let tick_ms = self.epoch_tick.as_millis().max(1);
+        let timeout_ms = timeout.as_millis();
+        if timeout_ms == 0 {
+            return u64::MAX / 2;
+        }
+        let ticks = (timeout_ms.saturating_add(tick_ms - 1) / tick_ms) as u64;
+        ticks.max(1)
+    }
+
     async fn run_component(
         &self,
         component: &Component,
@@ -169,6 +231,9 @@ impl IronRunner {
 
         let mut store = Store::new(&self.engine, HostState::new(cfg.tools, limits));
         store.limiter(|s: &mut HostState| &mut s.limits);
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(self.timeout_to_epoch_ticks(cfg.timeout));
+
         if let Some(fuel) = cfg.fuel {
             store.set_fuel(fuel).context("failed to add fuel")?;
         }
@@ -177,17 +242,23 @@ impl IronRunner {
             .await
             .context("failed to instantiate workflow")?;
 
-        let call = workflow.call_run(&mut store, event_json);
-
-        let out = if cfg.timeout.as_millis() > 0 {
-            tokio::time::timeout(cfg.timeout, call)
-                .await
-                .context("workflow timed out")?
-                .context("workflow failed")?
-        } else {
-            call.await.context("workflow failed")?
-        };
-
-        Ok(out)
+        match workflow.call_run(&mut store, event_json).await {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                for cause in e.chain() {
+                    if let Some(trap) = cause.downcast_ref::<wasmtime::Trap>() {
+                        if matches!(trap, wasmtime::Trap::Interrupt) {
+                            return Err(anyhow::anyhow!(
+                                "workflow timed out (epoch deadline reached)"
+                            ));
+                        }
+                        if matches!(trap, wasmtime::Trap::OutOfFuel) {
+                            return Err(anyhow::anyhow!("workflow exhausted fuel"));
+                        }
+                    }
+                }
+                Err(e).context("workflow failed")
+            }
+        }
     }
 }

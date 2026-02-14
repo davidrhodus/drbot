@@ -395,6 +395,7 @@ enum IronAction {
         /// Allow any bash command (dangerous)
         #[arg(long, default_value_t = false)]
         allow_bash_all: bool,
+
     },
 
 
@@ -438,6 +439,23 @@ enum IronAction {
         /// Allow any bash command (dangerous)
         #[arg(long, default_value_t = false)]
         allow_bash_all: bool,
+
+
+        /// Allow binding to non-local addresses (dangerous)
+        #[arg(long, default_value_t = false)]
+        public: bool,
+
+        /// Maximum request body size for /run (bytes)
+        #[arg(long, default_value_t = 262_144)]
+        max_event_bytes: u64,
+
+        /// Maximum workflow output size to return (bytes)
+        #[arg(long, default_value_t = 200_000)]
+        max_output_bytes: u64,
+
+        /// Maximum concurrent /run requests
+        #[arg(long, default_value_t = 4)]
+        max_concurrency: usize,
     },
 
     /// Call an Iron workflow HTTP server (/run)
@@ -865,6 +883,8 @@ struct IronHttpState {
     runner: Arc<drbot_iron::IronRunner>,
     workflow: Arc<drbot_iron::IronLoadedWorkflow>,
     cfg: drbot_iron::IronRunnerConfig,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    max_output_bytes: usize,
 }
 
 async fn iron_http_healthz() -> &'static str {
@@ -876,6 +896,17 @@ async fn iron_http_run(
     axum::Json(event): axum::Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
     use axum::http::StatusCode;
+
+    let _permit = match state.semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let body = serde_json::json!({
+                "ok": false,
+                "error": "server busy (concurrency limit reached)",
+            });
+            return (StatusCode::TOO_MANY_REQUESTS, axum::Json(body));
+        }
+    };
 
     let event_json = match serde_json::to_string(&event) {
         Ok(v) => v,
@@ -891,17 +922,43 @@ async fn iron_http_run(
         .await;
 
     match res {
-        Ok(out) => {
-            let output_json = serde_json::from_str::<serde_json::Value>(&out).ok();
-            let body = serde_json::json!({ "ok": true, "output": out, "output_json": output_json });
+        Ok(mut out) => {
+            let original_len = out.len();
+            let truncated = if out.len() > state.max_output_bytes {
+                out.truncate(state.max_output_bytes);
+                true
+            } else {
+                false
+            };
+
+            let output_json = if truncated {
+                None
+            } else {
+                serde_json::from_str::<serde_json::Value>(&out).ok()
+            };
+
+            let body = serde_json::json!({
+                "ok": true,
+                "output": out,
+                "output_json": output_json,
+                "truncated": truncated,
+                "output_len": original_len,
+            });
             (StatusCode::OK, axum::Json(body))
         }
         Err(e) => {
-            let body = serde_json::json!({ "ok": false, "error": e.to_string() });
-            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body))
+            let msg = e.to_string();
+            let status = if msg.contains("timed out") {
+                StatusCode::REQUEST_TIMEOUT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            let body = serde_json::json!({ "ok": false, "error": msg });
+            (status, axum::Json(body))
         }
     }
 }
+
 
 async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
     let _ = config;
@@ -960,7 +1017,26 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             fs_roots,
             allow_bash_prefixes,
             allow_bash_all,
+            public,
+            max_event_bytes,
+            max_output_bytes,
+            max_concurrency,
         } => {
+            if !public {
+                let host_lower = host.trim().to_ascii_lowercase();
+                let is_loopback = host_lower == "localhost"
+                    || host_lower
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| ip.is_loopback())
+                        .unwrap_or(false);
+                if !is_loopback {
+                    return Err(anyhow::anyhow!(
+                        "refusing to bind to non-local host '{}' without --public",
+                        host
+                    ));
+                }
+            }
+
             let path = PathBuf::from(expand_tilde(&path));
             let (path_for_run, bundle_tmp) = if is_iron_bundle_path(&path) {
                 let tmp = std::env::temp_dir().join(format!(
@@ -1002,17 +1078,25 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             tool_cfg.bash_allow_all = allow_bash_all;
             run_cfg.tools = tool_cfg;
 
+            let max_event_bytes = max_event_bytes.max(1).min(usize::MAX as u64) as usize;
+            let max_output_bytes = max_output_bytes.max(1).min(usize::MAX as u64) as usize;
+            let max_concurrency = max_concurrency.max(1);
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+
             let runner = drbot_iron::IronRunner::new()?;
             let loaded = runner.load_file(&wasm_path)?;
             let state = Arc::new(IronHttpState {
                 runner: Arc::new(runner),
                 workflow: Arc::new(loaded),
                 cfg: run_cfg,
+                semaphore,
+                max_output_bytes,
             });
 
             let app = axum::Router::new()
                 .route("/healthz", axum::routing::get(iron_http_healthz))
                 .route("/run", axum::routing::post(iron_http_run))
+                .layer(axum::extract::DefaultBodyLimit::max(max_event_bytes))
                 .with_state(state);
 
             let bind = format!("{}:{}", host, port);
