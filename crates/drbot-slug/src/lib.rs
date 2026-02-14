@@ -110,10 +110,17 @@ impl Slugify {
         }
 
         let mut result = input.to_string();
+        let sep = self.config.separator;
 
         // Apply custom replacements
         for (from, to) in &self.config.replacements {
-            result = result.replace(from, to);
+            let replacement = if to.is_empty() || from.chars().all(|c| c.is_alphanumeric()) {
+                to.clone()
+            } else {
+                format!("{}{}{}", sep, to, sep)
+            };
+
+            result = result.replace(from, &replacement);
         }
 
         // Convert to lowercase if configured
@@ -130,7 +137,6 @@ impl Slugify {
         }
 
         // Replace non-alphanumeric with separator
-        let sep = self.config.separator;
         result = result
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { sep })

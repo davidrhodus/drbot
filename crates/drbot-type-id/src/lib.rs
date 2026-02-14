@@ -173,7 +173,8 @@ pub fn type_name<T: 'static>() -> &'static str {
 /// Get short type name.
 pub fn short_type_name<T: 'static>() -> &'static str {
     let name = std::any::type_name::<T>();
-    name.rsplit("::").next().unwrap_or(name)
+    let base = name.split('<').next().unwrap_or(name);
+    base.rsplit("::").next().unwrap_or(base)
 }
 
 /// Type guard for runtime type checking.

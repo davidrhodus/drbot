@@ -187,7 +187,8 @@ mod tests {
 
     #[test]
     fn test_approx_eq() {
-        assert!(1.0f64.approx_eq(&1.0000000001, F64_EPSILON));
+        let other = 1.0f64 + (F64_EPSILON / 2.0);
+        assert!(1.0f64.approx_eq(&other, F64_EPSILON));
         assert!(!1.0f64.approx_eq(&1.1, F64_EPSILON));
     }
 

@@ -246,15 +246,20 @@ mod tests {
 
     #[test]
     fn test_finalizer_registry() {
-        let mut order = Vec::new();
+        use std::sync::{Arc, Mutex};
+
+        let order = Arc::new(Mutex::new(Vec::new()));
         {
             let mut registry = FinalizerRegistry::new();
-            let ptr = &mut order as *mut Vec<i32>;
-            registry.register(move || unsafe { (*ptr).push(1) });
-            registry.register(move || unsafe { (*ptr).push(2) });
+
+            let order1 = Arc::clone(&order);
+            registry.register(move || order1.lock().unwrap().push(1));
+
+            let order2 = Arc::clone(&order);
+            registry.register(move || order2.lock().unwrap().push(2));
         }
         // LIFO order
-        assert_eq!(order, vec![2, 1]);
+        assert_eq!(*order.lock().unwrap(), vec![2, 1]);
     }
 
     #[test]

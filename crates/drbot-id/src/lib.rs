@@ -9,6 +9,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
@@ -80,6 +81,55 @@ pub struct Ulid {
     bytes: [u8; 16],
 }
 
+#[derive(Debug)]
+struct UlidMonotonicState {
+    last_timestamp_ms: u64,
+    last_random: [u8; 10],
+}
+
+fn ulid_monotonic_state() -> &'static Mutex<UlidMonotonicState> {
+    static STATE: OnceLock<Mutex<UlidMonotonicState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(UlidMonotonicState {
+            last_timestamp_ms: 0,
+            last_random: [0u8; 10],
+        })
+    })
+}
+
+fn increment_be_80(bytes: &mut [u8; 10]) -> bool {
+    for i in (0..10).rev() {
+        let (b, overflow) = bytes[i].overflowing_add(1);
+        bytes[i] = b;
+        if !overflow {
+            return true;
+        }
+    }
+    false
+}
+
+fn next_ulid_components(timestamp_ms: u64) -> (u64, [u8; 10]) {
+    let mutex = ulid_monotonic_state();
+    let mut state = mutex.lock().unwrap();
+
+    if timestamp_ms > state.last_timestamp_ms {
+        state.last_timestamp_ms = timestamp_ms;
+        let uuid = Uuid::new_v4();
+        state.last_random.copy_from_slice(&uuid.as_bytes()[..10]);
+        return (state.last_timestamp_ms, state.last_random);
+    }
+
+    if increment_be_80(&mut state.last_random) {
+        return (state.last_timestamp_ms, state.last_random);
+    }
+
+    // Random overflow within the same millisecond; bump timestamp and reseed.
+    state.last_timestamp_ms = state.last_timestamp_ms.saturating_add(1);
+    let uuid = Uuid::new_v4();
+    state.last_random.copy_from_slice(&uuid.as_bytes()[..10]);
+    (state.last_timestamp_ms, state.last_random)
+}
+
 impl Ulid {
     const ENCODING: &'static [u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -95,6 +145,8 @@ impl Ulid {
 
     /// Generate ULID from timestamp.
     pub fn from_timestamp(timestamp_ms: u64) -> Result<Self> {
+        let (timestamp_ms, random) = next_ulid_components(timestamp_ms);
+
         let mut bytes = [0u8; 16];
 
         // First 6 bytes are timestamp (48 bits)
@@ -105,16 +157,7 @@ impl Ulid {
         bytes[4] = (timestamp_ms >> 8) as u8;
         bytes[5] = timestamp_ms as u8;
 
-        // Last 10 bytes are random
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let state = RandomState::new();
-        for i in 6..16 {
-            let mut hasher = state.build_hasher();
-            hasher.write_usize(i);
-            hasher.write_u64(timestamp_ms);
-            bytes[i] = hasher.finish() as u8;
-        }
+        bytes[6..].copy_from_slice(&random);
 
         Ok(Self { bytes })
     }
@@ -216,16 +259,41 @@ impl SnowflakeGenerator {
 
     /// Generate next ID.
     pub fn next(&self) -> Result<u64> {
-        let timestamp = SystemTime::now()
+        let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| IdError::GenerationFailed(e.to_string()))?
             .as_millis() as u64;
 
-        let timestamp = timestamp - self.epoch;
+        let mut timestamp = now_ms.saturating_sub(self.epoch);
 
         let last = self.last_timestamp.load(Ordering::SeqCst);
+        if timestamp < last {
+            timestamp = last;
+        }
+
         let seq = if timestamp == last {
-            self.sequence.fetch_add(1, Ordering::SeqCst) & 0xFFF // 12 bits
+            let next = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            let seq = next & 0xFFF; // 12 bits
+
+            if seq == 0 {
+                // Sequence overflow within the same millisecond; wait for next millisecond.
+                loop {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|e| IdError::GenerationFailed(e.to_string()))?
+                        .as_millis() as u64;
+                    let candidate = now_ms.saturating_sub(self.epoch);
+                    if candidate > last {
+                        timestamp = candidate;
+                        self.last_timestamp.store(timestamp, Ordering::SeqCst);
+                        self.sequence.store(0, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                0
+            } else {
+                seq
+            }
         } else {
             self.last_timestamp.store(timestamp, Ordering::SeqCst);
             self.sequence.store(0, Ordering::SeqCst);

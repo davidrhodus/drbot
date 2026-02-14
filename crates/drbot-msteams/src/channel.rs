@@ -5,11 +5,13 @@ use crate::{
     MsTeamsError, Result,
 };
 use async_trait::async_trait;
-use drbot_channels::{Channel, ChannelEvent, IncomingMessage, OutgoingMessage};
+use drbot_channels::Channel;
+use drbot_core::message::{Content, IncomingMessage, MessageSender, OutgoingMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
 /// Microsoft Teams channel implementation.
 pub struct MsTeamsChannel {
@@ -21,8 +23,8 @@ pub struct MsTeamsChannel {
     bot_framework: BotFramework,
     /// Conversation references for proactive messaging.
     conversation_refs: Arc<RwLock<HashMap<String, ConversationReference>>>,
-    /// Event sender.
-    event_tx: broadcast::Sender<ChannelEvent>,
+    /// Incoming message broadcaster.
+    sender: broadcast::Sender<IncomingMessage>,
     /// Connected state.
     connected: Arc<RwLock<bool>>,
 }
@@ -44,14 +46,14 @@ impl MsTeamsChannel {
 
         let bot_framework = BotFramework::new(&config.client_id, &config.client_secret);
 
-        let (event_tx, _) = broadcast::channel(256);
+        let (sender, _) = broadcast::channel(256);
 
         Ok(Self {
             config,
             graph_api,
             bot_framework,
             conversation_refs: Arc::new(RwLock::new(HashMap::new())),
-            event_tx,
+            sender,
             connected: Arc::new(RwLock::new(false)),
         })
     }
@@ -86,7 +88,6 @@ impl MsTeamsChannel {
             }
         }
 
-        // Convert to incoming message
         let sender_id = activity
             .from
             .as_ref()
@@ -96,33 +97,33 @@ impl MsTeamsChannel {
             .from
             .as_ref()
             .and_then(|f| f.name.clone())
-            .unwrap_or_default();
+            .filter(|s| !s.trim().is_empty());
         let conversation_id = activity
             .conversation
             .as_ref()
             .map(|c| c.id.clone())
             .unwrap_or_default();
 
-        let message = IncomingMessage {
-            id: activity.id.clone().unwrap_or_default(),
+        let incoming = IncomingMessage {
+            id: Uuid::new_v4(),
             channel_type: "msteams".to_string(),
-            sender_id,
-            sender_name,
-            conversation_id: conversation_id.clone(),
-            text: text.clone(),
-            timestamp: activity.timestamp.unwrap_or_else(chrono::Utc::now),
+            channel_id: conversation_id.clone(),
+            sender: MessageSender {
+                id: sender_id,
+                name: sender_name,
+                username: None,
+            },
+            content: vec![Content::Text { text: text.clone() }],
+            received_at: activity.timestamp.unwrap_or_else(chrono::Utc::now),
+            raw: serde_json::to_value(&activity).ok(),
             reply_to: activity.reply_to_id.clone(),
-            metadata: HashMap::new(),
         };
 
-        // Broadcast the event
-        let _ = self.event_tx.send(ChannelEvent::MessageReceived(message));
+        if self.sender.send(incoming).is_err() {
+            // No receivers, but that's ok.
+        }
 
-        info!(
-            conversation_id = %conversation_id,
-            "Received Teams message"
-        );
-
+        info!(conversation_id = %conversation_id, "Received Teams message");
         Ok(activity.id)
     }
 
@@ -139,6 +140,10 @@ impl MsTeamsChannel {
         self.bot_framework
             .send_proactive(&reference, activity)
             .await
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        *self.connected.read().await
     }
 
     fn is_allowed(&self, activity: &Activity) -> bool {
@@ -186,13 +191,12 @@ impl MsTeamsChannel {
 #[async_trait]
 impl Channel for MsTeamsChannel {
     async fn connect(&mut self) -> drbot_core::Result<()> {
-        // Verify credentials by making a test API call
+        // Verify credentials by making a test API call.
         match self.graph_api.list_teams().await {
             Ok(teams) => {
                 info!(team_count = teams.len(), "Connected to Microsoft Teams");
                 let mut connected = self.connected.write().await;
                 *connected = true;
-                let _ = self.event_tx.send(ChannelEvent::Connected);
                 Ok(())
             }
             Err(e) => {
@@ -202,22 +206,34 @@ impl Channel for MsTeamsChannel {
         }
     }
 
-    async fn disconnect(&mut self) -> drbot_core::Result<()> {
-        let mut connected = self.connected.write().await;
-        *connected = false;
-        let _ = self.event_tx.send(ChannelEvent::Disconnected);
-        info!("Disconnected from Microsoft Teams");
-        Ok(())
-    }
-
     async fn send(&self, to: &str, message: OutgoingMessage) -> drbot_core::Result<()> {
+        let text = message
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if text.trim().is_empty() {
+            return Err(drbot_core::Error::Internal(
+                "No text content in message".to_string(),
+            ));
+        }
+
         // Try to find conversation reference first (for proactive)
         let refs = self.conversation_refs.read().await;
         if let Some(reference) = refs.get(to) {
             let reference = reference.clone();
             drop(refs);
 
-            let activity = Activity::message(&message.text);
+            let mut activity = Activity::message(text.as_str());
+            if let Some(reply_to) = message.reply_to.as_deref() {
+                activity = activity.with_reply_to(reply_to);
+            }
+
             self.bot_framework
                 .send_proactive(&reference, activity)
                 .await
@@ -230,7 +246,7 @@ impl Channel for MsTeamsChannel {
         // Otherwise, try Graph API (requires team_id:channel_id format)
         let parts: Vec<&str> = to.split(':').collect();
         if parts.len() == 2 {
-            let body = crate::api::MessageBody::text(&message.text);
+            let body = crate::api::MessageBody::text(text.as_str());
             self.graph_api
                 .send_message(parts[0], parts[1], body)
                 .await
@@ -245,16 +261,19 @@ impl Channel for MsTeamsChannel {
         )))
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<ChannelEvent> {
-        self.event_tx.subscribe()
+    fn subscribe(&self) -> broadcast::Receiver<IncomingMessage> {
+        self.sender.subscribe()
+    }
+
+    async fn disconnect(&mut self) -> drbot_core::Result<()> {
+        let mut connected = self.connected.write().await;
+        *connected = false;
+        info!("Disconnected from Microsoft Teams");
+        Ok(())
     }
 
     fn channel_type(&self) -> &str {
         "msteams"
-    }
-
-    async fn is_connected(&self) -> bool {
-        *self.connected.read().await
     }
 }
 

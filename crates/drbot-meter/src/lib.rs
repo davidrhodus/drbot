@@ -141,7 +141,11 @@ impl Histogram {
     /// Observe a value.
     pub fn observe(&self, value: f64) {
         self.values.write().unwrap().push(value);
-        self.sum.fetch_add(value.to_bits(), Ordering::Relaxed);
+
+        let _ = self.sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+            Some((f64::from_bits(bits) + value).to_bits())
+        });
+
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -280,12 +284,13 @@ impl RateMeter {
     /// Get current rate (events per second).
     pub fn rate(&self) -> f64 {
         let count = self.count.load(Ordering::Relaxed) as f64;
-        let secs = self.start_time.elapsed().as_secs_f64();
-        if secs > 0.0 {
-            count / secs
-        } else {
-            0.0
+        if count == 0.0 {
+            return 0.0;
         }
+
+        let secs = self.start_time.elapsed().as_secs_f64();
+        let secs = if secs > 0.0 { secs } else { 1e-9 };
+        count / secs
     }
 
     /// Get count.

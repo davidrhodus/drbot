@@ -322,18 +322,22 @@ mod tests {
 
     #[test]
     fn test_cleanup_stack() {
-        let order = Cell::new(Vec::new());
+        let order = std::rc::Rc::new(Cell::new(Vec::new()));
         {
             let mut stack = CleanupStack::new();
-            stack.push(|| {
-                let mut v = order.take();
+
+            let order1 = order.clone();
+            stack.push(move || {
+                let mut v = order1.take();
                 v.push(1);
-                order.set(v);
+                order1.set(v);
             });
-            stack.push(|| {
-                let mut v = order.take();
+
+            let order2 = order.clone();
+            stack.push(move || {
+                let mut v = order2.take();
                 v.push(2);
-                order.set(v);
+                order2.set(v);
             });
         }
         // Should run in reverse order

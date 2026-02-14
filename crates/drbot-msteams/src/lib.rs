@@ -21,6 +21,7 @@
 //!         client_id: "your-client-id".to_string(),
 //!         client_secret: "your-client-secret".to_string(),
 //!         bot_app_id: "your-bot-app-id".to_string(),
+//!         ..Default::default()
 //!     };
 //!
 //!     let channel = MsTeamsChannel::new(config).await.unwrap();

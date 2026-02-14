@@ -292,7 +292,7 @@ mod tests {
     fn test_scope_guard() {
         let mut ran = false;
         {
-            let _guard = ScopeGuard::new(&mut ran, |r| *r = true);
+            let _guard = ScopeGuard::new(&mut ran, |r| **r = true);
         }
         assert!(ran);
     }
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_scope_guard_disarm() {
         let mut ran = false;
-        let guard = ScopeGuard::new(&mut ran, |r| *r = true);
+        let guard = ScopeGuard::new(&mut ran, |r| **r = true);
         guard.disarm();
         assert!(!ran);
     }

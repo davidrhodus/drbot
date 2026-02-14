@@ -141,9 +141,8 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         let mut inner = self.entries.write().unwrap();
 
         let idx = inner.map.remove(key)?;
-        let entry = inner.entries[idx].take()?;
-
         Self::unlink(&mut inner, idx);
+        let entry = inner.entries[idx].take()?;
         inner.free.push(idx);
 
         Some(entry.value)
@@ -246,12 +245,19 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
     }
 
     fn evict_lru(inner: &mut LruCacheInner<K, V>) {
-        if let Some(tail_idx) = inner.tail {
-            if let Some(entry) = inner.entries[tail_idx].take() {
-                inner.map.remove(&entry.key);
-                Self::unlink(inner, tail_idx);
-                inner.free.push(tail_idx);
-            }
+        let Some(tail_idx) = inner.tail else {
+            return;
+        };
+
+        if inner.entries.get(tail_idx).and_then(|e| e.as_ref()).is_none() {
+            return;
+        }
+
+        Self::unlink(inner, tail_idx);
+
+        if let Some(entry) = inner.entries[tail_idx].take() {
+            inner.map.remove(&entry.key);
+            inner.free.push(tail_idx);
         }
     }
 }

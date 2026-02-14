@@ -70,7 +70,7 @@ impl RollbackStack {
             .rposition(|(name, _)| name.as_deref() == Some(checkpoint))
             .ok_or_else(|| RollbackError::CheckpointNotFound(checkpoint.to_string()))?;
 
-        while self.actions.len() > pos {
+        while self.actions.len() > pos + 1 {
             if let Some((_, action)) = self.actions.pop() {
                 action();
             }

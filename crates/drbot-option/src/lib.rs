@@ -303,9 +303,9 @@ mod tests {
         let some_five: Option<i32> = Some(5);
         let none: Option<i32> = None;
 
-        assert!(some_five.is_none_or(|&x| x > 3));
-        assert!(!some_five.is_none_or(|&x| x > 10));
-        assert!(none.is_none_or(|&x| x > 10));
+        assert!(some_five.is_none_or(|x| x > 3));
+        assert!(!some_five.is_none_or(|x| x > 10));
+        assert!(none.is_none_or(|x| x > 10));
     }
 
     #[test]

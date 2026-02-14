@@ -8,7 +8,7 @@
 use thiserror::Error;
 
 /// Alignment error types.
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum AlignError {
     #[error("Not aligned")]
     NotAligned,

@@ -11,7 +11,10 @@ pub fn strip_frontmatter(content: &str) -> String {
     let Some(end_index) = normalized[3..].find("\n---").map(|i| i + 3) else {
         return normalized;
     };
-    let start = (end_index + 4).min(normalized.len());
+    let mut start = (end_index + 4).min(normalized.len());
+    if normalized.as_bytes().get(start) == Some(&b'\n') {
+        start = (start + 1).min(normalized.len());
+    }
     normalized[start..].to_string()
 }
 

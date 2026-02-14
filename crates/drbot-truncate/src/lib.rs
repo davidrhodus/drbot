@@ -92,34 +92,33 @@ pub struct Truncate;
 impl Truncate {
     /// Truncate string with options.
     pub fn with_options(s: &str, options: &TruncateOptions) -> String {
-        if s.len() <= options.max_length {
+        if Self::char_len(s) <= options.max_length {
             return s.to_string();
         }
 
-        let ellipsis_len = options.ellipsis.len();
+        let ellipsis_len = Self::char_len(&options.ellipsis);
         if options.max_length <= ellipsis_len {
-            return options.ellipsis[..options.max_length].to_string();
+            return Self::prefix_chars(&options.ellipsis, options.max_length).to_string();
         }
 
         let available = options.max_length - ellipsis_len;
 
         match options.position {
             Position::End => {
-                if options.preserve_words || options.word_boundary {
-                    let truncated = Self::truncate_at_word_end(s, available);
-                    format!("{}{}", truncated, options.ellipsis)
+                let prefix = if options.preserve_words || options.word_boundary {
+                    Self::truncate_at_word_end(s, available)
                 } else {
-                    format!("{}{}", &s[..available], options.ellipsis)
-                }
+                    Self::prefix_chars(s, available)
+                };
+                format!("{}{}", prefix, options.ellipsis)
             }
             Position::Start => {
-                if options.preserve_words || options.word_boundary {
-                    let truncated = Self::truncate_at_word_start(s, available);
-                    format!("{}{}", options.ellipsis, truncated)
+                let suffix = if options.preserve_words || options.word_boundary {
+                    Self::truncate_at_word_start(s, available)
                 } else {
-                    let start = s.len() - available;
-                    format!("{}{}", options.ellipsis, &s[start..])
-                }
+                    Self::suffix_chars(s, available)
+                };
+                format!("{}{}", options.ellipsis, suffix)
             }
             Position::Middle => {
                 let half = available / 2;
@@ -131,42 +130,75 @@ impl Truncate {
                     let end = Self::truncate_at_word_start(s, end_len);
                     format!("{}{}{}", start, options.ellipsis, end)
                 } else {
-                    let start = &s[..start_len];
-                    let end = &s[s.len() - end_len..];
+                    let start = Self::prefix_chars(s, start_len);
+                    let end = Self::suffix_chars(s, end_len);
                     format!("{}{}{}", start, options.ellipsis, end)
                 }
             }
         }
     }
 
-    fn truncate_at_word_end(s: &str, max_len: usize) -> &str {
-        if s.len() <= max_len {
+    fn char_len(s: &str) -> usize {
+        s.chars().count()
+    }
+
+    fn byte_index_for_char(s: &str, char_index: usize) -> usize {
+        s.char_indices()
+            .nth(char_index)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| s.len())
+    }
+
+    fn prefix_chars<'a>(s: &'a str, char_count: usize) -> &'a str {
+        let end = Self::byte_index_for_char(s, char_count);
+        &s[..end]
+    }
+
+    fn suffix_chars<'a>(s: &'a str, char_count: usize) -> &'a str {
+        if char_count == 0 {
+            return "";
+        }
+
+        let total = Self::char_len(s);
+        if char_count >= total {
             return s;
         }
 
-        // Find last space before max_len
-        let slice = &s[..max_len];
+        let start_char = total - char_count;
+        let start = Self::byte_index_for_char(s, start_char);
+        &s[start..]
+    }
+
+    fn truncate_at_word_end(s: &str, max_len: usize) -> &str {
+        if Self::char_len(s) <= max_len {
+            return s;
+        }
+
+        // Find last whitespace before max_len
+        let slice = Self::prefix_chars(s, max_len);
         if let Some(pos) = slice.rfind(|c: char| c.is_whitespace()) {
-            &s[..pos]
+            &slice[..pos]
         } else {
             slice
         }
     }
 
     fn truncate_at_word_start(s: &str, max_len: usize) -> &str {
-        if s.len() <= max_len {
+        if Self::char_len(s) <= max_len {
             return s;
         }
 
-        let start = s.len() - max_len;
-        let slice = &s[start..];
+        let slice = Self::suffix_chars(s, max_len);
 
-        // Find first space after start
-        if let Some(pos) = slice.find(|c: char| c.is_whitespace()) {
-            &slice[pos + 1..]
-        } else {
-            slice
+        // Find first whitespace in slice
+        for (idx, ch) in slice.char_indices() {
+            if ch.is_whitespace() {
+                let next = idx + ch.len_utf8();
+                return &slice[next..];
+            }
         }
+
+        slice
     }
 
     /// Simple truncate at end.

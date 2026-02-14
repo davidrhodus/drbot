@@ -76,8 +76,8 @@ impl<V: Clone + Send + Sync> Literal<V> {
     }
 }
 
-impl<V: Clone + Send + Sync> Expression<Context<V>, V> for Literal<V> {
-    fn interpret(&self, _context: &Context<V>) -> Result<V> {
+impl<C, V: Clone + Send + Sync> Expression<C, V> for Literal<V> {
+    fn interpret(&self, _context: &C) -> Result<V> {
         Ok(self.0.clone())
     }
 }

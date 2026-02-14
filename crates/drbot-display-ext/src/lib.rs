@@ -25,7 +25,7 @@ pub fn display_string<T: Display + ?Sized>(value: &T) -> String {
 
 /// Display with width.
 pub fn display_width<T: Display + ?Sized>(value: &T, width: usize) -> String {
-    format!("{:width$}", value, width = width)
+    format!("{:<width$}", value, width = width)
 }
 
 /// Display right-aligned.

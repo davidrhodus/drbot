@@ -281,20 +281,22 @@ impl Template {
                 for (index, item) in items.iter().enumerate() {
                     let mut loop_ctx = ctx.clone();
                     loop_ctx.values.insert(item_name.to_string(), item.clone());
-                    loop_ctx
-                        .values
-                        .insert("loop.index".to_string(), Value::Int((index + 1) as i64));
-                    loop_ctx
-                        .values
-                        .insert("loop.index0".to_string(), Value::Int(index as i64));
-                    loop_ctx
-                        .values
-                        .insert("loop.first".to_string(), Value::Bool(index == 0));
-                    loop_ctx.values.insert(
-                        "loop.last".to_string(),
-                        Value::Bool(index == items.len() - 1),
-                    );
 
+                    let mut loop_obj = HashMap::new();
+                    loop_obj.insert("index".to_string(), Value::Int((index + 1) as i64));
+                    loop_obj.insert("index0".to_string(), Value::Int(index as i64));
+                    loop_obj.insert("first".to_string(), Value::Bool(index == 0));
+                    loop_obj.insert("last".to_string(), Value::Bool(index + 1 == items.len()));
+                    loop_obj.insert("length".to_string(), Value::Int(items.len() as i64));
+                    loop_obj.insert(
+                        "revindex".to_string(),
+                        Value::Int((items.len() - index) as i64),
+                    );
+                    loop_obj.insert(
+                        "revindex0".to_string(),
+                        Value::Int((items.len() - index - 1) as i64),
+                    );
+                    loop_ctx.values.insert("loop".to_string(), Value::Object(loop_obj));
                     let rendered = self.process_variables(content, &loop_ctx)?;
                     result.push_str(&rendered);
                 }

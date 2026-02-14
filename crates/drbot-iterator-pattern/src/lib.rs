@@ -117,14 +117,20 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if self.count.is_some() && self.remaining == 0 {
+                return None;
+            }
+
             if let Some(item) = self.current.next() {
                 return Some(item);
             }
 
             match self.count {
-                Some(_) if self.remaining == 0 => return None,
                 Some(_) => {
-                    self.remaining -= 1;
+                    self.remaining = self.remaining.saturating_sub(1);
+                    if self.remaining == 0 {
+                        return None;
+                    }
                     self.current = self.original.clone();
                 }
                 None => {

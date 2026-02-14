@@ -128,7 +128,10 @@ impl Job {
     /// Create a new job.
     pub fn new(name: impl Into<String>, schedule: Schedule) -> Self {
         let now = Utc::now();
-        let next_run_at = schedule.next_run(now);
+        let next_run_at = match &schedule {
+            Schedule::Once(at) => Some(*at),
+            _ => schedule.next_run(now),
+        };
 
         Self {
             id: Uuid::new_v4(),

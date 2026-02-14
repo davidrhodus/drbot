@@ -180,7 +180,8 @@ impl CommandBus {
     /// Register a command handler.
     pub async fn register<C: Command, H: CommandHandler<C> + 'static>(&self, handler: H) {
         let mut handlers = self.handlers.write().await;
-        handlers.insert(TypeId::of::<C>(), Box::new(Arc::new(handler)));
+        let handler: Arc<dyn CommandHandler<C>> = Arc::new(handler);
+        handlers.insert(TypeId::of::<C>(), Box::new(handler));
     }
 
     /// Dispatch a command.
@@ -231,7 +232,8 @@ impl QueryBus {
     /// Register a query handler.
     pub async fn register<Q: Query, H: QueryHandler<Q> + 'static>(&self, handler: H) {
         let mut handlers = self.handlers.write().await;
-        handlers.insert(TypeId::of::<Q>(), Box::new(Arc::new(handler)));
+        let handler: Arc<dyn QueryHandler<Q>> = Arc::new(handler);
+        handlers.insert(TypeId::of::<Q>(), Box::new(handler));
     }
 
     /// Execute a query.

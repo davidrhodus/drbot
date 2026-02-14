@@ -907,6 +907,8 @@ async fn run_gateway(config: Config) -> Result<()> {
             let mut sigusr1 =
                 signal(SignalKind::user_defined1()).expect("Failed to install SIGUSR1 handler");
 
+            drbot_gateway::openclaw_restart::enable_sigusr1_self_restart();
+
             loop {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {

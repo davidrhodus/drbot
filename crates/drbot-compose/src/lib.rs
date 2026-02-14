@@ -200,9 +200,9 @@ where
 }
 
 /// Tap - execute side effect and return input.
-pub fn tap<T, F>(f: F) -> impl Fn(T) -> T
+pub fn tap<T, F>(mut f: F) -> impl FnMut(T) -> T
 where
-    F: Fn(&T),
+    F: FnMut(&T),
 {
     move |x| {
         f(&x);
@@ -278,11 +278,13 @@ mod tests {
     #[test]
     fn test_tap() {
         let mut log = Vec::new();
-        let logger = tap(|x: &i32| log.push(*x));
+        let result = {
+            let mut logger = tap(|x: &i32| log.push(*x));
+            logger(42)
+        };
 
-        let result = logger(42);
         assert_eq!(result, 42);
-        // Note: log won't capture due to closure semantics
+        assert_eq!(log, vec![42]);
     }
 
     #[test]

@@ -8,11 +8,23 @@ use crate::state::GatewayState;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 const SIGUSR1_AUTH_GRACE_MS: u64 = 5_000;
+
+static SIGUSR1_SELF_RESTART_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_sigusr1_self_restart() {
+    SIGUSR1_SELF_RESTART_ENABLED.store(true, Ordering::Relaxed);
+}
+
+fn sigusr1_self_restart_enabled() -> bool {
+    SIGUSR1_SELF_RESTART_ENABLED.load(Ordering::Relaxed)
+}
+
 const SENTINEL_FILENAME: &str = "restart-sentinel.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,10 +148,21 @@ pub fn schedule_sigusr1_restart(delay_ms: Option<u64>, reason: Option<&str>) -> 
     authorize_sigusr1_restart(delay_ms);
 
     #[cfg(unix)]
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        send_sigusr1(pid);
-    });
+    if sigusr1_self_restart_enabled() {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            send_sigusr1(pid);
+        });
+
+        return ScheduledRestart {
+            ok: true,
+            pid,
+            signal: "SIGUSR1".to_string(),
+            delay_ms,
+            reason,
+            mode: "signal".to_string(),
+        };
+    }
 
     ScheduledRestart {
         ok: true,
@@ -147,7 +170,7 @@ pub fn schedule_sigusr1_restart(delay_ms: Option<u64>, reason: Option<&str>) -> 
         signal: "SIGUSR1".to_string(),
         delay_ms,
         reason,
-        mode: "signal".to_string(),
+        mode: "authorized".to_string(),
     }
 }
 

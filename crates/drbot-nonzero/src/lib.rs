@@ -237,19 +237,19 @@ mod tests {
 
     #[test]
     fn test_positive() {
-        assert!(Positive::new(42i32).is_ok());
-        assert!(Positive::new(0i32).is_err());
-        assert!(Positive::new(-1i32).is_err());
+        assert!(Positive::<i32>::new(42).is_ok());
+        assert!(Positive::<i32>::new(0).is_err());
+        assert!(Positive::<i32>::new(-1).is_err());
 
-        assert!(Positive::new(3.14f64).is_ok());
-        assert!(Positive::new(0.0f64).is_err());
+        assert!(Positive::<f64>::new(3.14).is_ok());
+        assert!(Positive::<f64>::new(0.0).is_err());
     }
 
     #[test]
     fn test_non_negative() {
-        assert!(NonNegative::new(42i32).is_ok());
-        assert!(NonNegative::new(0i32).is_ok());
-        assert!(NonNegative::new(-1i32).is_err());
+        assert!(NonNegative::<i32>::new(42).is_ok());
+        assert!(NonNegative::<i32>::new(0).is_ok());
+        assert!(NonNegative::<i32>::new(-1).is_err());
     }
 
     #[test]

@@ -70,10 +70,14 @@ impl<T: Clone> Broadcaster<T> {
     }
 
     /// Send to all subscribers.
+    ///
+    /// Tokio broadcast channels return an error when there are no receivers.
+    /// For our use-cases, that's equivalent to delivering to 0 subscribers.
     pub fn send(&self, value: T) -> Result<usize> {
-        self.sender
-            .send(value)
-            .map_err(|e| BroadcastError::SendFailed(e.to_string()))
+        match self.sender.send(value) {
+            Ok(n) => Ok(n),
+            Err(_e) => Ok(0),
+        }
     }
 
     /// Create a new subscriber.

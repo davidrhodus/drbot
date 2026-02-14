@@ -212,7 +212,7 @@ mod tests {
     fn test_pinned() {
         let pinned = Pinned::new(42);
         let boxed = Box::pin(pinned);
-        assert_eq!(*boxed.as_ref().get_ref(), 42);
+        assert_eq!(*Pinned::get_ref(boxed.as_ref()), 42);
     }
 
     #[test]

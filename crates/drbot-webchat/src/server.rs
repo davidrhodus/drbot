@@ -592,6 +592,8 @@ mod tests {
             port: 0,
             require_auth: false,
             auth_token: None,
+            response_prefix: None,
+            accounts: std::collections::HashMap::new(),
         };
 
         let mut channel = WebChatChannel::new(config);
@@ -608,6 +610,8 @@ mod tests {
             port: 0,
             require_auth: true,
             auth_token: None,
+            response_prefix: None,
+            accounts: std::collections::HashMap::new(),
         };
 
         let mut channel = WebChatChannel::new(config);

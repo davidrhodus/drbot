@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn test_reborrow() {
         let mut value = 42;
-        let r = &mut value;
+        let mut r = &mut value;
         let rb = r.reborrow();
         *rb = 84;
         assert_eq!(value, 84);

@@ -74,7 +74,7 @@ impl<T, E> TryBlock<T, E> {
     }
 
     /// Catch specific error type.
-    pub fn catch<F, H>(self, handler: H) -> TryBlock<T, E>
+    pub fn catch<H>(self, handler: H) -> TryBlock<T, E>
     where
         H: FnOnce(E) -> T,
     {

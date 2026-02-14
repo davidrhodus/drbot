@@ -63,6 +63,14 @@ impl Args {
                 continue;
             }
 
+            if arg == "--" {
+                // End of options; treat remaining args as positional.
+                for rest in iter {
+                    args.positional.push(rest.as_ref().to_string());
+                }
+                break;
+            }
+
             if arg.starts_with("--") {
                 let arg = &arg[2..];
                 if let Some(eq_pos) = arg.find('=') {
@@ -493,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_parse_mixed() {
-        let args = Args::parse(["input.txt", "--output=out.txt", "--verbose", "extra"]);
+        let args = Args::parse(["input.txt", "--output=out.txt", "--verbose", "--", "extra"]);
         assert_eq!(args.positional(0), Some("input.txt"));
         assert_eq!(args.positional(1), Some("extra"));
         assert_eq!(args.get("output"), Some("out.txt"));

@@ -260,7 +260,7 @@ mod tests {
         cell.update(|x| x * 2);
         assert_eq!(cell.get(), 10);
 
-        let old = cell.swap(20);
+        let old = CellExt::swap(&cell, 20);
         assert_eq!(old, 10);
         assert_eq!(cell.get(), 20);
     }
