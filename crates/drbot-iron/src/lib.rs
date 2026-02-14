@@ -6,6 +6,7 @@
 mod manifest;
 mod runner;
 mod tools;
+mod bundle;
 
 /// The canonical WIT definition for drbot Iron workflows.
 pub const IRON_WORKFLOW_WIT: &str = include_str!("../wit/workflow.wit");
@@ -13,3 +14,4 @@ pub const IRON_WORKFLOW_WIT: &str = include_str!("../wit/workflow.wit");
 pub use manifest::IronWorkflowManifest;
 pub use runner::{IronRunner, IronRunnerConfig};
 pub use tools::{IronToolHostConfig, IronToolResult};
+pub use bundle::{create_bundle_tar_gz, unpack_bundle_tar_gz};

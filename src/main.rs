@@ -329,6 +329,32 @@ enum IronAction {
         rust_dir: String,
     },
 
+
+    /// Bundle an Iron workflow for distribution (.tar.gz)
+    Bundle {
+        /// Path to a workflow directory (containing iron.json)
+        path: String,
+
+        /// Output bundle path (defaults to <dir>/<name>-<version>.iron.tgz)
+        #[arg(long)]
+        out: Option<String>,
+
+        /// Build first (uses the Rust template if present)
+        #[arg(long, default_value_t = false)]
+        build: bool,
+
+        /// Build in release mode (used with --build)
+        #[arg(long, default_value_t = false)]
+        release: bool,
+
+        /// Rust project directory name (defaults to "rust") (used with --build)
+        #[arg(long, default_value = "rust")]
+        rust_dir: String,
+
+        /// Exclude WIT from the bundle
+        #[arg(long, default_value_t = false)]
+        no_wit: bool,
+    },
     /// Run an Iron workflow component
     Run {
         /// Path to a workflow directory (containing iron.json) or a .wasm component
@@ -789,6 +815,35 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             let out = build_iron_rust_workflow(&workflow_dir, &rust_dir, release).await?;
             println!("{}", out.display());
         }
+        IronAction::Bundle {
+            path,
+            out,
+            build,
+            release,
+            rust_dir,
+            no_wit,
+        } => {
+            let path = PathBuf::from(expand_tilde(&path));
+            let workflow_dir = resolve_iron_workflow_dir(&path)?;
+
+            if build {
+                let _ = build_iron_rust_workflow(&workflow_dir, &rust_dir, release).await?;
+            }
+
+            let manifest = drbot_iron::IronWorkflowManifest::load(&workflow_dir.join("iron.json"))?;
+            let default_name = format!(
+                "{}-{}.iron.tgz",
+                slugify_filename(manifest.name.as_str()),
+                slugify_filename(manifest.version.as_str())
+            );
+            let out_path = out
+                .as_deref()
+                .map(|p| PathBuf::from(expand_tilde(p)))
+                .unwrap_or_else(|| workflow_dir.join(default_name));
+
+            drbot_iron::create_bundle_tar_gz(&workflow_dir, &out_path, !no_wit)?;
+            println!("{}", out_path.display());
+        }
         IronAction::Run {
             path,
             event,
@@ -802,7 +857,19 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
             allow_bash_all,
         } => {
             let path = PathBuf::from(expand_tilde(&path));
-            let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path)?;
+            let (path_for_run, _bundle_tmp) = if is_iron_bundle_path(&path) {
+                let tmp = std::env::temp_dir().join(format!(
+                    "drbot-iron-bundle-{}",
+                    Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&tmp)?;
+                drbot_iron::unpack_bundle_tar_gz(&path, &tmp)?;
+                (tmp.clone(), Some(TempDirGuard::new(tmp)))
+            } else {
+                (path, None)
+            };
+
+            let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path_for_run)?;
             let event_json = if let Some(raw) = event {
                 raw
             } else if let Some(src) = event_file.as_deref() {
@@ -906,6 +973,57 @@ fn resolve_iron_workflow_dir(path: &Path) -> Result<PathBuf> {
     }
 
     Err(anyhow::anyhow!("path not found: {}", path.display()))
+}
+
+fn slugify_filename(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "workflow".to_string()
+    } else {
+        out
+    }
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn is_iron_bundle_path(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    name.ends_with(".iron.tgz") || name.ends_with(".tgz") || name.ends_with(".tar.gz")
 }
 
 fn read_rust_package_name(cargo_toml: &Path) -> Result<String> {
