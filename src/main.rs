@@ -396,6 +396,67 @@ enum IronAction {
         #[arg(long, default_value_t = false)]
         allow_bash_all: bool,
     },
+
+
+    /// Serve an Iron workflow over HTTP (local worker)
+    Serve {
+        /// Path to a workflow directory (containing iron.json), a .wasm component, or a .iron.tgz bundle
+        path: String,
+
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to listen on
+        #[arg(long, default_value_t = 18790)]
+        port: u16,
+
+        /// Timeout in milliseconds (per run)
+        #[arg(long, default_value_t = 120_000)]
+        timeout_ms: u64,
+
+        /// Fuel limit for deterministic execution (instruction units)
+        #[arg(long)]
+        fuel: Option<u64>,
+
+        /// Maximum linear memory per guest memory (MB)
+        #[arg(long)]
+        max_memory_mb: Option<u64>,
+
+        /// Working directory for relative paths
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Allow filesystem roots for fs.* tools (repeatable)
+        #[arg(long = "fs-root")]
+        fs_roots: Vec<String>,
+
+        /// Allow bash commands starting with these prefixes (repeatable)
+        #[arg(long = "allow-bash-prefix")]
+        allow_bash_prefixes: Vec<String>,
+
+        /// Allow any bash command (dangerous)
+        #[arg(long, default_value_t = false)]
+        allow_bash_all: bool,
+    },
+
+    /// Call an Iron workflow HTTP server (/run)
+    Call {
+        /// Server URL (e.g., http://127.0.0.1:18790)
+        url: String,
+
+        /// Event JSON string (defaults to {"type":"manual"})
+        #[arg(long)]
+        event: Option<String>,
+
+        /// Read event JSON from a file (or "-" for stdin)
+        #[arg(long)]
+        event_file: Option<String>,
+
+        /// Request timeout in milliseconds
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -798,6 +859,50 @@ async fn run_skills(
 }
 
 
+
+#[derive(Clone)]
+struct IronHttpState {
+    runner: Arc<drbot_iron::IronRunner>,
+    workflow: Arc<drbot_iron::IronLoadedWorkflow>,
+    cfg: drbot_iron::IronRunnerConfig,
+}
+
+async fn iron_http_healthz() -> &'static str {
+    "ok"
+}
+
+async fn iron_http_run(
+    axum::extract::State(state): axum::extract::State<Arc<IronHttpState>>,
+    axum::Json(event): axum::Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+
+    let event_json = match serde_json::to_string(&event) {
+        Ok(v) => v,
+        Err(e) => {
+            let body = serde_json::json!({ "ok": false, "error": format!("invalid JSON: {}", e) });
+            return (StatusCode::BAD_REQUEST, axum::Json(body));
+        }
+    };
+
+    let res = state
+        .runner
+        .run_loaded(state.workflow.as_ref(), event_json.as_str(), state.cfg.clone())
+        .await;
+
+    match res {
+        Ok(out) => {
+            let output_json = serde_json::from_str::<serde_json::Value>(&out).ok();
+            let body = serde_json::json!({ "ok": true, "output": out, "output_json": output_json });
+            (StatusCode::OK, axum::Json(body))
+        }
+        Err(e) => {
+            let body = serde_json::json!({ "ok": false, "error": e.to_string() });
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body))
+        }
+    }
+}
+
 async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
     let _ = config;
     match action {
@@ -843,6 +948,126 @@ async fn run_iron(config: &Config, action: IronAction) -> Result<()> {
 
             drbot_iron::create_bundle_tar_gz(&workflow_dir, &out_path, !no_wit)?;
             println!("{}", out_path.display());
+        }
+        IronAction::Serve {
+            path,
+            host,
+            port,
+            timeout_ms,
+            fuel,
+            max_memory_mb,
+            workdir,
+            fs_roots,
+            allow_bash_prefixes,
+            allow_bash_all,
+        } => {
+            let path = PathBuf::from(expand_tilde(&path));
+            let (path_for_run, bundle_tmp) = if is_iron_bundle_path(&path) {
+                let tmp = std::env::temp_dir().join(format!(
+                    "drbot-iron-bundle-{}",
+                    Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&tmp)?;
+                drbot_iron::unpack_bundle_tar_gz(&path, &tmp)?;
+                (tmp.clone(), Some(TempDirGuard::new(tmp)))
+            } else {
+                (path, None)
+            };
+
+            let (wasm_path, _manifest_name) = resolve_iron_wasm_path(&path_for_run)?;
+
+            let mut run_cfg = drbot_iron::IronRunnerConfig::default();
+            run_cfg.timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+            if let Some(f) = fuel {
+                run_cfg.fuel = Some(f);
+            }
+            if let Some(mb) = max_memory_mb {
+                if mb == 0 {
+                    run_cfg.max_memory_bytes = None;
+                } else {
+                    let bytes = mb.saturating_mul(1024 * 1024);
+                    let bytes = bytes.min(usize::MAX as u64) as usize;
+                    run_cfg.max_memory_bytes = Some(bytes);
+                }
+            }
+            let mut tool_cfg = drbot_iron::IronToolHostConfig::default();
+            if let Some(wd) = workdir.as_deref() {
+                tool_cfg.workdir = PathBuf::from(expand_tilde(wd));
+            }
+            tool_cfg.fs_roots = fs_roots
+                .iter()
+                .map(|p| PathBuf::from(expand_tilde(p)))
+                .collect();
+            tool_cfg.bash_allow_prefixes = allow_bash_prefixes;
+            tool_cfg.bash_allow_all = allow_bash_all;
+            run_cfg.tools = tool_cfg;
+
+            let runner = drbot_iron::IronRunner::new()?;
+            let loaded = runner.load_file(&wasm_path)?;
+            let state = Arc::new(IronHttpState {
+                runner: Arc::new(runner),
+                workflow: Arc::new(loaded),
+                cfg: run_cfg,
+            });
+
+            let app = axum::Router::new()
+                .route("/healthz", axum::routing::get(iron_http_healthz))
+                .route("/run", axum::routing::post(iron_http_run))
+                .with_state(state);
+
+            let bind = format!("{}:{}", host, port);
+            let listener = tokio::net::TcpListener::bind(&bind).await?;
+            let addr = listener.local_addr()?;
+            println!("listening on http://{}/run", addr);
+
+            let _bundle_tmp = bundle_tmp;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await?;
+        }
+        IronAction::Call {
+            url,
+            event,
+            event_file,
+            timeout_ms,
+        } => {
+            let event_json = if let Some(raw) = event {
+                raw
+            } else if let Some(src) = event_file.as_deref() {
+                read_message_from_source(src)?
+            } else {
+                r#"{"type":"manual"}"#.to_string()
+            };
+            let event_value: serde_json::Value = serde_json::from_str(event_json.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid --event JSON: {}", e))?;
+
+            let mut endpoint = url.trim().to_string();
+            if !endpoint.contains("://") {
+                endpoint = format!("http://{}", endpoint);
+            }
+            endpoint = endpoint.trim_end_matches('/').to_string();
+            if !endpoint.ends_with("/run") {
+                endpoint = format!("{}/run", endpoint);
+            }
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(timeout_ms.max(1)))
+                .build()?;
+
+            let resp = client.post(endpoint).json(&event_value).send().await?;
+            let status = resp.status();
+            let txt = resp.text().await?;
+            if !status.is_success() {
+                return Err(anyhow::anyhow!("server returned {}: {}", status, txt));
+            }
+
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}", txt);
+            }
         }
         IronAction::Run {
             path,

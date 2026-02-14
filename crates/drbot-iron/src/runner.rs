@@ -92,6 +92,11 @@ pub struct IronRunner {
     engine: Engine,
 }
 
+/// A workflow component loaded/compiled against a specific [`IronRunner`] engine.
+pub struct IronLoadedWorkflow {
+    component: Component,
+}
+
 impl IronRunner {
     pub fn new() -> anyhow::Result<Self> {
         let mut cfg = Config::new();
@@ -103,15 +108,26 @@ impl IronRunner {
         Ok(Self { engine })
     }
 
+    pub fn load_file(&self, component_path: &Path) -> anyhow::Result<IronLoadedWorkflow> {
+        let component = Component::from_file(&self.engine, component_path)
+            .with_context(|| format!("failed to load component: {}", component_path.display()))?;
+        Ok(IronLoadedWorkflow { component })
+    }
+
+    pub fn load_bytes(&self, bytes: &[u8]) -> anyhow::Result<IronLoadedWorkflow> {
+        let component =
+            Component::new(&self.engine, bytes).context("failed to load component bytes")?;
+        Ok(IronLoadedWorkflow { component })
+    }
+
     pub async fn run_file(
         &self,
         component_path: &Path,
         event_json: &str,
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
-        let component = Component::from_file(&self.engine, component_path)
-            .with_context(|| format!("failed to load component: {}", component_path.display()))?;
-        self.run_component(&component, event_json, cfg).await
+        let loaded = self.load_file(component_path)?;
+        self.run_loaded(&loaded, event_json, cfg).await
     }
 
     pub async fn run_bytes(
@@ -120,8 +136,17 @@ impl IronRunner {
         event_json: &str,
         cfg: IronRunnerConfig,
     ) -> anyhow::Result<String> {
-        let component = Component::new(&self.engine, bytes).context("failed to load component bytes")?;
-        self.run_component(&component, event_json, cfg).await
+        let loaded = self.load_bytes(bytes)?;
+        self.run_loaded(&loaded, event_json, cfg).await
+    }
+
+    pub async fn run_loaded(
+        &self,
+        loaded: &IronLoadedWorkflow,
+        event_json: &str,
+        cfg: IronRunnerConfig,
+    ) -> anyhow::Result<String> {
+        self.run_component(&loaded.component, event_json, cfg).await
     }
 
     async fn run_component(

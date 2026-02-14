@@ -12,6 +12,6 @@ mod bundle;
 pub const IRON_WORKFLOW_WIT: &str = include_str!("../wit/workflow.wit");
 
 pub use manifest::IronWorkflowManifest;
-pub use runner::{IronRunner, IronRunnerConfig};
+pub use runner::{IronLoadedWorkflow, IronRunner, IronRunnerConfig};
 pub use tools::{IronToolHostConfig, IronToolResult};
 pub use bundle::{create_bundle_tar_gz, unpack_bundle_tar_gz};
