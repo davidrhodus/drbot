@@ -4,6 +4,8 @@
 //! The frontmatter contains `name`, `description`, and an optional `metadata` JSON5
 //! blob with OpenClaw-specific requirements and installer specs.
 
+#![allow(dead_code)] // Protocol-parity scaffolding isn't always referenced from this crate directly.
+
 use drbot_core::Config;
 use drbot_protocol::openclaw::{error_codes, ErrorShape};
 use futures::StreamExt;

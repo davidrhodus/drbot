@@ -3,7 +3,7 @@
 //! Supports standard cron format: minute hour day-of-month month day-of-week
 //! Also supports special strings like @hourly, @daily, @weekly, @monthly
 
-use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use std::collections::HashSet;
 
 /// A parsed cron expression.

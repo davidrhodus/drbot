@@ -3,13 +3,28 @@
 use async_trait::async_trait;
 use drbot_core::config::CliProviderConfig;
 use drbot_core::message::{Message, Role};
+use serde_json::json;
+use std::io::{BufRead, BufReader, Write};
 use std::pin::Pin;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use tokio_stream::Stream;
 
 use crate::{ChatOptions, ChatResponse, ModelInfo, Provider, StreamEvent, Usage};
 
 /// Default timeout for CLI execution in seconds.
 pub const CLI_DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliProtocol {
+    /// Plain text stdout; no structured parsing.
+    Text,
+    /// Claude Code `claude -p --output-format {json,stream-json}`.
+    ClaudeJson,
+    /// Codex `codex exec --json` JSONL events.
+    CodexJsonl,
+}
 
 /// A provider that wraps external CLI tools (e.g. `claude -p`, `codex exec`).
 pub struct CliProvider {
@@ -27,8 +42,8 @@ pub struct CliProvider {
     pub stdin_mode: bool,
     /// Timeout for CLI execution.
     pub timeout: std::time::Duration,
-    /// If true, add `--output-format json` and parse structured response (claude-cli).
-    pub json_output: bool,
+    /// Protocol used for stdout parsing / streaming flags.
+    pub protocol: CliProtocol,
 }
 
 impl CliProvider {
@@ -69,7 +84,7 @@ impl CliProvider {
             known_models,
             stdin_mode: false,
             timeout: std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS),
-            json_output: true,
+            protocol: CliProtocol::ClaudeJson,
         }
     }
 
@@ -94,7 +109,17 @@ impl CliProvider {
         ];
         Self {
             command: "codex".into(),
-            args: vec!["exec".into(), "--full-auto".into(), "-".into()],
+            // Safe, non-interactive defaults:
+            // - `-s read-only` prevents workspace modifications
+            // - `-a never` avoids approval prompts that would hang in a non-interactive wrapper
+            args: vec![
+                "-a".into(),
+                "never".into(),
+                "-s".into(),
+                "read-only".into(),
+                "exec".into(),
+                "-".into(),
+            ],
             model_flag: "-m".into(),
             default_model: "o3".into(),
             system_flag: None,
@@ -103,7 +128,59 @@ impl CliProvider {
             known_models,
             stdin_mode: true,
             timeout: std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS),
-            json_output: false,
+            protocol: CliProtocol::CodexJsonl,
+        }
+    }
+
+    /// Create a provider that wraps `codex exec` in local OSS mode (Ollama).
+    ///
+    /// This runs Codex against a local Ollama server instead of calling a hosted API.
+    pub fn codex_oss_ollama() -> Self {
+        let provider_name = "codex-oss".to_string();
+        let known_models = vec![
+            ModelInfo {
+                id: "llama3.1:8b".into(),
+                name: "llama3.1:8b (Ollama)".into(),
+                provider: provider_name.clone(),
+                context_window: 0,
+                max_output_tokens: None,
+            },
+            ModelInfo {
+                id: "qwen2.5-coder:7b".into(),
+                name: "qwen2.5-coder:7b (Ollama)".into(),
+                provider: provider_name.clone(),
+                context_window: 0,
+                max_output_tokens: None,
+            },
+        ];
+        Self {
+            command: "codex".into(),
+            // Safe, non-interactive defaults + local provider.
+            //
+            // Important: `codex exec` has its own `--oss` / `--local-provider` flags.
+            // Passing `--oss` at the top-level (before `exec`) can be ignored by `exec`
+            // depending on codex-cli version/config precedence. Put `--oss` *after* `exec`
+            // to ensure OSS mode is actually used.
+            args: vec![
+                "-a".into(),
+                "never".into(),
+                "-s".into(),
+                "read-only".into(),
+                "exec".into(),
+                "--oss".into(),
+                "--local-provider".into(),
+                "ollama".into(),
+                "-".into(),
+            ],
+            model_flag: "-m".into(),
+            default_model: "llama3.1:8b".into(),
+            system_flag: None,
+            provider_name,
+            send_history: false,
+            known_models,
+            stdin_mode: true,
+            timeout: std::time::Duration::from_secs(CLI_DEFAULT_TIMEOUT_SECS),
+            protocol: CliProtocol::CodexJsonl,
         }
     }
 
@@ -134,7 +211,11 @@ impl CliProvider {
             known_models,
             stdin_mode,
             timeout: std::time::Duration::from_secs(timeout_secs),
-            json_output: false,
+            protocol: match cfg.command.as_str() {
+                "claude" => CliProtocol::ClaudeJson,
+                "codex" => CliProtocol::CodexJsonl,
+                _ => CliProtocol::Text,
+            },
         }
     }
 
@@ -150,6 +231,10 @@ impl CliProvider {
             .unwrap_or_else(|| self.default_model.clone());
 
         let mut cmd = tokio::process::Command::new(&self.command);
+        if self.protocol == CliProtocol::CodexJsonl {
+            // Codex CLI is Rust-based and emits lots of diagnostics by default; keep stdout clean.
+            cmd.env("RUST_LOG", "off");
+        }
 
         // Add base args, but skip trailing "-" in stdin_mode (it's a sentinel, not a real arg
         // for some CLIs, but for codex it IS a real arg). Keep it.
@@ -159,25 +244,118 @@ impl CliProvider {
 
         cmd.arg(&self.model_flag).arg(&model);
 
+        let system_from_options = options
+            .system_prompt
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let system_from_messages = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.text_content())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let effective_system = system_from_options
+            .map(|s| s.to_string())
+            .or(system_from_messages);
+
         if let Some(ref flag) = self.system_flag {
-            if let Some(ref system) = options.system_prompt {
+            if let Some(system) = effective_system.as_deref() {
                 cmd.arg(flag).arg(system);
             }
         }
 
         let prompt = if self.send_history {
-            self.format_history(messages)
+            let mut out = String::new();
+
+            // If the CLI does not support a system prompt flag, embed it as a "System:" turn.
+            // When options.system_prompt is present, treat it as authoritative and don't duplicate
+            // any existing system messages from history.
+            let embed_system = self.system_flag.is_none();
+            if embed_system {
+                if let Some(sys) = system_from_options {
+                    out.push_str("System: ");
+                    out.push_str(sys);
+                    out.push('\n');
+                }
+            }
+
+            for msg in messages {
+                if msg.role == Role::System {
+                    if self.system_flag.is_some() {
+                        // System prompt is sent via flag; don't duplicate in history.
+                        continue;
+                    }
+                    if system_from_options.is_some() {
+                        // options.system_prompt was embedded above; don't duplicate system messages.
+                        continue;
+                    }
+                }
+
+                let prefix = match msg.role {
+                    Role::System => "System",
+                    Role::User => "User",
+                    Role::Assistant => "Assistant",
+                };
+                let text = msg.text_content();
+                if !text.is_empty() {
+                    out.push_str(prefix);
+                    out.push_str(": ");
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+
+            out
         } else {
-            messages
+            let last_user = messages
                 .iter()
                 .rev()
                 .find(|m| m.role == Role::User)
                 .map(|m| m.text_content())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if self.system_flag.is_none() {
+                if let Some(sys) = effective_system.as_deref() {
+                    format!("System: {}\n\nUser: {}", sys.trim(), last_user)
+                } else {
+                    last_user
+                }
+            } else {
+                last_user
+            }
         };
 
         if !self.stdin_mode {
             cmd.arg(&prompt);
+        }
+
+        (cmd, prompt)
+    }
+
+    /// Build the command and prompt text for streaming without executing.
+    /// Useful for testing stream-specific flags.
+    pub fn build_stream_command(
+        &self,
+        messages: &[Message],
+        options: &ChatOptions,
+    ) -> (tokio::process::Command, String) {
+        let (mut cmd, prompt) = self.build_command(messages, options);
+
+        match self.protocol {
+            CliProtocol::ClaudeJson => {
+                cmd.arg("--output-format").arg("stream-json");
+                cmd.arg("--include-partial-messages");
+                // Current `claude` CLI requires `--verbose` when using `-p/--print` with
+                // `--output-format=stream-json`.
+                if self.command == "claude" {
+                    cmd.arg("--verbose");
+                }
+            }
+            CliProtocol::CodexJsonl => {
+                cmd.arg("--json");
+            }
+            CliProtocol::Text => {}
         }
 
         (cmd, prompt)
@@ -227,6 +405,161 @@ impl CliProvider {
             Ok(output) if output.status.success() => Ok(()),
             _ => Err(drbot_core::Error::Provider(self.not_found_hint())),
         }
+    }
+
+    fn should_use_codex_app_server_models(&self) -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        if self.command != "codex" {
+            return false;
+        }
+        if self.protocol != CliProtocol::CodexJsonl {
+            return false;
+        }
+        if self.args.iter().any(|arg| arg == "--oss") {
+            return false;
+        }
+        if std::env::var("DRBOT_CODEX_MODEL_LIST")
+            .ok()
+            .is_some_and(|v| v == "static")
+        {
+            return false;
+        }
+        true
+    }
+
+    fn codex_app_server_models(&self) -> Option<Vec<ModelInfo>> {
+        if !self.should_use_codex_app_server_models() {
+            return None;
+        }
+
+        let mut cmd = Command::new(&self.command);
+        cmd.arg("app-server")
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+
+        let init = json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "drbot",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "optOutNotificationMethods": ["codex/event"]
+                }
+            }
+        });
+        let list = json!({
+            "id": 2,
+            "method": "model/list",
+            "params": { "limit": 200 }
+        });
+
+        if writeln!(stdin, "{}", init).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        if writeln!(stdin, "{}", list).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        drop(stdin);
+
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        let _ = tx.send(line);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut models: Option<Vec<ModelInfo>> = None;
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            match rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let id_matches = value
+                        .get("id")
+                        .and_then(|v| v.as_i64())
+                        .is_some_and(|v| v == 2)
+                        || value
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .is_some_and(|v| v == 2);
+                    if !id_matches {
+                        continue;
+                    }
+                    let Some(result) = value.get("result") else {
+                        break;
+                    };
+                    let Some(data) = result.get("data").and_then(|v| v.as_array()) else {
+                        break;
+                    };
+
+                    let mut seen = std::collections::HashSet::new();
+                    let mut out = Vec::new();
+                    for item in data {
+                        let model_id = item
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item.get("id").and_then(|v| v.as_str()));
+                        let Some(model_id) = model_id else {
+                            continue;
+                        };
+                        if !seen.insert(model_id.to_string()) {
+                            continue;
+                        }
+                        let name = item
+                            .get("displayName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(model_id);
+                        out.push(ModelInfo {
+                            id: model_id.to_string(),
+                            name: name.to_string(),
+                            provider: self.provider_name.clone(),
+                            context_window: 0,
+                            max_output_tokens: None,
+                        });
+                    }
+
+                    if !out.is_empty() {
+                        models = Some(out);
+                    }
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        models
     }
 
     /// Parse JSON output from `claude -p --output-format json`.
@@ -297,6 +630,69 @@ impl CliProvider {
             tool_uses: vec![],
         })
     }
+
+    pub fn parse_codex_jsonl_output(
+        &self,
+        raw: &str,
+        fallback_model: &str,
+    ) -> drbot_core::Result<ChatResponse> {
+        let mut content: Option<String> = None;
+        let mut usage: Option<Usage> = None;
+
+        for line in raw.lines() {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+
+            let ev = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match ev {
+                "item.completed" => {
+                    let item_type = json
+                        .get("item")
+                        .and_then(|i| i.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if item_type == "agent_message" {
+                        if let Some(text) = json
+                            .get("item")
+                            .and_then(|i| i.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            content = Some(text.to_string());
+                        }
+                    }
+                }
+                "turn.completed" => {
+                    usage = json.get("usage").and_then(|u| {
+                        let input =
+                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let output =
+                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        if input > 0 || output > 0 {
+                            Some(Usage {
+                                input_tokens: input,
+                                output_tokens: output,
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                }
+                // Best-effort: keep going for other events.
+                _ => {}
+            }
+        }
+
+        let content = content.unwrap_or_else(|| raw.trim_end().to_string());
+
+        Ok(ChatResponse {
+            content,
+            model: fallback_model.to_string(),
+            usage,
+            stop_reason: Some("end_turn".into()),
+            tool_uses: vec![],
+        })
+    }
 }
 
 #[async_trait]
@@ -312,9 +708,15 @@ impl Provider for CliProvider {
             .unwrap_or_else(|| self.default_model.clone());
         let (mut cmd, prompt) = self.build_command(messages, &options);
 
-        // For chat(), use JSON output format to get structured response with usage stats
-        if self.json_output {
-            cmd.arg("--output-format").arg("json");
+        match self.protocol {
+            CliProtocol::ClaudeJson => {
+                // For chat(), use JSON output format to get structured response with usage stats
+                cmd.arg("--output-format").arg("json");
+            }
+            CliProtocol::CodexJsonl => {
+                cmd.arg("--json");
+            }
+            CliProtocol::Text => {}
         }
 
         if self.stdin_mode {
@@ -388,18 +790,20 @@ impl Provider for CliProvider {
             )));
         }
 
-        let raw_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let raw_stdout = String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string();
 
-        if self.json_output {
-            self.parse_json_output(&raw_stdout, &model)
-        } else {
-            Ok(ChatResponse {
+        match self.protocol {
+            CliProtocol::ClaudeJson => self.parse_json_output(&raw_stdout, &model),
+            CliProtocol::CodexJsonl => self.parse_codex_jsonl_output(&raw_stdout, &model),
+            CliProtocol::Text => Ok(ChatResponse {
                 content: raw_stdout,
                 model,
                 usage: None,
                 stop_reason: Some("end_turn".into()),
                 tool_uses: vec![],
-            })
+            }),
         }
     }
 
@@ -412,14 +816,8 @@ impl Provider for CliProvider {
             .model
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
-        let (mut cmd, prompt) = self.build_command(messages, &options);
-
-        // For streaming with JSON-capable CLIs, use stream-json for incremental deltas + usage
-        let json_stream = self.json_output;
-        if json_stream {
-            cmd.arg("--output-format").arg("stream-json");
-            cmd.arg("--include-partial-messages");
-        }
+        let (mut cmd, prompt) = self.build_stream_command(messages, &options);
+        let protocol = self.protocol;
 
         if self.stdin_mode {
             cmd.stdin(std::process::Stdio::piped());
@@ -489,37 +887,100 @@ impl Provider for CliProvider {
                 let line_result = tokio::time::timeout_at(deadline, stdout_lines.next_line()).await;
                 match line_result {
                     Ok(Ok(Some(line))) => {
-                        if json_stream {
-                            // Parse NDJSON line
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                match msg_type {
-                                    "system" => {
-                                        // Init message — extract model if available
-                                        let m = json.get("model")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or(&model)
-                                            .to_string();
-                                        if !started {
-                                            started = true;
-                                            yield StreamEvent::Start { model: m };
+                        match protocol {
+                            CliProtocol::ClaudeJson => {
+                                // Parse NDJSON line
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                    let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    match msg_type {
+                                        "system" => {
+                                            // Init message — extract model if available
+                                            let m = json.get("model")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or(&model)
+                                                .to_string();
+                                            if !started {
+                                                started = true;
+                                                yield StreamEvent::Start { model: m };
+                                            }
                                         }
-                                    }
-                                    "stream_event" => {
-                                        if !started {
-                                            started = true;
-                                            yield StreamEvent::Start { model: model.clone() };
-                                        }
-                                        // Extract text delta: event.delta.text
-                                        if let Some(event) = json.get("event") {
-                                            let delta_type = event
-                                                .get("delta")
-                                                .and_then(|d| d.get("type"))
-                                                .and_then(|v| v.as_str());
-                                            if delta_type == Some("text_delta") {
-                                                if let Some(text) = event
+                                        "stream_event" => {
+                                            if !started {
+                                                started = true;
+                                                yield StreamEvent::Start { model: model.clone() };
+                                            }
+                                            // Extract text delta: event.delta.text
+                                            if let Some(event) = json.get("event") {
+                                                let delta_type = event
                                                     .get("delta")
-                                                    .and_then(|d| d.get("text"))
+                                                    .and_then(|d| d.get("type"))
+                                                    .and_then(|v| v.as_str());
+                                                if delta_type == Some("text_delta") {
+                                                    if let Some(text) = event
+                                                        .get("delta")
+                                                        .and_then(|d| d.get("text"))
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        if !text.is_empty() {
+                                                            yield StreamEvent::Delta { content: text.to_string() };
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "result" => {
+                                            _got_result = true;
+                                            // Extract usage from result
+                                            final_usage = json.get("usage").and_then(|u| {
+                                                let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                if input > 0 || output > 0 {
+                                                    Some(Usage { input_tokens: input, output_tokens: output })
+                                                } else {
+                                                    None
+                                                }
+                                            });
+
+                                            if let Some(cost) = json.get("total_cost_usd").and_then(|v| v.as_f64()) {
+                                                tracing::info!("{} cost: ${:.6}", command_name, cost);
+                                            }
+
+                                            let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            if is_error {
+                                                let err_msg = json.get("result").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                                                yield StreamEvent::Error { message: format!("{}: {}", command_name, err_msg) };
+                                            }
+                                        }
+                                        // "assistant", "user" — skip, we get content from stream_event deltas
+                                        _ => {}
+                                    }
+                                }
+                                // Silently skip lines that aren't valid JSON
+                            }
+                            CliProtocol::CodexJsonl => {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                    let ev = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    match ev {
+                                        "thread.started" | "turn.started" => {
+                                            if !started {
+                                                started = true;
+                                                yield StreamEvent::Start { model: model.clone() };
+                                            }
+                                        }
+                                        "item.completed" => {
+                                            if !started {
+                                                started = true;
+                                                yield StreamEvent::Start { model: model.clone() };
+                                            }
+                                            let item_type = json
+                                                .get("item")
+                                                .and_then(|i| i.get("type"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if item_type == "agent_message" {
+                                                if let Some(text) = json
+                                                    .get("item")
+                                                    .and_then(|i| i.get("text"))
                                                     .and_then(|v| v.as_str())
                                                 {
                                                     if !text.is_empty() {
@@ -528,47 +989,35 @@ impl Provider for CliProvider {
                                                 }
                                             }
                                         }
-                                    }
-                                    "result" => {
-                                        _got_result = true;
-                                        // Extract usage from result
-                                        final_usage = json.get("usage").and_then(|u| {
-                                            let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                            let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                            if input > 0 || output > 0 {
-                                                Some(Usage { input_tokens: input, output_tokens: output })
-                                            } else {
-                                                None
-                                            }
-                                        });
-
-                                        if let Some(cost) = json.get("total_cost_usd").and_then(|v| v.as_f64()) {
-                                            tracing::info!("{} cost: ${:.6}", command_name, cost);
+                                        "turn.completed" => {
+                                            _got_result = true;
+                                            final_usage = json.get("usage").and_then(|u| {
+                                                let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                if input > 0 || output > 0 {
+                                                    Some(Usage { input_tokens: input, output_tokens: output })
+                                                } else {
+                                                    None
+                                                }
+                                            });
                                         }
-
-                                        let is_error = json.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                                        if is_error {
-                                            let err_msg = json.get("result").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                                            yield StreamEvent::Error { message: format!("{}: {}", command_name, err_msg) };
-                                        }
+                                        _ => {}
                                     }
-                                    // "assistant", "user" — skip, we get content from stream_event deltas
-                                    _ => {}
                                 }
                             }
-                            // Silently skip lines that aren't valid JSON
-                        } else {
-                            // Plain text mode
-                            if !started {
-                                started = true;
-                                yield StreamEvent::Start { model: model.clone() };
+                            CliProtocol::Text => {
+                                // Plain text mode
+                                if !started {
+                                    started = true;
+                                    yield StreamEvent::Start { model: model.clone() };
+                                }
+                                if first_text_line {
+                                    first_text_line = false;
+                                } else {
+                                    yield StreamEvent::Delta { content: "\n".into() };
+                                }
+                                yield StreamEvent::Delta { content: line };
                             }
-                            if first_text_line {
-                                first_text_line = false;
-                            } else {
-                                yield StreamEvent::Delta { content: "\n".into() };
-                            }
-                            yield StreamEvent::Delta { content: line };
                         }
                     }
                     Ok(Ok(None)) => break, // EOF
@@ -594,23 +1043,31 @@ impl Provider for CliProvider {
                 yield StreamEvent::Start { model: model.clone() };
             }
 
-            // Emit stderr lines as errors
-            if let Some(handle) = stderr_handle {
-                if let Ok(stderr_lines) = handle.await {
+            let status = if timed_out {
+                let _ = child.wait().await;
+                None
+            } else {
+                child.wait().await.ok()
+            };
+
+            let stderr_lines: Vec<String> = match stderr_handle {
+                Some(handle) => match handle.await {
+                    Ok(lines) => lines,
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+
+            if let Some(exit) = status {
+                if exit.success() {
+                    for line in stderr_lines {
+                        tracing::warn!("{} stderr: {}", command_name, line);
+                    }
+                } else {
                     for line in stderr_lines {
                         yield StreamEvent::Error { message: format!("{} stderr: {}", command_name, line) };
                     }
-                }
-            }
-
-            if !timed_out {
-                let status = child.wait().await;
-                if let Ok(exit) = &status {
-                    if !exit.success() {
-                        yield StreamEvent::Error {
-                            message: format!("{} exited with {}", command_name, exit),
-                        };
-                    }
+                    yield StreamEvent::Error { message: format!("{} exited with {}", command_name, exit) };
                 }
             }
 
@@ -622,6 +1079,9 @@ impl Provider for CliProvider {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
+        if let Some(models) = self.codex_app_server_models() {
+            return models;
+        }
         self.known_models.clone()
     }
 
@@ -654,6 +1114,95 @@ mod tests {
         assert_eq!(prog, "claude");
         assert_eq!(args, vec!["-p", "--model", "sonnet", "What is 2+2?"]);
         assert_eq!(prompt, "What is 2+2?");
+    }
+
+    #[test]
+    fn claude_cli_stream_command_includes_verbose() {
+        let provider = CliProvider::claude_cli();
+        let messages = vec![Message::user("Ping")];
+        let options = ChatOptions::default();
+
+        let (cmd, _prompt) = provider.build_stream_command(&messages, &options);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--model",
+                "sonnet",
+                "Ping",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "--verbose"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_cli_stream_command_includes_json_flag() {
+        let provider = CliProvider::codex_cli();
+        let messages = vec![Message::user("Ping")];
+        let options = ChatOptions::default();
+
+        let (cmd, _prompt) = provider.build_stream_command(&messages, &options);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-a",
+                "never",
+                "-s",
+                "read-only",
+                "exec",
+                "-",
+                "-m",
+                "o3",
+                "--json"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_oss_stream_command_includes_oss_flags_and_json() {
+        let provider = CliProvider::codex_oss_ollama();
+        let messages = vec![Message::user("Ping")];
+        let options = ChatOptions::default();
+
+        let (cmd, _prompt) = provider.build_stream_command(&messages, &options);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-a",
+                "never",
+                "-s",
+                "read-only",
+                "exec",
+                "--oss",
+                "--local-provider",
+                "ollama",
+                "-",
+                "-m",
+                "llama3.1:8b",
+                "--json"
+            ]
+        );
     }
 
     #[test]
@@ -722,7 +1271,10 @@ mod tests {
 
         // In stdin_mode, the prompt is NOT appended as an arg
         assert_eq!(prog, "codex");
-        assert_eq!(args, vec!["exec", "--full-auto", "-", "-m", "o3"]);
+        assert_eq!(
+            args,
+            vec!["-a", "never", "-s", "read-only", "exec", "-", "-m", "o3"]
+        );
         assert_eq!(prompt, "Fix the bug");
     }
 
@@ -735,7 +1287,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (cmd, _prompt) = provider.build_command(&messages, &options);
+        let (cmd, prompt) = provider.build_command(&messages, &options);
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -745,6 +1297,10 @@ mod tests {
         // system_flag is None, so --system-prompt should NOT appear
         assert!(!args.contains(&"--system-prompt".to_string()));
         assert!(!args.contains(&"Be helpful".to_string()));
+
+        // But the system prompt should be embedded into the prompt text.
+        assert!(prompt.contains("System: Be helpful"));
+        assert!(prompt.contains("User: Hello"));
     }
 
     #[test]
@@ -997,7 +1553,7 @@ mod tests {
         provider.default_model = String::new();
         provider.system_flag = None;
         provider.stdin_mode = false;
-        provider.json_output = false; // plain text output for this test
+        provider.protocol = CliProtocol::Text; // plain text output for this test
 
         let messages = vec![Message::user("ignored")];
         let options = ChatOptions::default();
@@ -1009,7 +1565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_stderr_emitted_as_error_events() {
+    async fn stream_stderr_ignored_on_success() {
         let mut provider = CliProvider::claude_cli();
         provider.command = "bash".into();
         provider.args = vec![
@@ -1020,7 +1576,7 @@ mod tests {
         provider.default_model = String::new();
         provider.system_flag = None;
         provider.stdin_mode = false;
-        provider.json_output = false;
+        provider.protocol = CliProtocol::Text;
 
         let messages = vec![Message::user("ignored")];
         let options = ChatOptions::default();
@@ -1036,19 +1592,23 @@ mod tests {
         let has_stderr = events.iter().any(
             |e| matches!(e, StreamEvent::Error { message } if message.contains("stderr warning")),
         );
-        assert!(has_stderr, "expected stderr error event, got: {:?}", events);
+        assert!(
+            !has_stderr,
+            "did not expect stderr to be surfaced as error on success, got: {:?}",
+            events
+        );
     }
 
     #[test]
     fn claude_cli_has_json_output() {
         let provider = CliProvider::claude_cli();
-        assert!(provider.json_output);
+        assert_eq!(provider.protocol, CliProtocol::ClaudeJson);
     }
 
     #[test]
     fn codex_cli_no_json_output() {
         let provider = CliProvider::codex_cli();
-        assert!(!provider.json_output);
+        assert_eq!(provider.protocol, CliProtocol::CodexJsonl);
     }
 
     #[test]
@@ -1277,6 +1837,7 @@ mod tests {
         provider.default_model = "test".into();
         provider.system_flag = None;
         provider.stdin_mode = true;
+        provider.protocol = CliProtocol::Text;
 
         let messages = vec![Message::user("test")];
         let options = ChatOptions::default();
@@ -1297,6 +1858,76 @@ mod tests {
             .find(|e| matches!(e, StreamEvent::Stop { .. }));
         if let Some(StreamEvent::Stop { usage, .. }) = stop {
             assert!(usage.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_codex_jsonl_parses_agent_message_and_usage() {
+        let mut provider = CliProvider::codex_cli();
+        provider.command = "bash".into();
+        provider.args = vec!["-c".into(), concat!(
+            r#"echo '{"type":"thread.started","thread_id":"t"}'"#, " && ",
+            r#"echo '{"type":"turn.started"}'"#, " && ",
+            r#"echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello!"}}'"#, " && ",
+            r#"echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'"#
+        ).into()];
+        provider.model_flag = String::new();
+        provider.system_flag = None;
+        provider.stdin_mode = true;
+
+        let messages = vec![Message::user("ignored")];
+        let options = ChatOptions::default();
+        let resp = provider.chat(&messages, options).await.unwrap();
+
+        assert_eq!(resp.content, "Hello!");
+        assert_eq!(resp.model, "o3");
+        let u = resp.usage.unwrap();
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_codex_jsonl_parses_agent_message_and_usage() {
+        let mut provider = CliProvider::codex_cli();
+        provider.command = "bash".into();
+        provider.args = vec!["-c".into(), concat!(
+            r#"echo '{"type":"thread.started","thread_id":"t"}'"#, " && ",
+            r#"echo '{"type":"turn.started"}'"#, " && ",
+            r#"echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello!"}}'"#, " && ",
+            r#"echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'"#
+        ).into()];
+        provider.model_flag = String::new();
+        provider.system_flag = None;
+        provider.stdin_mode = true;
+
+        let messages = vec![Message::user("ignored")];
+        let options = ChatOptions::default();
+        let stream = provider.stream(&messages, options).await.unwrap();
+        let events: Vec<StreamEvent> = stream.collect().await;
+
+        let start = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Start { .. }));
+        assert!(start.is_some(), "expected Start event, got: {:?}", events);
+
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Hello!"]);
+
+        let stop = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Stop { .. }));
+        assert!(stop.is_some(), "expected Stop event, got: {:?}", events);
+        if let Some(StreamEvent::Stop { usage, reason, .. }) = stop {
+            assert_eq!(reason, "end_turn");
+            let u = usage.as_ref().expect("expected usage in Stop event");
+            assert_eq!(u.input_tokens, 10);
+            assert_eq!(u.output_tokens, 5);
         }
     }
 }

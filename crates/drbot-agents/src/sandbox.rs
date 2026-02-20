@@ -2,11 +2,10 @@
 
 use crate::{AgentError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 /// Sandbox configuration.
 #[derive(Debug, Clone)]
@@ -215,11 +214,13 @@ impl Default for Sandbox {
 }
 
 /// Docker-based sandbox for stronger isolation.
+#[allow(dead_code)] // Optional implementation; not currently wired into the agent runtime.
 pub struct DockerSandbox {
     config: SandboxConfig,
     image: String,
 }
 
+#[allow(dead_code)]
 impl DockerSandbox {
     /// Create a new Docker sandbox.
     pub fn new(config: SandboxConfig, image: &str) -> Self {
@@ -316,10 +317,12 @@ impl DockerSandbox {
 }
 
 /// WASM-based sandbox for even stronger isolation.
+#[allow(dead_code)] // Optional implementation; not currently wired into the agent runtime.
 pub struct WasmSandbox {
     config: SandboxConfig,
 }
 
+#[allow(dead_code)]
 impl WasmSandbox {
     /// Create a new WASM sandbox.
     pub fn new(config: SandboxConfig) -> Self {
@@ -329,9 +332,9 @@ impl WasmSandbox {
     /// Execute WASM module.
     pub async fn execute_wasm(
         &self,
-        wasm_bytes: &[u8],
-        function: &str,
-        args: &[&str],
+        _wasm_bytes: &[u8],
+        _function: &str,
+        _args: &[&str],
     ) -> Result<SandboxResult> {
         // This would use wasmtime or wasmer to execute WASM
         // Placeholder implementation

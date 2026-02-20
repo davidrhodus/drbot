@@ -5,6 +5,8 @@
 //!
 //! Endpoint: `/openclaw/ws`
 
+#![allow(dead_code)] // Protocol-parity scaffolding isn't always referenced from this crate directly.
+
 use crate::openclaw_exec_approvals::ExecApprovalRequestPayload;
 use crate::openclaw_system::SystemPresencePayload;
 use crate::state::{GatewayState, OpenclawClient, OpenclawOutbound};
@@ -19,6 +21,7 @@ use drbot_base64_util::Base64Config;
 use drbot_browser::{
     Browser, BrowserAutomation, BrowserOptions, Page, ScreenshotFormat, ScreenshotOptions, Viewport,
 };
+use drbot_core::config::AutonomyMode;
 use drbot_core::message::{Content, ImageSource, Message, OutgoingMessage, Role};
 use drbot_protocol::openclaw::{
     error_codes, ConnectParams, ErrorShape, EventFrame, GatewayFrame, HelloFeatures, HelloOk,
@@ -45,6 +48,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 const DEFAULT_TICK_INTERVAL_MS: u64 = 30_000;
@@ -272,6 +276,11 @@ impl WizardSessionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WizardStepKey {
     Intro,
+    RepairIntro,
+    MigrateIntro,
+    MigrateSourceDir,
+    MigrateConfirm,
+    MigrateResult,
     RiskNotice,
     RiskConfirm,
     GatewayAuthMode,
@@ -279,6 +288,12 @@ enum WizardStepKey {
     GatewayBindHost,
     GatewayBindHostCustom,
     GatewayPort,
+    GatewayPairingRequired,
+    GatewayPairingAllowLocal,
+    AssistantAutonomy,
+    AssistantWorkspaceAllowlist,
+    AssistantToolAllowlist,
+    AssistantToolDenylist,
     ProviderSelect,
     ProviderApiKey,
     ProviderDefaultModel,
@@ -303,6 +318,26 @@ enum WizardStepKey {
     ChannelWebChatAuthToken,
     ConfirmWrite,
     Outro,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardMode {
+    Full,
+    ChannelsRepair,
+    Migration,
+}
+
+impl WizardMode {
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" | "default" => Some(WizardMode::Full),
+            "channels" | "repair" | "channels-only" | "channels_only" | "channels-repair" => {
+                Some(WizardMode::ChannelsRepair)
+            }
+            "migrate" | "migration" | "import" => Some(WizardMode::Migration),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +369,7 @@ enum WizardBindChoice {
 struct WizardSessionState {
     status: WizardSessionStatus,
     error: Option<String>,
+    mode: WizardMode,
     step: WizardStepKey,
     current_step_id: String,
     current_step: serde_json::Value,
@@ -348,6 +384,14 @@ struct WizardSessionState {
     bind_choice: WizardBindChoice,
     host: String,
     port: u16,
+    pairing_required: bool,
+    pairing_allow_local: bool,
+
+    assistant_autonomy: AutonomyMode,
+    assistant_workspace_allowlist: Vec<String>,
+    assistant_tool_allowlist: Vec<String>,
+    assistant_tool_denylist: Vec<String>,
+    assistant_use_camel_case: bool,
 
     provider_configured: bool,
     provider_suggestion: Option<String>,
@@ -384,6 +428,10 @@ struct WizardSessionState {
     webchat_port: u16,
     webchat_require_auth: bool,
     webchat_auth_token: Option<String>,
+
+    migrate_source_dir: String,
+    migrate_target_dir: String,
+    migrate_summary: Option<String>,
 
     wrote: bool,
 }
@@ -433,6 +481,39 @@ fn wizard_value_to_string_vec(value: &serde_json::Value) -> Vec<String> {
             }
         }
         _ => Vec::new(),
+    }
+}
+
+fn wizard_parse_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn wizard_join_csv(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn wizard_autonomy_to_str(mode: AutonomyMode) -> &'static str {
+    match mode {
+        AutonomyMode::ReadOnly => "read-only",
+        AutonomyMode::Supervised => "supervised",
+        AutonomyMode::Full => "full",
+    }
+}
+
+fn wizard_parse_autonomy_mode(raw: &str) -> Option<AutonomyMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "read" | "readonly" | "read-only" | "read_only" => Some(AutonomyMode::ReadOnly),
+        "supervised" | "supervise" | "super" => Some(AutonomyMode::Supervised),
+        "full" => Some(AutonomyMode::Full),
+        _ => None,
     }
 }
 
@@ -590,6 +671,171 @@ fn wizard_format_internal_error(err: ErrorShape) -> String {
     msg
 }
 
+fn migrate_openclaw_state_from_dir(
+    state: &GatewayState,
+    source_dir: &PathBuf,
+) -> Result<String, ErrorShape> {
+    let target_dir = resolve_openclaw_state_dir(state).ok_or_else(|| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            "openclaw state dir not available",
+        )
+    })?;
+    let source_dir = canonicalize_policy_path(source_dir.as_path()).ok_or_else(|| {
+        ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "invalid openclaw state dir",
+        )
+    })?;
+    if !source_dir.exists() || !source_dir.is_dir() {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "openclaw state dir does not exist",
+        ));
+    }
+    let target_dir = canonicalize_policy_path(target_dir.as_path()).unwrap_or(target_dir);
+    if source_dir == target_dir {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "source and target state dirs are the same",
+        ));
+    }
+
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to create target dir: {}", e),
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&target_dir).map_err(|e| {
+        ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to create target dir: {}", e),
+        )
+    })?;
+
+    let mut copied: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    fn copy_file(
+        rel: &str,
+        source_dir: &PathBuf,
+        target_dir: &PathBuf,
+        copied: &mut Vec<String>,
+        skipped: &mut Vec<String>,
+        errors: &mut Vec<String>,
+    ) {
+        let src = source_dir.join(rel);
+        if !src.exists() {
+            skipped.push(rel.to_string());
+            return;
+        }
+        let dst = target_dir.join(rel);
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                errors.push(format!("{}: {}", rel, e));
+                return;
+            }
+        }
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => copied.push(rel.to_string()),
+            Err(e) => errors.push(format!("{}: {}", rel, e)),
+        }
+    }
+
+    fn copy_dir_recursive(
+        src: &PathBuf,
+        dst: &PathBuf,
+        prefix: &str,
+        copied: &mut Vec<String>,
+        errors: &mut Vec<String>,
+    ) {
+        if let Err(e) = std::fs::create_dir_all(dst) {
+            errors.push(format!("{}: {}", prefix, e));
+            return;
+        }
+        let entries = match std::fs::read_dir(src) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(format!("{}: {}", prefix, e));
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            if path.is_dir() {
+                copy_dir_recursive(
+                    &path,
+                    &dst.join(&name),
+                    &rel,
+                    copied,
+                    errors,
+                );
+            } else if path.is_file() {
+                if let Err(e) = std::fs::copy(&path, dst.join(&name)) {
+                    errors.push(format!("{}: {}", rel, e));
+                } else {
+                    copied.push(rel);
+                }
+            }
+        }
+    }
+
+    let file_list = [
+        "agents.json",
+        "openclaw_tools.json",
+        "openclaw_memory.json",
+        "tool-policy.json",
+        "exec_approvals.json",
+        "cron.json",
+        "nodes/paired.json",
+        "devices/paired.json",
+    ];
+
+    for rel in file_list {
+        copy_file(rel, &source_dir, &target_dir, &mut copied, &mut skipped, &mut errors);
+    }
+
+    let skills_src = source_dir.join("skills");
+    if skills_src.exists() && skills_src.is_dir() {
+        copy_dir_recursive(
+            &skills_src,
+            &target_dir.join("skills"),
+            "skills",
+            &mut copied,
+            &mut errors,
+        );
+    } else {
+        skipped.push("skills/".to_string());
+    }
+
+    let mut summary = String::new();
+    summary.push_str(&format!(
+        "Imported OpenClaw state from:\n{}\n\nto:\n{}\n\n",
+        source_dir.to_string_lossy(),
+        target_dir.to_string_lossy()
+    ));
+    summary.push_str(&format!("Copied: {}\n", copied.len()));
+    summary.push_str(&format!("Skipped: {}\n", skipped.len()));
+    summary.push_str(&format!("Errors: {}\n", errors.len()));
+    if !errors.is_empty() {
+        let list = errors.iter().take(8).cloned().collect::<Vec<_>>().join("\n- ");
+        summary.push_str("\nErrors (first 8):\n- ");
+        summary.push_str(&list);
+    }
+
+    Ok(summary)
+}
+
 fn wizard_enabled_has(enabled: &[String], name: &str) -> bool {
     let name = name.trim();
     if name.is_empty() {
@@ -657,6 +903,34 @@ fn wizard_advance_channel_steps(session: &mut WizardSessionState, steps: usize) 
 
 fn wizard_make_step_for_session(session: &mut WizardSessionState) {
     let (id, step) = match session.step {
+        WizardStepKey::RepairIntro => wizard_note_step(
+            "Channel repair",
+            "This wizard will help you reconfigure channel credentials and re-enable channels.\n\nIt only touches channel settings.",
+        ),
+        WizardStepKey::MigrateIntro => wizard_note_step(
+            "OpenClaw import",
+            "Import OpenClaw state (agents/tools/memory/skills) into drbot.\n\nThis copies files into the drbot OpenClaw state directory and can overwrite existing files.",
+        ),
+        WizardStepKey::MigrateSourceDir => wizard_text_step(
+            "OpenClaw state directory to import",
+            Some(json!(session.migrate_source_dir.clone())),
+            Some("e.g. ~/.openclaw"),
+            false,
+        ),
+        WizardStepKey::MigrateConfirm => wizard_confirm_step(
+            &format!(
+                "Import OpenClaw state from {} into {} now?",
+                session.migrate_source_dir, session.migrate_target_dir
+            ),
+            false,
+        ),
+        WizardStepKey::MigrateResult => {
+            let message = session
+                .migrate_summary
+                .as_deref()
+                .unwrap_or("No migration summary available.");
+            wizard_note_step("Import summary", message)
+        }
         WizardStepKey::Intro => wizard_note_step(
             "drbot setup",
             "This wizard can configure basic Gateway settings (auth token + host/port), optionally configure a default AI provider, and optionally enable channels.\n\nFor advanced settings, use the Config tab (config.get/config.patch).",
@@ -744,6 +1018,53 @@ fn wizard_make_step_for_session(session: &mut WizardSessionState) {
             Some("1-65535"),
             false,
         ),
+        WizardStepKey::GatewayPairingRequired => wizard_confirm_step(
+            "Require pairing for non-local OpenClaw operator connections?",
+            session.pairing_required,
+        ),
+        WizardStepKey::GatewayPairingAllowLocal => wizard_confirm_step(
+            "Allow local (loopback) operator connections without pairing?",
+            session.pairing_allow_local,
+        ),
+        WizardStepKey::AssistantAutonomy => {
+            let options = vec![
+                json!({
+                    "value": "read-only",
+                    "label": "Read-only",
+                    "hint": "Tools may read but never write or execute.",
+                }),
+                json!({
+                    "value": "supervised",
+                    "label": "Supervised",
+                    "hint": "Sensitive tools require approval.",
+                }),
+                json!({
+                    "value": "full",
+                    "label": "Full autonomy",
+                    "hint": "Allow tools based on tool policy without extra prompts.",
+                }),
+            ];
+            let initial = wizard_autonomy_to_str(session.assistant_autonomy);
+            wizard_select_step("Assistant autonomy", options, Some(json!(initial)))
+        }
+        WizardStepKey::AssistantWorkspaceAllowlist => wizard_text_step(
+            "Workspace allowlist (comma-separated paths). Leave blank to allow any.",
+            Some(json!(wizard_join_csv(&session.assistant_workspace_allowlist))),
+            Some("e.g. ~/projects,/srv/bots"),
+            false,
+        ),
+        WizardStepKey::AssistantToolAllowlist => wizard_text_step(
+            "Tool allowlist (comma-separated patterns). Leave blank to allow all.",
+            Some(json!(wizard_join_csv(&session.assistant_tool_allowlist))),
+            Some("e.g. read*,list*,search,web_fetch"),
+            false,
+        ),
+        WizardStepKey::AssistantToolDenylist => wizard_text_step(
+            "Tool denylist (comma-separated patterns). Leave blank to deny none.",
+            Some(json!(wizard_join_csv(&session.assistant_tool_denylist))),
+            Some("e.g. exec,bash,http"),
+            false,
+        ),
         WizardStepKey::ProviderSelect => {
             let options = vec![
                 json!({
@@ -789,16 +1110,30 @@ fn wizard_make_step_for_session(session: &mut WizardSessionState) {
             Some("e.g. gpt-4o / claude-sonnet-4-20250514"),
             false,
         ),
-        WizardStepKey::ConfirmWrite => wizard_confirm_step(
-            &format!(
-                "Write these settings to {} now? (Restart drbot after applying.)",
-                session.config_path
-            ),
-            true,
-        ),
+        WizardStepKey::ConfirmWrite => {
+            let message = if matches!(session.mode, WizardMode::ChannelsRepair) {
+                format!(
+                    "Write these channel settings to {} now? (No restart required.)",
+                    session.config_path
+                )
+            } else {
+                format!(
+                    "Write these settings to {} now? (Restart drbot after applying.)",
+                    session.config_path
+                )
+            };
+            wizard_confirm_step(&message, true)
+        }
         WizardStepKey::Outro => {
             let mut message = String::new();
-            if session.wrote {
+            if matches!(session.mode, WizardMode::ChannelsRepair) {
+                if session.wrote {
+                    message.push_str("Channel settings updated.\n\n");
+                    message.push_str("No gateway settings were changed.");
+                } else {
+                    message.push_str("No changes were written.\n\nYou can configure channels via the Config tab.");
+                }
+            } else if session.wrote {
                 message.push_str("Config updated.\n\n");
                 if session.auth_choice == WizardAuthChoice::New {
                     if let Some(token) = session.auth_token.as_deref() {
@@ -1020,7 +1355,11 @@ fn wizard_make_step_for_session(session: &mut WizardSessionState) {
     session.current_step = step;
 }
 
-fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSessionState {
+fn wizard_session_from_config_snapshot(
+    state: &GatewayState,
+    snapshot: &serde_json::Value,
+    mode: WizardMode,
+) -> WizardSessionState {
     let config_path = snapshot
         .get("path")
         .and_then(|v| v.as_str())
@@ -1059,6 +1398,66 @@ fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSe
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    let pairing_required = gateway
+        .and_then(|g| g.get("pairing_required"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pairing_allow_local = gateway
+        .and_then(|g| g.get("pairing_allow_local"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let assistant = cfg.get("assistant").and_then(|v| v.as_object());
+    let assistant_use_camel_case = assistant
+        .map(|a| {
+            a.contains_key("autonomyMode")
+                || a.contains_key("workspaceAllowlist")
+                || a.contains_key("toolAllowlist")
+                || a.contains_key("toolDenylist")
+        })
+        .unwrap_or(false);
+    let assistant_get = |camel: &str, snake: &str| -> Option<&serde_json::Value> {
+        let obj = assistant?;
+        if assistant_use_camel_case {
+            obj.get(camel).or_else(|| obj.get(snake))
+        } else {
+            obj.get(snake).or_else(|| obj.get(camel))
+        }
+    };
+    let assistant_autonomy = assistant_get("autonomyMode", "autonomy_mode")
+        .and_then(|v| v.as_str())
+        .and_then(wizard_parse_autonomy_mode)
+        .unwrap_or_default();
+    let assistant_workspace_allowlist = assistant_get("workspaceAllowlist", "workspace_allowlist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let assistant_tool_allowlist = assistant_get("toolAllowlist", "tool_allowlist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let assistant_tool_denylist = assistant_get("toolDenylist", "tool_denylist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     let providers = cfg.get("providers").and_then(|v| v.as_object());
     let provider_configured = providers
@@ -1210,14 +1609,36 @@ fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSe
 
     let auth_choice = if existing_has_token {
         WizardAuthChoice::Keep
+    } else if matches!(mode, WizardMode::ChannelsRepair) {
+        WizardAuthChoice::Disable
     } else {
         WizardAuthChoice::New
     };
     let bind_choice = wizard_bind_choice_for_host(&host);
 
+    let migrate_source_dir = std::env::var("OPENCLAW_STATE_DIR")
+        .ok()
+        .or_else(|| std::env::var("CLAWDBOT_STATE_DIR").ok())
+        .or_else(|| std::env::var("OPENCLAW_HOME").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            drbot_core::Config::data_dir()
+                .or_else(drbot_core::Config::config_dir)
+                .or_else(crate::openclaw_paths::resolve_home_dir)
+                .unwrap_or_else(|| PathBuf::from("~"))
+                .join(".openclaw")
+                .to_string_lossy()
+                .to_string()
+        });
+    let migrate_target_dir = resolve_openclaw_state_dir(state)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+
     let mut session = WizardSessionState {
         status: WizardSessionStatus::Running,
         error: None,
+        mode,
         step: WizardStepKey::Intro,
         current_step_id: String::new(),
         current_step: serde_json::Value::Null,
@@ -1232,6 +1653,14 @@ fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSe
         bind_choice,
         host,
         port,
+        pairing_required,
+        pairing_allow_local,
+
+        assistant_autonomy,
+        assistant_workspace_allowlist,
+        assistant_tool_allowlist,
+        assistant_tool_denylist,
+        assistant_use_camel_case,
 
         provider_configured,
         provider_suggestion,
@@ -1239,7 +1668,7 @@ fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSe
         provider_api_key: None,
         provider_default_model,
 
-        configure_channels: false,
+        configure_channels: matches!(mode, WizardMode::ChannelsRepair),
         channels_enabled,
         channel_steps: Vec::new(),
         channel_step_index: 0,
@@ -1269,7 +1698,16 @@ fn wizard_session_from_config_snapshot(snapshot: &serde_json::Value) -> WizardSe
         webchat_require_auth,
         webchat_auth_token: None,
 
+        migrate_source_dir,
+        migrate_target_dir,
+        migrate_summary: None,
+
         wrote: false,
+    };
+    session.step = match mode {
+        WizardMode::Full => WizardStepKey::Intro,
+        WizardMode::ChannelsRepair => WizardStepKey::RepairIntro,
+        WizardMode::Migration => WizardStepKey::MigrateIntro,
     };
     wizard_make_step_for_session(&mut session);
     session
@@ -1301,6 +1739,59 @@ async fn wizard_apply_answer_and_advance(
     };
 
     match session.step {
+        WizardStepKey::RepairIntro => {
+            session.configure_channels = true;
+            session.channel_steps.clear();
+            session.channel_step_index = 0;
+            session.step = WizardStepKey::ChannelsSelect;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::MigrateIntro => {
+            session.step = WizardStepKey::MigrateSourceDir;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::MigrateSourceDir => {
+            let raw = wizard_value_to_string(&value);
+            if !raw.trim().is_empty() {
+                session.migrate_source_dir = raw.trim().to_string();
+            }
+            session.step = WizardStepKey::MigrateConfirm;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::MigrateConfirm => {
+            if !wizard_value_to_bool(&value) {
+                session.status = WizardSessionStatus::Cancelled;
+                session.error = Some("cancelled".to_string());
+                session.current_step_id = String::new();
+                session.current_step = serde_json::Value::Null;
+                return Ok(());
+            }
+            let source = crate::openclaw_paths::resolve_user_path(&session.migrate_source_dir);
+            match migrate_openclaw_state_from_dir(state, &source) {
+                Ok(summary) => {
+                    session.migrate_summary = Some(summary);
+                    session.step = WizardStepKey::MigrateResult;
+                    wizard_make_step_for_session(session);
+                    Ok(())
+                }
+                Err(err) => {
+                    session.status = WizardSessionStatus::Error;
+                    session.error = Some(wizard_format_internal_error(err));
+                    session.current_step_id = String::new();
+                    session.current_step = serde_json::Value::Null;
+                    Ok(())
+                }
+            }
+        }
+        WizardStepKey::MigrateResult => {
+            session.status = WizardSessionStatus::Done;
+            session.current_step_id = String::new();
+            session.current_step = serde_json::Value::Null;
+            Ok(())
+        }
         WizardStepKey::Intro => {
             session.step = WizardStepKey::RiskNotice;
             wizard_make_step_for_session(session);
@@ -1428,6 +1919,71 @@ async fn wizard_apply_answer_and_advance(
                 ));
             };
             session.port = port;
+            session.step = WizardStepKey::GatewayPairingRequired;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayPairingRequired => {
+            session.pairing_required = wizard_value_to_bool(&value);
+            if session.pairing_required {
+                session.step = WizardStepKey::GatewayPairingAllowLocal;
+            } else {
+                session.step = WizardStepKey::AssistantAutonomy;
+            }
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::GatewayPairingAllowLocal => {
+            session.pairing_allow_local = wizard_value_to_bool(&value);
+            session.step = WizardStepKey::AssistantAutonomy;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::AssistantAutonomy => {
+            let raw = wizard_value_to_string(&value);
+            let Some(mode) = wizard_parse_autonomy_mode(&raw) else {
+                return Err(ErrorShape::new(
+                    error_codes::INVALID_REQUEST,
+                    "invalid autonomy mode",
+                ));
+            };
+            session.assistant_autonomy = mode;
+            session.step = WizardStepKey::AssistantWorkspaceAllowlist;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::AssistantWorkspaceAllowlist => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.assistant_workspace_allowlist = if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                wizard_parse_csv_list(trimmed)
+            };
+            session.step = WizardStepKey::AssistantToolAllowlist;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::AssistantToolAllowlist => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.assistant_tool_allowlist = if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                wizard_parse_csv_list(trimmed)
+            };
+            session.step = WizardStepKey::AssistantToolDenylist;
+            wizard_make_step_for_session(session);
+            Ok(())
+        }
+        WizardStepKey::AssistantToolDenylist => {
+            let raw = wizard_value_to_string(&value);
+            let trimmed = raw.trim();
+            session.assistant_tool_denylist = if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                wizard_parse_csv_list(trimmed)
+            };
             session.step = WizardStepKey::ProviderSelect;
             wizard_make_step_for_session(session);
             Ok(())
@@ -1779,60 +2335,109 @@ async fn wizard_apply_answer_and_advance(
             // Apply merge-patch to drbot.toml via the OpenClaw config.patch implementation.
             let mut patch = serde_json::Map::new();
 
-            let mut gateway_patch = serde_json::Map::new();
-            gateway_patch.insert("host".to_string(), json!(session.host.clone()));
-            gateway_patch.insert("port".to_string(), json!(session.port));
-            match session.auth_choice {
-                WizardAuthChoice::Keep => {}
-                WizardAuthChoice::Disable => {
-                    gateway_patch.insert("auth_token".to_string(), serde_json::Value::Null);
-                }
-                WizardAuthChoice::New => {
-                    let token = session.auth_token.clone().unwrap_or_default();
-                    if token.trim().is_empty() {
-                        return Err(ErrorShape::new(
-                            error_codes::INVALID_REQUEST,
-                            "token cannot be empty",
-                        ));
+            if !matches!(session.mode, WizardMode::ChannelsRepair) {
+                let mut gateway_patch = serde_json::Map::new();
+                gateway_patch.insert("host".to_string(), json!(session.host.clone()));
+                gateway_patch.insert("port".to_string(), json!(session.port));
+                gateway_patch.insert(
+                    "pairing_required".to_string(),
+                    json!(session.pairing_required),
+                );
+                gateway_patch.insert(
+                    "pairing_allow_local".to_string(),
+                    json!(session.pairing_allow_local),
+                );
+                match session.auth_choice {
+                    WizardAuthChoice::Keep => {}
+                    WizardAuthChoice::Disable => {
+                        gateway_patch.insert("auth_token".to_string(), serde_json::Value::Null);
                     }
-                    gateway_patch.insert("auth_token".to_string(), json!(token));
-                }
-            }
-            patch.insert(
-                "gateway".to_string(),
-                serde_json::Value::Object(gateway_patch),
-            );
-
-            if let Some(provider) = session.provider_choice.as_deref() {
-                let api_key = session.provider_api_key.clone().unwrap_or_default();
-                if api_key.trim().is_empty() {
-                    return Err(ErrorShape::new(
-                        error_codes::INVALID_REQUEST,
-                        "API key required",
-                    ));
-                }
-
-                let mut providers_patch = serde_json::Map::new();
-                providers_patch.insert("default_provider".to_string(), json!(provider));
-                if let Some(model) = session.provider_default_model.as_deref() {
-                    providers_patch.insert("default_model".to_string(), json!(model));
-                } else {
-                    providers_patch.insert("default_model".to_string(), serde_json::Value::Null);
-                }
-
-                match provider {
-                    "openai" => {
-                        providers_patch.insert("openai".to_string(), json!({ "api_key": api_key }));
-                    }
-                    _ => {
-                        providers_patch
-                            .insert("anthropic".to_string(), json!({ "api_key": api_key }));
+                    WizardAuthChoice::New => {
+                        let token = session.auth_token.clone().unwrap_or_default();
+                        if token.trim().is_empty() {
+                            return Err(ErrorShape::new(
+                                error_codes::INVALID_REQUEST,
+                                "token cannot be empty",
+                            ));
+                        }
+                        gateway_patch.insert("auth_token".to_string(), json!(token));
                     }
                 }
                 patch.insert(
-                    "providers".to_string(),
-                    serde_json::Value::Object(providers_patch),
+                    "gateway".to_string(),
+                    serde_json::Value::Object(gateway_patch),
                 );
+
+                let mut assistant_patch = serde_json::Map::new();
+                let (autonomy_key, workspace_key, allow_key, deny_key) =
+                    if session.assistant_use_camel_case {
+                        (
+                            "autonomyMode",
+                            "workspaceAllowlist",
+                            "toolAllowlist",
+                            "toolDenylist",
+                        )
+                    } else {
+                        (
+                            "autonomy_mode",
+                            "workspace_allowlist",
+                            "tool_allowlist",
+                            "tool_denylist",
+                        )
+                    };
+                assistant_patch.insert(
+                    autonomy_key.to_string(),
+                    json!(wizard_autonomy_to_str(session.assistant_autonomy)),
+                );
+                assistant_patch.insert(
+                    workspace_key.to_string(),
+                    json!(session.assistant_workspace_allowlist.clone()),
+                );
+                assistant_patch.insert(
+                    allow_key.to_string(),
+                    json!(session.assistant_tool_allowlist.clone()),
+                );
+                assistant_patch.insert(
+                    deny_key.to_string(),
+                    json!(session.assistant_tool_denylist.clone()),
+                );
+                patch.insert(
+                    "assistant".to_string(),
+                    serde_json::Value::Object(assistant_patch),
+                );
+
+                if let Some(provider) = session.provider_choice.as_deref() {
+                    let api_key = session.provider_api_key.clone().unwrap_or_default();
+                    if api_key.trim().is_empty() {
+                        return Err(ErrorShape::new(
+                            error_codes::INVALID_REQUEST,
+                            "API key required",
+                        ));
+                    }
+
+                    let mut providers_patch = serde_json::Map::new();
+                    providers_patch.insert("default_provider".to_string(), json!(provider));
+                    if let Some(model) = session.provider_default_model.as_deref() {
+                        providers_patch.insert("default_model".to_string(), json!(model));
+                    } else {
+                        providers_patch.insert("default_model".to_string(), serde_json::Value::Null);
+                    }
+
+                    match provider {
+                        "openai" => {
+                            providers_patch
+                                .insert("openai".to_string(), json!({ "api_key": api_key }));
+                        }
+                        _ => {
+                            providers_patch
+                                .insert("anthropic".to_string(), json!({ "api_key": api_key }));
+                        }
+                    }
+                    patch.insert(
+                        "providers".to_string(),
+                        serde_json::Value::Object(providers_patch),
+                    );
+                }
             }
 
             if session.configure_channels {
@@ -2642,6 +3247,24 @@ pub(crate) fn canonicalize_openclaw_session_key(default_agent_id: &str, key: &st
     let agent_id = crate::openclaw_paths::normalize_agent_id(default_agent_id);
     let rest = normalize_store_key(raw);
     format!("agent:{}:{}", agent_id, rest)
+}
+
+fn ensure_openclaw_session_key_valid(raw: &str) -> Result<(), ErrorShape> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.eq_ignore_ascii_case("global") || trimmed.eq_ignore_ascii_case("unknown") {
+        return Ok(());
+    }
+    if trimmed.to_ascii_lowercase().starts_with("agent:") && parse_agent_session_key(trimmed).is_none()
+    {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "invalid agent sessionKey",
+        ));
+    }
+    Ok(())
 }
 
 fn openclaw_session_key_to_store_key(key: &str) -> String {
@@ -4845,6 +5468,73 @@ pub(crate) fn drbot_message_to_openclaw(msg: &Message) -> serde_json::Value {
     })
 }
 
+fn openclaw_collect_text_parts(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            parts.push(text.clone());
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                openclaw_collect_text_parts(item, parts);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                parts.push(text.to_string());
+                return;
+            }
+            if let Some(content) = obj.get("content") {
+                let before = parts.len();
+                openclaw_collect_text_parts(content, parts);
+                if parts.len() > before {
+                    return;
+                }
+            }
+            if let Some(message) = obj.get("message").and_then(|v| v.as_str()) {
+                parts.push(message.to_string());
+                return;
+            }
+            if let Some(value) = obj.get("value").and_then(|v| v.as_str()) {
+                parts.push(value.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn openclaw_chat_message_from_params(params: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(message) = params.get("message") {
+        openclaw_collect_text_parts(message, &mut parts);
+    }
+    if let Some(tool_messages) = params.get("toolMessages") {
+        openclaw_collect_text_parts(tool_messages, &mut parts);
+    }
+    parts.join("\n")
+}
+
+fn sanitize_openclaw_inbound_text(raw: &str) -> Result<String, ErrorShape> {
+    if raw.contains('\0') {
+        return Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "message contains null byte",
+        ));
+    }
+    let normalized = raw.nfc().collect::<String>();
+    if normalized
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        let cleaned: String = normalized
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+            .collect();
+        Ok(cleaned)
+    } else {
+        Ok(normalized)
+    }
+}
+
 fn openclaw_user_message_to_drbot(message: &str, attachments: &[serde_json::Value]) -> Message {
     let mut content: Vec<Content> = Vec::new();
     let trimmed = message.trim();
@@ -5048,46 +5738,46 @@ pub(crate) fn resolve_openclaw_outbound_response_prefix(
     let account_id = account_id.map(|raw| raw.trim()).filter(|s| !s.is_empty());
 
     let account_prefix = match (channel.as_deref(), account_id) {
-        (Some("telegram"), Some(account)) => cfg
-            .channels
-            .telegram
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("discord"), Some(account)) => cfg
-            .channels
-            .discord
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("slack"), Some(account)) => cfg
-            .channels
-            .slack
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("whatsapp"), Some(account)) => cfg
-            .channels
-            .whatsapp
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("signal"), Some(account)) => cfg
-            .channels
-            .signal
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("imessage"), Some(account)) => cfg
-            .channels
-            .imessage
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("matrix"), Some(account)) => cfg
-            .channels
-            .matrix
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
-        (Some("webchat"), Some(account)) => cfg
-            .channels
-            .webchat
-            .as_ref()
-            .and_then(|c| c.accounts.get(account).and_then(|a| a.response_prefix.clone())),
+        (Some("telegram"), Some(account)) => cfg.channels.telegram.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("discord"), Some(account)) => cfg.channels.discord.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("slack"), Some(account)) => cfg.channels.slack.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("whatsapp"), Some(account)) => cfg.channels.whatsapp.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("signal"), Some(account)) => cfg.channels.signal.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("imessage"), Some(account)) => cfg.channels.imessage.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("matrix"), Some(account)) => cfg.channels.matrix.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
+        (Some("webchat"), Some(account)) => cfg.channels.webchat.as_ref().and_then(|c| {
+            c.accounts
+                .get(account)
+                .and_then(|a| a.response_prefix.clone())
+        }),
         _ => None,
     };
 
@@ -5485,10 +6175,22 @@ fn build_config_schema() -> serde_json::Value {
                     "host": { "type": "string" },
                     "port": { "type": "integer" },
                     "auth_token": { "type": ["string", "null"] },
+                    "pairing_required": { "type": "boolean" },
+                    "pairing_allow_local": { "type": "boolean" },
                     "tls_enabled": { "type": "boolean" },
                     "tls_cert": { "type": ["string", "null"] },
                     "tls_key": { "type": ["string", "null"] }
                 }
+            },
+            "assistant": {
+                "type": "object",
+                "properties": {
+                    "autonomyMode": { "type": "string" },
+                    "workspaceAllowlist": { "type": "array", "items": { "type": "string" } },
+                    "toolAllowlist": { "type": "array", "items": { "type": "string" } },
+                    "toolDenylist": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": {}
             },
             "hooks": {
                 "type": "object",
@@ -5983,16 +6685,19 @@ mod config_redaction_tests {
     #[test]
     fn merge_redacted_config_secrets_preserves_previous_values() {
         use drbot_core::config::{
-            AnthropicConfig, ChannelsConfig, DiscordConfig, GatewayConfig, HooksConfig,
-            MatrixConfig, MessagesConfig, OpenAICompatibleConfig, OpenAIConfig, ProvidersConfig,
-            SlackConfig, TelegramConfig, WebChatConfig,
+            AnthropicConfig, AssistantConfig, ChannelsConfig, DiscordConfig, GatewayConfig,
+            HooksConfig, MatrixConfig, MessagesConfig, OpenAICompatibleConfig, OpenAIConfig,
+            ProvidersConfig, SlackConfig, TelegramConfig, WebChatConfig,
         };
 
         let prev = drbot_core::Config {
+            assistant: AssistantConfig::default(),
             gateway: GatewayConfig {
                 host: "127.0.0.1".to_string(),
                 port: 18789,
                 auth_token: Some("prev-gw".to_string()),
+                pairing_required: false,
+                pairing_allow_local: true,
                 tls_enabled: false,
                 tls_cert: None,
                 tls_key: None,
@@ -6236,7 +6941,6 @@ mod config_redaction_tests {
             .is_none());
     }
 }
-
 
 #[cfg(test)]
 mod sessions_compact_tests {
@@ -7546,6 +8250,58 @@ pub(crate) async fn handle_config_set(
     }))
 }
 
+fn merge_array_patch_by_id(
+    target_arr: &mut Vec<serde_json::Value>,
+    patch_arr: &[serde_json::Value],
+) -> bool {
+    if patch_arr.is_empty() {
+        return false;
+    }
+
+    for item in patch_arr {
+        let Some(obj) = item.as_object() else {
+            return false;
+        };
+        let Some(id) = obj.get("id").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if id.trim().is_empty() {
+            return false;
+        }
+    }
+
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (idx, item) in target_arr.iter().enumerate() {
+        if let Some(id) = item
+            .as_object()
+            .and_then(|obj| obj.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            index.insert(id.to_string(), idx);
+        }
+    }
+
+    for item in patch_arr {
+        let Some(id) = item
+            .as_object()
+            .and_then(|obj| obj.get("id"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if let Some(idx) = index.get(id).copied() {
+            if let Some(target_item) = target_arr.get_mut(idx) {
+                apply_merge_patch(target_item, item);
+            }
+        } else {
+            target_arr.push(item.clone());
+            index.insert(id.to_string(), target_arr.len().saturating_sub(1));
+        }
+    }
+
+    true
+}
+
 fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     use serde_json::Value;
     match patch {
@@ -7568,6 +8324,14 @@ fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) 
                     }
                 }
             }
+        }
+        Value::Array(patch_arr) => {
+            if let Some(target_arr) = target.as_array_mut() {
+                if merge_array_patch_by_id(target_arr, patch_arr) {
+                    return;
+                }
+            }
+            *target = patch.clone();
         }
         _ => {
             *target = patch.clone();
@@ -8358,6 +9122,57 @@ pub(crate) fn merge_openclaw_exec_ask_modes(
     }
 }
 
+pub(crate) fn autonomy_policy_for_tool(mode: AutonomyMode, tool_name: &str) -> OpenclawExecAskMode {
+    if matches!(mode, AutonomyMode::Full) {
+        return OpenclawExecAskMode::Allow;
+    }
+    let is_readonly = is_autonomy_readonly_tool(tool_name);
+    match mode {
+        AutonomyMode::ReadOnly => {
+            if is_readonly {
+                OpenclawExecAskMode::Allow
+            } else {
+                OpenclawExecAskMode::Deny
+            }
+        }
+        AutonomyMode::Supervised => {
+            if is_readonly {
+                OpenclawExecAskMode::Allow
+            } else {
+                OpenclawExecAskMode::Ask
+            }
+        }
+        AutonomyMode::Full => OpenclawExecAskMode::Allow,
+    }
+}
+
+pub(crate) fn is_autonomy_readonly_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "read"
+            | "list_dir"
+            | "list_directory"
+            | "search"
+            | "calculator"
+            | "web_fetch"
+            | "web_search"
+            | "memory_search"
+            | "memory_get"
+            | "sessions_list"
+            | "sessions_history"
+            | "session_status"
+            | "agents_list"
+    )
+}
+
+fn tool_uses_exec_ask(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "bash" | "exec" | "write_file" | "write" | "edit" | "apply_patch" | "http"
+    )
+}
+
 fn normalize_tool_policy_key(value: &str) -> String {
     value
         .trim()
@@ -9007,6 +9822,18 @@ fn resolve_openclaw_tools_profile_filter(
     })
 }
 
+fn resolve_openclaw_assistant_tool_filter(state: &GatewayState) -> Option<OpenclawToolFilter> {
+    let cfg = &state.config().assistant;
+    if cfg.tool_allowlist.is_empty() && cfg.tool_denylist.is_empty() {
+        return None;
+    }
+    Some(OpenclawToolFilter {
+        allow: expand_openclaw_tool_groups(cfg.tool_allowlist.clone()),
+        deny: expand_openclaw_tool_groups(cfg.tool_denylist.clone()),
+        hard_deny: Vec::new(),
+    })
+}
+
 pub(crate) fn resolve_openclaw_effective_tool_filter(
     state: &GatewayState,
     session_key: &str,
@@ -9030,6 +9857,10 @@ pub(crate) fn resolve_openclaw_effective_tool_filter(
         if let Some(agent_filter) = resolve_openclaw_tools_explicit_policy_filter(agent_tools) {
             filters.push(agent_filter);
         }
+    }
+
+    if let Some(assistant_filter) = resolve_openclaw_assistant_tool_filter(state) {
+        filters.push(assistant_filter);
     }
 
     filters.push(resolve_openclaw_tool_filter(state, session_key, sender_id));
@@ -16711,7 +17542,9 @@ fn load_openclaw_agents_file(state: &GatewayState) -> OpenclawAgentsFile {
     read_json_file::<OpenclawAgentsFile>(&path).unwrap_or_default()
 }
 
-pub(crate) fn resolve_openclaw_agents_defaults_image_model_refs(state: &GatewayState) -> Vec<String> {
+pub(crate) fn resolve_openclaw_agents_defaults_image_model_refs(
+    state: &GatewayState,
+) -> Vec<String> {
     let file = load_openclaw_agents_file(state);
     collect_openclaw_model_list_refs(file.defaults.image_model.as_ref())
 }
@@ -16983,13 +17816,70 @@ pub(crate) fn resolve_openclaw_memory_qmd_sessions_max_messages(state: &GatewayS
         .clamp(10, 2000) as usize
 }
 
+fn normalize_policy_path(path: &PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let mut resolved = crate::openclaw_paths::resolve_user_path(raw.as_ref());
+    if !resolved.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            resolved = cwd.join(resolved);
+        }
+    }
+    canonicalize_policy_path(resolved.as_path()).unwrap_or(resolved)
+}
+
+fn default_workspace_root_from_allowlist(state: &GatewayState) -> Option<PathBuf> {
+    let allowlist = &state.config().assistant.workspace_allowlist;
+    let first = allowlist.iter().find(|p| !p.as_os_str().is_empty())?;
+    Some(normalize_policy_path(first))
+}
+
 fn default_agent_workspace_dir(state: &GatewayState, agent_id: &str) -> PathBuf {
     let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    if let Some(root) = default_workspace_root_from_allowlist(state) {
+        return root.join(&agent_id);
+    }
     if let Some(dir) = resolve_openclaw_state_dir(state) {
         dir.join("agents").join(&agent_id)
     } else {
         PathBuf::from("agents").join(agent_id)
     }
+}
+
+fn canonicalize_policy_path(path: &std::path::Path) -> Option<PathBuf> {
+    let mut path = path.to_path_buf();
+    if !path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            path = cwd.join(path);
+        }
+    }
+    if path.exists() {
+        return path.canonicalize().ok();
+    }
+    let parent = path.parent()?;
+    let parent_canon = parent.canonicalize().ok()?;
+    let name = path.file_name()?;
+    Some(parent_canon.join(name))
+}
+
+fn workspace_path_allowed(state: &GatewayState, candidate: &PathBuf) -> bool {
+    let allowlist = &state.config().assistant.workspace_allowlist;
+    if allowlist.is_empty() {
+        return true;
+    }
+    let Some(candidate_canon) = canonicalize_policy_path(candidate.as_path()) else {
+        return false;
+    };
+    for root in allowlist {
+        let root_str = root.to_string_lossy();
+        let root_path = crate::openclaw_paths::resolve_user_path(root_str.as_ref());
+        let Some(root_canon) = canonicalize_policy_path(root_path.as_path()) else {
+            continue;
+        };
+        if candidate_canon.starts_with(&root_canon) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn resolve_agent_workspace_dir_for_state(
@@ -17005,10 +17895,53 @@ pub(crate) fn resolve_agent_workspace_dir_for_state(
     {
         let workspace = entry.workspace.trim();
         if !workspace.is_empty() {
-            return crate::openclaw_paths::resolve_user_path(workspace);
+            let candidate = crate::openclaw_paths::resolve_user_path(workspace);
+            if workspace_path_allowed(state, &candidate) {
+                return candidate;
+            }
+            warn!(
+                workspace = %workspace,
+                "workspace path not in allowlist; using default workspace"
+            );
         }
     }
     default_agent_workspace_dir(state, &agent_id)
+}
+
+pub(crate) fn ensure_agent_workspace_bootstrap_best_effort(
+    state: &GatewayState,
+    agent_id: &str,
+) -> PathBuf {
+    let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
+    let workspace_dir = resolve_agent_workspace_dir_for_state(state, &agent_id);
+
+    let file = load_openclaw_agents_file(state);
+    let (name, emoji) = file
+        .agents
+        .iter()
+        .find(|a| crate::openclaw_paths::normalize_agent_id(&a.agent_id) == agent_id)
+        .map(|a| (a.name.clone(), a.emoji.clone()))
+        .unwrap_or_else(|| {
+            let fallback_name = if agent_id == crate::openclaw_paths::DEFAULT_AGENT_ID {
+                "drbot".to_string()
+            } else {
+                agent_id.clone()
+            };
+            (fallback_name, None)
+        });
+
+    if let Err(err) = ensure_agent_workspace_bootstrap(&workspace_dir, &name, emoji.as_deref()) {
+        tracing::warn!(
+            error = %err.message,
+            agent_id = %agent_id,
+            workspace = %workspace_dir.to_string_lossy(),
+            "failed to bootstrap agent workspace"
+        );
+    }
+
+    crate::workspace_autosave::ensure_user_timezone_best_effort(&workspace_dir);
+
+    workspace_dir
 }
 
 pub(crate) fn resolve_openclaw_agent_default_model(
@@ -17148,7 +18081,52 @@ fn default_agent_workspace_file_content(filename: &str, name: &str, emoji: Optio
         return format!("# {}\n", name);
     }
 
-    format!("# {}\n", title)
+    match filename {
+        "USER.md" => {
+            format!(
+                r#"# User
+
+Stable facts and preferences that should carry across sessions.
+
+- Name:
+- Timezone:
+- Preferred tone/style:
+- Formatting preferences (e.g., bullets, terse/verbose):
+- Defaults (units, currency, locale):
+- Avoid / don't do:
+"#
+            )
+        }
+        "MEMORY.md" | "memory.md" => r#"# Memory
+
+Long-term notes for the assistant.
+
+- Keep *always-relevant* items short and stable.
+- Put longer docs/notes in `memory/` as separate Markdown files (easier to search).
+
+## Pinned
+
+## Preferences
+
+## Knowledge base
+"#
+        .to_string(),
+        _ => format!("# {}\n", title),
+    }
+}
+
+fn default_agent_workspace_memory_readme_content() -> String {
+    r#"# Knowledge Base
+
+Put longer notes/docs here as Markdown files (the assistant can search them when needed).
+
+Suggested files:
+- `projects.md` (current work + status)
+- `people.md` (names + relationships)
+- `procedures.md` (how you like things done)
+- `preferences.md` (style, tools, defaults)
+"#
+    .to_string()
 }
 
 fn ensure_agent_workspace_bootstrap(
@@ -17185,6 +18163,23 @@ fn ensure_agent_workspace_bootstrap(
             return Err(ErrorShape::new(
                 error_codes::UNAVAILABLE,
                 format!("failed to bootstrap {}: {}", AGENT_MEMORY_FILENAME, e),
+            ));
+        }
+    }
+
+    let memory_dir = workspace.join("memory");
+    if let Err(e) = std::fs::create_dir_all(&memory_dir) {
+        return Err(ErrorShape::new(
+            error_codes::UNAVAILABLE,
+            format!("failed to bootstrap memory dir: {}", e),
+        ));
+    }
+    let readme = memory_dir.join("README.md");
+    if !readme.exists() {
+        if let Err(e) = std::fs::write(&readme, default_agent_workspace_memory_readme_content()) {
+            return Err(ErrorShape::new(
+                error_codes::UNAVAILABLE,
+                format!("failed to bootstrap memory/README.md: {}", e),
             ));
         }
     }
@@ -17588,9 +18583,15 @@ async fn spawn_chat_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
-    let workspace_dir = resolve_agent_workspace_dir_for_state(&ctx.state, &agent_id);
+    let workspace_dir = ensure_agent_workspace_bootstrap_best_effort(&ctx.state, &agent_id);
+    crate::workspace_autosave::autosave_workspace_best_effort(&workspace_dir, &user_text_raw);
     let workspace_context =
         crate::openclaw_workspace_prompt::build_workspace_context_prompt(&workspace_dir);
+    let workspace_notes = crate::workspace_notes_recall::recall_workspace_notes_prompt(
+        &workspace_dir,
+        &user_text_raw,
+    )
+    .await;
     let skills_filter = resolve_openclaw_agent_skills_filter(&ctx.state, &agent_id);
     let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
         &workspace_dir,
@@ -17605,6 +18606,12 @@ async fn spawn_chat_run(
     let workspace_trimmed = workspace_context.trim();
     if !workspace_trimmed.is_empty() {
         system_sections.push(workspace_trimmed.to_string());
+    }
+    if let Some(notes) = workspace_notes.as_deref() {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            system_sections.push(trimmed.to_string());
+        }
     }
     if let Some(recall) = recall.as_deref() {
         let trimmed = recall.trim();
@@ -17905,6 +18912,206 @@ async fn spawn_chat_run(
     // Run completed; any in-flight abort handle is removed in the global registry above.
 }
 
+async fn spawn_chat_run_local_command(
+    ctx: ConnCtx,
+    run_id: String,
+    session_key: String,
+    user_msg: Message,
+    response_prefix: Option<String>,
+    cancel_rx: watch::Receiver<Option<String>>,
+) {
+    let session_key =
+        canonicalize_openclaw_session_key(crate::openclaw_paths::DEFAULT_AGENT_ID, &session_key);
+    let agent_id =
+        openclaw_session_key_agent_id(&session_key, crate::openclaw_paths::DEFAULT_AGENT_ID);
+    let user_text_raw = user_msg.text_content();
+    let dedupe_key = chat_send_dedupe_key(&session_key, &run_id);
+    let _lane = OpenclawMainLaneGuard::new(ctx.state.clone());
+
+    let initial_abort_reason = cancel_rx.borrow().clone();
+    if let Some(stop_reason) = initial_abort_reason {
+        let seq = {
+            let mut run_seq = ctx.run_seq.lock().await;
+            next_run_seq(&mut run_seq, &run_id)
+        };
+        let payload = json!({
+            "runId": run_id,
+            "sessionKey": session_key,
+            "seq": seq,
+            "state": "aborted",
+            "stopReason": stop_reason,
+        });
+        broadcast_openclaw_event(&ctx.state, "chat", payload, None).await;
+        openclaw_dedupe_put(
+            &dedupe_key,
+            OpenclawDedupeEntry {
+                ts: now_ms(),
+                ok: true,
+                payload: Some(json!({"runId": run_id, "status": "aborted" })),
+                error: None,
+            },
+        )
+        .await;
+        ctx.state.openclaw_unregister_chat_run(&run_id).await;
+        return;
+    }
+
+    let workspace_dir = ensure_agent_workspace_bootstrap_best_effort(&ctx.state, &agent_id);
+
+    let msg_trimmed = user_text_raw.trim_start();
+    let msg_lower = msg_trimmed.to_ascii_lowercase();
+    let is_remember_cmd = msg_lower.starts_with("/remember") || msg_lower.starts_with("remember:");
+    let is_forget_cmd = msg_lower.starts_with("/forget") || msg_lower.starts_with("forget:");
+    let is_memory_cmd = msg_lower == "/memory" || msg_lower == "/mem";
+    let is_profile_cmd = msg_lower == "/profile";
+    let is_kb_cmd = msg_lower == "/kb"
+        || msg_lower.starts_with("/kb ")
+        || msg_lower.starts_with("/kb:")
+        || msg_lower.starts_with("kb:")
+        || msg_lower == "/notes"
+        || msg_lower.starts_with("/notes ")
+        || msg_lower.starts_with("/notes:")
+        || msg_lower.starts_with("notes:");
+
+    let should_persist = is_remember_cmd || is_forget_cmd;
+
+    let reply = if is_remember_cmd || is_forget_cmd {
+        let updates = if is_remember_cmd {
+            crate::workspace_autosave::autosave_workspace_best_effort(
+                &workspace_dir,
+                &user_text_raw,
+            )
+        } else {
+            crate::workspace_autosave::forget_workspace_best_effort(&workspace_dir, &user_text_raw)
+        };
+
+        if updates.applied {
+            if updates.updates.is_empty() {
+                if is_remember_cmd {
+                    "Saved to memory.".to_string()
+                } else {
+                    "Forgot.".to_string()
+                }
+            } else {
+                let mut out = String::new();
+                out.push_str(if is_remember_cmd {
+                    "Saved to memory:\n"
+                } else {
+                    "Forgot:\n"
+                });
+                for u in updates.updates.iter().take(12) {
+                    out.push_str("- ");
+                    out.push_str(u);
+                    out.push('\n');
+                }
+                out.trim_end().to_string()
+            }
+        } else if is_remember_cmd {
+            if crate::workspace_autosave::parse_remember_command(&user_text_raw).is_some() {
+                "Nothing saved (refused to store sensitive/invalid content).".to_string()
+            } else {
+                "Usage: /remember <note>".to_string()
+            }
+        } else if crate::workspace_autosave::parse_forget_command(&user_text_raw).is_some() {
+            "Nothing forgotten (no matching items).".to_string()
+        } else {
+            "Usage: /forget <name|timezone|style|all|text>".to_string()
+        }
+    } else if is_profile_cmd {
+        crate::workspace_memory_view::build_workspace_profile_overview(&workspace_dir)
+    } else if is_memory_cmd {
+        crate::workspace_memory_view::build_workspace_memory_overview(&workspace_dir)
+    } else if is_kb_cmd {
+        let query =
+            if msg_lower == "/kb" || msg_lower.starts_with("/kb ") || msg_lower.starts_with("/kb:")
+            {
+                msg_trimmed[3..].trim_start_matches(&[' ', ':'][..]).trim()
+            } else if msg_lower.starts_with("kb:") {
+                msg_trimmed[3..].trim()
+            } else if msg_lower == "/notes"
+                || msg_lower.starts_with("/notes ")
+                || msg_lower.starts_with("/notes:")
+            {
+                msg_trimmed[6..].trim_start_matches(&[' ', ':'][..]).trim()
+            } else if msg_lower.starts_with("notes:") {
+                msg_trimmed[6..].trim()
+            } else {
+                ""
+            };
+
+        if query.trim().is_empty() {
+            "Usage: /kb <query>".to_string()
+        } else {
+            crate::workspace_notes_recall::recall_workspace_notes_prompt_explicit(
+                &workspace_dir,
+                query,
+            )
+            .await
+            .unwrap_or_else(|| "No relevant notes found.".to_string())
+        }
+    } else {
+        "Unknown local command.".to_string()
+    };
+
+    let final_text = if let Some(prefix) = response_prefix.as_deref() {
+        if reply.starts_with(prefix) {
+            reply
+        } else {
+            format!("{}{}", prefix, reply)
+        }
+    } else {
+        reply
+    };
+
+    let seq = {
+        let mut run_seq = ctx.run_seq.lock().await;
+        next_run_seq(&mut run_seq, &run_id)
+    };
+    let payload = json!({
+        "runId": run_id,
+        "sessionKey": session_key,
+        "seq": seq,
+        "state": "final",
+        "message": {
+            "role": "assistant",
+            "content": [{ "type": "text", "text": final_text.as_str() }],
+            "timestamp": now_ms()
+        },
+        "stopReason": "local",
+    });
+    broadcast_openclaw_event(&ctx.state, "chat", payload, None).await;
+    openclaw_dedupe_put(
+        &dedupe_key,
+        OpenclawDedupeEntry {
+            ts: now_ms(),
+            ok: true,
+            payload: Some(json!({"runId": run_id, "status": "ok" })),
+            error: None,
+        },
+    )
+    .await;
+
+    if should_persist {
+        if let Some(store) = ctx.state.session_store() {
+            let (canonical_key, candidates) = openclaw_session_store_key_candidates(
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+                &session_key,
+            );
+            let user_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"openclaw-operator");
+            if let Some(mut session) =
+                get_or_create_openclaw_session(store, user_id, &canonical_key, &candidates).await
+            {
+                session.add_message(user_msg);
+                session.add_message(assistant_message_from_text(&final_text));
+                session.update_timestamp();
+                let _ = store.update(&session).await;
+            }
+        }
+    }
+
+    ctx.state.openclaw_unregister_chat_run(&run_id).await;
+}
+
 async fn emit_agent_event(ctx: &ConnCtx, run_id: &str, stream: &str, data: serde_json::Value) {
     let seq = {
         let mut run_seq = ctx.run_seq.lock().await;
@@ -17936,6 +19143,7 @@ async fn register_openclaw_toolset_for_agent(
 ) -> std::result::Result<(), String> {
     // Register a conservative baseline toolset (avoid generic HTTP; prefer allowlisted API tools).
     let exec_ask = resolve_openclaw_session_exec_ask_mode(state, session_key);
+    let autonomy_mode = state.config().assistant.autonomy_mode;
     let inferred_sender_id = transcript.iter().rev().find_map(|m| {
         if !matches!(m.role, Role::User) {
             return None;
@@ -17977,13 +19185,11 @@ async fn register_openclaw_toolset_for_agent(
         let tool_name = tool.name();
         let tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, tool_name)
             .unwrap_or(OpenclawExecAskMode::Allow);
-        let baseline = if matches!(
-            tool_name,
-            "bash" | "exec" | "write_file" | "write" | "edit" | "apply_patch" | "http"
-        ) {
-            exec_ask
+        let autonomy_policy = autonomy_policy_for_tool(autonomy_mode, tool_name);
+        let baseline = if tool_uses_exec_ask(tool_name) {
+            merge_openclaw_exec_ask_modes(exec_ask, autonomy_policy)
         } else {
-            OpenclawExecAskMode::Allow
+            autonomy_policy
         };
         let mode = merge_openclaw_exec_ask_modes(tool_policy, baseline);
         let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
@@ -18099,11 +19305,13 @@ async fn register_openclaw_toolset_for_agent(
         let tool_policy =
             resolve_openclaw_session_tool_policy_mode(state, session_key, tool.name())
                 .unwrap_or(OpenclawExecAskMode::Allow);
+        let autonomy_policy = autonomy_policy_for_tool(autonomy_mode, tool.name());
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, autonomy_policy);
         let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
             state.clone(),
             agent_id,
             Some(session_key),
-            tool_policy,
+            mode,
             tool,
         ) else {
             continue;
@@ -18115,7 +19323,9 @@ async fn register_openclaw_toolset_for_agent(
     if tool_filter.is_allowed("exec") {
         let tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "exec")
             .unwrap_or(OpenclawExecAskMode::Allow);
-        let mode = merge_openclaw_exec_ask_modes(tool_policy, exec_ask);
+        let autonomy_policy = autonomy_policy_for_tool(autonomy_mode, "exec");
+        let baseline = merge_openclaw_exec_ask_modes(exec_ask, autonomy_policy);
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, baseline);
         if !matches!(mode, OpenclawExecAskMode::Deny) {
             let tool = Arc::new(crate::openclaw_agent_tools::ExecTool::new(
                 state.clone(),
@@ -18139,7 +19349,9 @@ async fn register_openclaw_toolset_for_agent(
     if tool_filter.is_allowed("process") {
         let tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "process")
             .unwrap_or(OpenclawExecAskMode::Allow);
-        let mode = merge_openclaw_exec_ask_modes(tool_policy, exec_ask);
+        let autonomy_policy = autonomy_policy_for_tool(autonomy_mode, "process");
+        let baseline = merge_openclaw_exec_ask_modes(exec_ask, autonomy_policy);
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, baseline);
         if !matches!(mode, OpenclawExecAskMode::Deny) {
             let tool = Arc::new(crate::openclaw_agent_tools::ProcessTool::new(
                 workspace_dir.clone(),
@@ -18162,6 +19374,7 @@ async fn register_openclaw_toolset_for_agent(
     let message_tool_policy =
         resolve_openclaw_session_tool_policy_mode(state, session_key, "message")
             .unwrap_or(OpenclawExecAskMode::Allow);
+    let message_autonomy = autonomy_policy_for_tool(autonomy_mode, "message");
     if tool_filter.is_allowed("message")
         && !matches!(send_policy, OpenclawSendPolicyMode::Deny)
         && !matches!(message_tool_policy, OpenclawExecAskMode::Deny)
@@ -18176,6 +19389,7 @@ async fn register_openclaw_toolset_for_agent(
         } else {
             message_tool_policy
         };
+        let wrapper_mode = merge_openclaw_exec_ask_modes(wrapper_mode, message_autonomy);
         if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
             state.clone(),
             agent_id,
@@ -18189,6 +19403,7 @@ async fn register_openclaw_toolset_for_agent(
 
     let send_tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "send")
         .unwrap_or(OpenclawExecAskMode::Allow);
+    let send_autonomy = autonomy_policy_for_tool(autonomy_mode, "send");
     if tool_filter.is_allowed("send")
         && !matches!(send_policy, OpenclawSendPolicyMode::Deny)
         && !matches!(send_tool_policy, OpenclawExecAskMode::Deny)
@@ -18203,6 +19418,7 @@ async fn register_openclaw_toolset_for_agent(
         } else {
             send_tool_policy
         };
+        let wrapper_mode = merge_openclaw_exec_ask_modes(wrapper_mode, send_autonomy);
         if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
             state.clone(),
             agent_id,
@@ -18216,6 +19432,7 @@ async fn register_openclaw_toolset_for_agent(
 
     let poll_tool_policy = resolve_openclaw_session_tool_policy_mode(state, session_key, "poll")
         .unwrap_or(OpenclawExecAskMode::Allow);
+    let poll_autonomy = autonomy_policy_for_tool(autonomy_mode, "poll");
     if tool_filter.is_allowed("poll")
         && !matches!(send_policy, OpenclawSendPolicyMode::Deny)
         && !matches!(poll_tool_policy, OpenclawExecAskMode::Deny)
@@ -18230,6 +19447,7 @@ async fn register_openclaw_toolset_for_agent(
         } else {
             poll_tool_policy
         };
+        let wrapper_mode = merge_openclaw_exec_ask_modes(wrapper_mode, poll_autonomy);
         if let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
             state.clone(),
             agent_id,
@@ -18259,11 +19477,13 @@ async fn register_openclaw_toolset_for_agent(
         let tool_policy =
             resolve_openclaw_session_tool_policy_mode(state, session_key, tool.name())
                 .unwrap_or(OpenclawExecAskMode::Allow);
+        let autonomy_policy = autonomy_policy_for_tool(autonomy_mode, tool.name());
+        let mode = merge_openclaw_exec_ask_modes(tool_policy, autonomy_policy);
         let Some(tool) = crate::openclaw_agent_tools::apply_openclaw_tool_policy_to_tool(
             state.clone(),
             agent_id,
             Some(session_key),
-            tool_policy,
+            mode,
             tool,
         ) else {
             continue;
@@ -18324,9 +19544,18 @@ async fn spawn_agent_run(
     );
 
     let remote = resolve_remote_skill_eligibility(&ctx.state).await;
-    let workspace_dir = resolve_agent_workspace_dir_for_state(&ctx.state, &agent_id);
+    let workspace_dir = ensure_agent_workspace_bootstrap_best_effort(&ctx.state, &agent_id);
+    crate::workspace_autosave::autosave_workspace_best_effort(
+        &workspace_dir,
+        user_text_raw.as_str(),
+    );
     let workspace_context =
         crate::openclaw_workspace_prompt::build_workspace_context_prompt(&workspace_dir);
+    let workspace_notes = crate::workspace_notes_recall::recall_workspace_notes_prompt(
+        &workspace_dir,
+        user_text_raw.as_str(),
+    )
+    .await;
     let skills_filter = resolve_openclaw_agent_skills_filter(&ctx.state, &agent_id);
     let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
         &workspace_dir,
@@ -18358,6 +19587,15 @@ async fn spawn_agent_run(
     if !workspace_trimmed.is_empty() {
         base_system_prompt.push_str("\n\n");
         base_system_prompt.push_str(workspace_trimmed);
+    }
+    if let Some(notes) = workspace_notes.as_deref() {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            if !base_system_prompt.is_empty() {
+                base_system_prompt.push_str("\n\n---\n\n");
+            }
+            base_system_prompt.push_str(trimmed);
+        }
     }
     if let Some(recall) = recall.as_deref() {
         let trimmed = recall.trim();
@@ -18794,9 +20032,18 @@ async fn openclaw_spawn_agent_run_for_tool_task(
     );
 
     let remote = resolve_remote_skill_eligibility(&state).await;
-    let workspace_dir = resolve_agent_workspace_dir_for_state(&state, &agent_id);
+    let workspace_dir = ensure_agent_workspace_bootstrap_best_effort(&state, &agent_id);
+    crate::workspace_autosave::autosave_workspace_best_effort(
+        &workspace_dir,
+        user_text_raw.as_str(),
+    );
     let workspace_context =
         crate::openclaw_workspace_prompt::build_workspace_context_prompt(&workspace_dir);
+    let workspace_notes = crate::workspace_notes_recall::recall_workspace_notes_prompt(
+        &workspace_dir,
+        user_text_raw.as_str(),
+    )
+    .await;
     let skills_filter = resolve_openclaw_agent_skills_filter(&state, &agent_id);
     let skills_prompt = crate::openclaw_skills::build_workspace_skills_prompt_with_remote_filtered(
         &workspace_dir,
@@ -18827,6 +20074,15 @@ async fn openclaw_spawn_agent_run_for_tool_task(
     if !workspace_trimmed.is_empty() {
         base_system_prompt.push_str("\n\n");
         base_system_prompt.push_str(workspace_trimmed);
+    }
+    if let Some(notes) = workspace_notes.as_deref() {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            if !base_system_prompt.is_empty() {
+                base_system_prompt.push_str("\n\n---\n\n");
+            }
+            base_system_prompt.push_str(trimmed);
+        }
     }
     if let Some(recall) = recall.as_deref() {
         let trimmed = recall.trim();
@@ -18959,7 +20215,6 @@ async fn openclaw_spawn_agent_run_for_tool_task(
     };
 
     let final_text = strip_openclaw_media_path_lines(&full).into_owned();
-
 
     // Clear system events only after a successful agent run.
     if has_system_events {
@@ -20220,6 +21475,8 @@ impl OpenclawCronService {
     async fn status(&self) -> serde_json::Value {
         let mut st = self.state.lock().await;
         self.ensure_loaded_locked(&mut st).await;
+        let now = now_ms();
+        recompute_next_runs(&mut st.store.jobs, now);
         let next = if self.enabled {
             next_wake_at_ms(&st.store.jobs)
         } else {
@@ -21023,13 +22280,25 @@ async fn execute_cron_job(
         let channel = channel_raw.to_ascii_lowercase();
         let to = delivery_plan.to.as_deref().unwrap_or("").trim().to_string();
 
-        let mut text = summary
-            .clone()
-            .or_else(|| err.clone())
-            .or_else(|| output_text.clone())
-            .unwrap_or_else(|| "completed".to_string())
-            .trim()
-            .to_string();
+        let explicit_target = delivery_plan
+            .to
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let mut text = if explicit_target {
+            output_text
+                .clone()
+                .or_else(|| summary.clone())
+                .or_else(|| err.clone())
+        } else {
+            summary
+                .clone()
+                .or_else(|| err.clone())
+                .or_else(|| output_text.clone())
+        }
+        .unwrap_or_else(|| "completed".to_string())
+        .trim()
+        .to_string();
         if text.chars().count() > 4000 {
             text = text.chars().take(3997).collect::<String>() + "...";
         }
@@ -21037,9 +22306,14 @@ async fn execute_cron_job(
         text = strip_openclaw_media_path_lines(&text).into_owned();
         text = text.trim().to_string();
 
+        let agent_id_for_prefix = snapshot
+            .agent_id
+            .as_deref()
+            .map(crate::openclaw_paths::normalize_agent_id)
+            .unwrap_or_else(|| crate::openclaw_paths::DEFAULT_AGENT_ID.to_string());
         text = apply_openclaw_outbound_response_prefix(
             state,
-            crate::openclaw_paths::DEFAULT_AGENT_ID,
+            &agent_id_for_prefix,
             Some(&channel),
             None,
             &text,
@@ -25463,8 +26737,31 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
             }
 
             let snapshot = handle_config_get(&ctx.state).await;
+            let mode = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("mode"))
+                .and_then(|v| v.as_str())
+                .and_then(WizardMode::from_str)
+                .or_else(|| {
+                    let params = req.params.as_ref()?;
+                    let repair = params
+                        .get("repairChannels")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let channels_only = params
+                        .get("channelsOnly")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if repair || channels_only {
+                        Some(WizardMode::ChannelsRepair)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(WizardMode::Full);
             let session_id = Uuid::new_v4().to_string();
-            let session = wizard_session_from_config_snapshot(&snapshot);
+            let session = wizard_session_from_config_snapshot(&ctx.state, &snapshot, mode);
             let payload = json!({
                 "sessionId": session_id,
                 "done": false,
@@ -26918,6 +28215,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
+            if let Err(err) = ensure_openclaw_session_key_valid(session_key) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
+            }
             let limit = req
                 .params
                 .as_ref()
@@ -26936,7 +28241,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_message = openclaw_chat_message_from_params(&params);
             let run_id = params
                 .get("idempotencyKey")
                 .and_then(|v| v.as_str())
@@ -26962,6 +28267,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
+            if let Err(err) = ensure_openclaw_session_key_valid(&session_key) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
+            }
             let session_key = canonicalize_openclaw_session_key(
                 crate::openclaw_paths::DEFAULT_AGENT_ID,
                 &session_key,
@@ -26974,6 +28287,17 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     None,
                 );
             }
+            let message = match sanitize_openclaw_inbound_text(&raw_message) {
+                Ok(msg) => msg,
+                Err(err) => {
+                    return GatewayFrame::Res(ResponseFrame {
+                        id: req.id,
+                        ok: false,
+                        payload: None,
+                        error: Some(err),
+                    })
+                }
+            };
             if message.trim().is_empty() && attachments.is_empty() {
                 return error_response(
                     &req.id,
@@ -26983,7 +28307,7 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 );
             }
 
-            if is_chat_stop_command_text(message) {
+            if is_chat_stop_command_text(&message) {
                 let run_ids = ctx
                     .state
                     .openclaw_abort_chat_runs(&session_key, None, "stop")
@@ -27012,6 +28336,55 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                 return ok_response(&req.id, json!({ "runId": run_id, "status": "in_flight" }));
             }
 
+            let msg_trimmed = message.trim_start();
+            let msg_lower = msg_trimmed.to_ascii_lowercase();
+            let is_remember_cmd =
+                msg_lower.starts_with("/remember") || msg_lower.starts_with("remember:");
+            let is_forget_cmd =
+                msg_lower.starts_with("/forget") || msg_lower.starts_with("forget:");
+            let is_memory_cmd = msg_lower == "/memory" || msg_lower == "/mem";
+            let is_profile_cmd = msg_lower == "/profile";
+            let is_kb_cmd = msg_lower == "/kb"
+                || msg_lower.starts_with("/kb ")
+                || msg_lower.starts_with("/kb:")
+                || msg_lower.starts_with("kb:")
+                || msg_lower == "/notes"
+                || msg_lower.starts_with("/notes ")
+                || msg_lower.starts_with("/notes:")
+                || msg_lower.starts_with("notes:");
+            let is_local_cmd =
+                is_remember_cmd || is_forget_cmd || is_memory_cmd || is_profile_cmd || is_kb_cmd;
+
+            let user_msg = openclaw_user_message_to_drbot(&message, &attachments);
+            if is_local_cmd {
+                let (cancel_tx, cancel_rx) = watch::channel::<Option<String>>(None);
+                let inserted = ctx
+                    .state
+                    .openclaw_try_register_chat_run(
+                        &run_id,
+                        crate::state::OpenclawChatRun {
+                            session_key: session_key.clone(),
+                            run_id: run_id.clone(),
+                            cancel_tx,
+                            started_at_ms: now_ms(),
+                        },
+                    )
+                    .await;
+                if !inserted {
+                    return ok_response(&req.id, json!({ "runId": run_id, "status": "in_flight" }));
+                }
+
+                tokio::spawn(spawn_chat_run_local_command(
+                    ctx.clone(),
+                    run_id.clone(),
+                    session_key,
+                    user_msg,
+                    response_prefix,
+                    cancel_rx,
+                ));
+                return ok_response(&req.id, json!({ "runId": run_id, "status": "started" }));
+            }
+
             let provider = match ctx.state.provider() {
                 Some(p) => p,
                 None => {
@@ -27023,8 +28396,6 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     );
                 }
             };
-
-            let user_msg = openclaw_user_message_to_drbot(message, &attachments);
             let (cancel_tx, cancel_rx) = watch::channel::<Option<String>>(None);
             let inserted = ctx
                 .state
@@ -27073,6 +28444,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     "sessionKey required",
                     None,
                 );
+            }
+            if let Err(err) = ensure_openclaw_session_key_valid(&session_key) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
             }
             let session_key = canonicalize_openclaw_session_key(
                 crate::openclaw_paths::DEFAULT_AGENT_ID,
@@ -27140,6 +28519,14 @@ async fn handle_request_after_connect(ctx: &ConnCtx, req: RequestFrame) -> Gatew
                     "chat.inject requires sessionKey and message",
                     None,
                 );
+            }
+            if let Err(err) = ensure_openclaw_session_key_valid(&session_key) {
+                return GatewayFrame::Res(ResponseFrame {
+                    id: req.id,
+                    ok: false,
+                    payload: None,
+                    error: Some(err),
+                });
             }
             let session_key = canonicalize_openclaw_session_key(
                 crate::openclaw_paths::DEFAULT_AGENT_ID,
@@ -27688,6 +29075,8 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
 
             // Device identity verification (OpenClaw parity).
             let is_local_client = peer.ip().is_loopback();
+            let pairing_required = state.config().gateway.pairing_required;
+            let pairing_allow_local = state.config().gateway.pairing_allow_local;
             let mut device_id: Option<String> = None;
             let mut device_public_key: Option<String> = None;
             if let Some(device) = params.device.as_ref().and_then(|v| v.as_object()) {
@@ -27850,6 +29239,20 @@ pub async fn handle_socket(socket: WebSocket, state: GatewayState, peer: SocketA
                     device_id = Some(raw_id);
                     device_public_key = Some(base64_encode_url_safe_no_pad(&public_key_raw));
                 }
+            }
+            if pairing_required
+                && role == "operator"
+                && (!is_local_client || !pairing_allow_local)
+                && device_id.is_none()
+            {
+                let err = error_response(
+                    &req.id,
+                    error_codes::INVALID_REQUEST,
+                    "device identity required for pairing",
+                    None,
+                );
+                send_frame(&tx, &queued_bytes, &closing, &err).await;
+                break;
             }
             let client_id = params.client.id.clone();
             let client_mode = params.client.mode.clone();

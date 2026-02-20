@@ -6,7 +6,7 @@
 //! - Event streaming
 //! - Resumable execution
 
-use crate::{Agent, AgentConfig, AgentError, AgentEvent, AgentMessage, AgentState, Result};
+use crate::{Agent, AgentConfig, AgentError, AgentEvent, AgentMessage, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use drbot_providers::Provider;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 /// Background agent status.
@@ -400,7 +400,7 @@ impl BackgroundRunner {
         &self,
         agent_id: Uuid,
         task: &str,
-        mut approval_rx: mpsc::Receiver<(Uuid, bool, Option<String>)>,
+        _approval_rx: mpsc::Receiver<(Uuid, bool, Option<String>)>,
     ) {
         // Update status to running
         self.update_status(agent_id, BackgroundStatus::Running, None)

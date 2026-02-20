@@ -48,6 +48,7 @@ pub trait TaskClassifier: Send + Sync {
 }
 
 /// Rule-based task classifier using heuristics.
+#[allow(dead_code)]
 pub struct RuleBasedClassifier {
     /// Keywords indicating simple tasks.
     simple_keywords: Vec<&'static str>,
@@ -159,6 +160,7 @@ impl Default for RuleBasedClassifier {
     }
 }
 
+#[allow(dead_code)]
 impl RuleBasedClassifier {
     /// Create a new rule-based classifier.
     pub fn new() -> Self {
@@ -270,10 +272,12 @@ impl TaskClassifier for RuleBasedClassifier {
 }
 
 /// LLM-based classifier that uses a fast model for classification.
+#[allow(dead_code)]
 pub struct LlmClassifier {
     fallback: RuleBasedClassifier,
 }
 
+#[allow(dead_code)]
 impl LlmClassifier {
     /// Create a new LLM-based classifier.
     pub fn new() -> Self {

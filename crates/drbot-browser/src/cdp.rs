@@ -43,6 +43,7 @@ pub struct CdpError {
     /// Error message.
     pub message: String,
     /// Additional data.
+    #[allow(dead_code)] // Keep for protocol completeness; not always inspected.
     pub data: Option<serde_json::Value>,
 }
 

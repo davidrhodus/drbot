@@ -32,10 +32,8 @@ fn test_config(port: u16) -> Config {
     }];
 
     // Avoid writing into the user's real data dir during tests.
-    let base = std::env::temp_dir().join(format!(
-        "drbot-openclaw-hooks-wake-test-{}",
-        Uuid::new_v4()
-    ));
+    let base =
+        std::env::temp_dir().join(format!("drbot-openclaw-hooks-wake-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     config.storage.database_path = base.join("drbot.db");
     config.storage.media_path = base.join("media");

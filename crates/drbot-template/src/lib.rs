@@ -296,7 +296,9 @@ impl Template {
                         "revindex0".to_string(),
                         Value::Int((items.len() - index - 1) as i64),
                     );
-                    loop_ctx.values.insert("loop".to_string(), Value::Object(loop_obj));
+                    loop_ctx
+                        .values
+                        .insert("loop".to_string(), Value::Object(loop_obj));
                     let rendered = self.process_variables(content, &loop_ctx)?;
                     result.push_str(&rendered);
                 }

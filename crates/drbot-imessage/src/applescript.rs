@@ -81,6 +81,7 @@ pub fn is_messages_running() -> bool {
 }
 
 /// Activate Messages.app.
+#[allow(dead_code)] // Used by some workflows/channels; not currently referenced in this crate.
 pub fn activate_messages() -> drbot_core::Result<()> {
     let script = r#"
         tell application "Messages"

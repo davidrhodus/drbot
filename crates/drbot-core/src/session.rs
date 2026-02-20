@@ -20,6 +20,8 @@ pub struct Session {
     pub channel_id: String,
     /// Session title (auto-generated or user-set).
     pub title: Option<String>,
+    /// Provider used for this session (e.g. "claude-cli", "ollama").
+    pub provider: Option<String>,
     /// Model being used for this session.
     pub model: Option<String>,
     /// Custom system prompt for this session.
@@ -79,6 +81,7 @@ impl Session {
             channel_type: channel_type.into(),
             channel_id: channel_id.into(),
             title: None,
+            provider: None,
             model: None,
             system_prompt: None,
             messages: Vec::new(),

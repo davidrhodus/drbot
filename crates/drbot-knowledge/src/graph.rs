@@ -1,7 +1,7 @@
 //! Knowledge graph for relationship tracking.
 
 use crate::store::Document;
-use crate::{KnowledgeEntry, KnowledgeError, Result};
+use crate::{KnowledgeEntry, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;

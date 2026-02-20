@@ -48,11 +48,13 @@ pub trait Chunker: Send + Sync {
 }
 
 /// Simple fixed-size chunker.
+#[allow(dead_code)]
 pub struct FixedChunker {
     strategy: ChunkingStrategy,
 }
 
 impl FixedChunker {
+    #[allow(dead_code)]
     pub fn new(strategy: ChunkingStrategy) -> Self {
         Self { strategy }
     }
@@ -114,11 +116,13 @@ impl Chunker for FixedChunker {
 }
 
 /// Semantic chunker that respects document structure.
+#[allow(dead_code)]
 pub struct SemanticChunker {
     strategy: ChunkingStrategy,
 }
 
 impl SemanticChunker {
+    #[allow(dead_code)]
     pub fn new(strategy: ChunkingStrategy) -> Self {
         Self { strategy }
     }
@@ -187,11 +191,13 @@ impl Chunker for SemanticChunker {
 }
 
 /// Markdown-aware chunker.
+#[allow(dead_code)]
 pub struct MarkdownChunker {
     strategy: ChunkingStrategy,
 }
 
 impl MarkdownChunker {
+    #[allow(dead_code)]
     pub fn new(strategy: ChunkingStrategy) -> Self {
         Self { strategy }
     }

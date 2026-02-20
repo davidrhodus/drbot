@@ -15,6 +15,7 @@ use drbot_agents::{
     Agent as DrbotAgent, AgentConfig as DrbotAgentConfig, AgentMessage as DrbotAgentMessage,
     AgentRole as DrbotAgentRole, BuiltinTools,
 };
+use drbot_core::config::AutonomyMode;
 use drbot_core::message::Message;
 use drbot_core::message::Role;
 use drbot_providers::{ChatOptions, Provider, StreamEvent as ProviderStreamEvent, Usage};
@@ -708,6 +709,8 @@ async fn run_heartbeat_once_impl(
         == Some("1");
 
     let full = if use_tools {
+        let autonomy_mode = state.config().assistant.autonomy_mode;
+        let readonly = matches!(autonomy_mode, AutonomyMode::ReadOnly);
         let agent_cfg = DrbotAgentConfig {
             max_iterations: std::env::var("DRBOT_OPENCLAW_HEARTBEAT_MAX_ITERATIONS")
                 .ok()
@@ -750,28 +753,33 @@ async fn run_heartbeat_once_impl(
             if matches!(tool.name(), "http" | "bash" | "write_file" | "apply_patch") {
                 continue;
             }
+            if readonly && !crate::openclaw::is_autonomy_readonly_tool(tool.name()) {
+                continue;
+            }
             agent.register_tool(tool);
         }
-        agent.register_tool(Arc::new(
-            crate::openclaw_agent_tools::ColosseumRequestTool::new(state.clone()),
-        ));
-        agent.register_tool(Arc::new(
-            crate::openclaw_agent_tools::MoltbookRequestTool::new(state.clone()),
-        ));
-        agent.register_tool(Arc::new(
-            crate::openclaw_agent_tools::SendTool::new_with_context(
-                state.clone(),
-                "default",
-                &main_session_key,
-            ),
-        ));
-        agent.register_tool(Arc::new(
-            crate::openclaw_agent_tools::PollTool::new_with_context(
-                state.clone(),
-                "default",
-                &main_session_key,
-            ),
-        ));
+        if !readonly {
+            agent.register_tool(Arc::new(
+                crate::openclaw_agent_tools::ColosseumRequestTool::new(state.clone()),
+            ));
+            agent.register_tool(Arc::new(
+                crate::openclaw_agent_tools::MoltbookRequestTool::new(state.clone()),
+            ));
+            agent.register_tool(Arc::new(
+                crate::openclaw_agent_tools::SendTool::new_with_context(
+                    state.clone(),
+                    "default",
+                    &main_session_key,
+                ),
+            ));
+            agent.register_tool(Arc::new(
+                crate::openclaw_agent_tools::PollTool::new_with_context(
+                    state.clone(),
+                    "default",
+                    &main_session_key,
+                ),
+            ));
+        }
 
         for msg in &messages {
             let text = msg.text_content();

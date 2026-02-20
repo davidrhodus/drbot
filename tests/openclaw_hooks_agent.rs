@@ -8,6 +8,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 fn base_test_config(port: u16) -> Config {
+    // Keep tests deterministic even if claude/codex CLIs are installed locally.
+    std::env::set_var("DRBOT_AUTO_DISABLE_CLI_PRESETS", "1");
+
     let mut config = Config::default();
     config.gateway.host = "127.0.0.1".to_string();
     config.gateway.port = port;
@@ -49,7 +52,12 @@ fn config_with_provider(port: u16) -> Config {
     config
 }
 
-async fn spawn_gateway(config: Config) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+async fn spawn_gateway(
+    config: Config,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let gateway = Gateway::new(config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server_handle = tokio::spawn(async move {
@@ -103,7 +111,10 @@ async fn openclaw_hooks_agent_success_returns_result_text() {
     let body = resp.json::<Value>().await.unwrap();
 
     assert_eq!(body.get("ok"), Some(&Value::Bool(true)));
-    assert_eq!(body.get("agentId").and_then(|v| v.as_str()), Some("default"));
+    assert_eq!(
+        body.get("agentId").and_then(|v| v.as_str()),
+        Some("default")
+    );
     assert_eq!(
         body.get("sessionKey").and_then(|v| v.as_str()),
         Some("agent:default:main")

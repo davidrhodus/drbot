@@ -2,6 +2,8 @@
 //!
 //! This is the main entry point for the drbot binary.
 
+mod gateway_client;
+
 use anyhow::Result;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
@@ -15,6 +17,11 @@ use drbot_gateway::Gateway;
 use drbot_personas::{Persona, PersonaRegistry, PersonaStyle, PersonaTrait};
 use drbot_providers::{ChatOptions, CliProvider, Provider, StreamEvent};
 use drbot_sessions::{ListOptions, SessionStore, SqliteSessionStore};
+use drbot_tool_mode::{
+    bash_command_is_safe_for_auto_approve, build_agent_system_prompt_with_policy,
+    execute_tool_call, extract_tool_calls, resolve_tool_root_with_allowlist,
+    should_reprompt_for_tool_calls, BashAutoApprovePolicy, ToolModeConfig,
+};
 use drbot_tui::AppConfig;
 use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -66,7 +73,7 @@ enum Commands {
 
     /// Interactive chat with AI
     Chat {
-        /// Provider to use (auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli)
+        /// Provider to use (auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli, codex-oss)
         #[arg(short, long)]
         provider: Option<String>,
 
@@ -171,6 +178,12 @@ enum Commands {
         system: Option<String>,
     },
 
+    /// Manage a project-local knowledge base (.drbot/)
+    Kb {
+        #[command(subcommand)]
+        action: KbAction,
+    },
+
     /// Manage channels
     Channels {
         #[command(subcommand)]
@@ -211,6 +224,17 @@ enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
+    },
+}
+
+/// Knowledge base subcommands.
+#[derive(Subcommand)]
+enum KbAction {
+    /// Initialize a project-local knowledge base in .drbot/
+    Init {
+        /// Directory to initialize (defaults to current directory; uses nearest git root when available)
+        #[arg(long)]
+        dir: Option<String>,
     },
 }
 
@@ -804,7 +828,12 @@ async fn main() -> Result<()> {
             provider,
             model,
             system,
-        }) => run_tui(&config, provider, model, system).await,
+        }) => {
+            // Match the default `drbot` behavior: launch the TUI and ensure the gateway
+            // is running (attach if another instance already bound the port).
+            run_tui_with_gateway(config, provider, model, system).await
+        }
+        Some(Commands::Kb { action }) => run_kb(action).await,
         Some(Commands::Channels { action }) => {
             run_channels(&config, action, cli.config.as_deref()).await
         }
@@ -821,8 +850,115 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Doctor) => run_doctor(&config).await,
         None => {
-            // Default: start gateway
-            run_gateway(config).await
+            // Default: start TUI + gateway
+            run_tui_with_gateway(config, None, None, None).await
+        }
+    }
+}
+
+async fn run_tui_with_gateway(
+    mut config: Config,
+    provider_name: Option<String>,
+    model: Option<String>,
+    system: Option<String>,
+) -> Result<()> {
+    'outer: loop {
+        // If the gateway is already running (e.g., another drbot instance), just attach the TUI.
+        if gateway_is_listening(&config).await {
+            let action = run_tui(
+                &config,
+                provider_name.clone(),
+                model.clone(),
+                system.clone(),
+                true,
+            )
+            .await?;
+            match action {
+                drbot_tui::ExitAction::Quit => return Ok(()),
+                drbot_tui::ExitAction::LaunchWizard => {
+                    run_wizard().await?;
+                    config = Config::load().unwrap_or_default();
+                    continue;
+                }
+            }
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let gateway_config = config.clone();
+
+        let gateway_task = tokio::spawn(async move {
+            run_gateway_with_external_shutdown(gateway_config, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        // Wait briefly for the gateway to start accepting connections.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if gateway_is_listening(&config).await {
+                break;
+            }
+            if gateway_task.is_finished() {
+                let res = gateway_task.await;
+                if gateway_is_listening(&config).await {
+                    // Another process won the race and bound the port. Treat as "gateway already running".
+                    let action = run_tui(
+                        &config,
+                        provider_name.clone(),
+                        model.clone(),
+                        system.clone(),
+                        true,
+                    )
+                    .await?;
+                    match action {
+                        drbot_tui::ExitAction::Quit => return Ok(()),
+                        drbot_tui::ExitAction::LaunchWizard => {
+                            run_wizard().await?;
+                            config = Config::load().unwrap_or_default();
+                            continue 'outer;
+                        }
+                    }
+                }
+                let err = match res {
+                    Ok(Ok(())) => anyhow::anyhow!("Gateway exited before TUI started"),
+                    Ok(Err(e)) => e,
+                    Err(e) => anyhow::anyhow!("Gateway task failed: {}", e),
+                };
+                return Err(err);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let action = run_tui(
+            &config,
+            provider_name.clone(),
+            model.clone(),
+            system.clone(),
+            true,
+        )
+        .await;
+
+        let _ = shutdown_tx.send(());
+
+        let gateway_result = match gateway_task.await {
+            Ok(res) => res,
+            Err(e) => Err(anyhow::anyhow!("Gateway task failed: {}", e)),
+        };
+
+        let action = action?;
+        let _ = gateway_result?;
+
+        match action {
+            drbot_tui::ExitAction::Quit => return Ok(()),
+            drbot_tui::ExitAction::LaunchWizard => {
+                run_wizard().await?;
+                config = Config::load().unwrap_or_default();
+                continue;
+            }
         }
     }
 }
@@ -832,51 +968,22 @@ async fn run_tui(
     provider_name: Option<String>,
     model: Option<String>,
     system: Option<String>,
-) -> Result<()> {
-    use drbot_tui::ProviderType;
-
-    // Determine provider type
-    let provider_name = provider_name
-        .or_else(|| config.providers.default_provider.clone())
-        .unwrap_or_else(|| "auto".to_string());
-
-    let provider_type = ProviderType::from_str(&provider_name)
-        .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", provider_name))?;
-
-    // Get provider-specific config
-    let (api_key, base_url, default_model) = match provider_type {
-        ProviderType::Anthropic => {
-            let cfg = config.providers.anthropic.as_ref();
-            (
-                cfg.map(|c| c.api_key.clone()),
-                cfg.and_then(|c| c.base_url.clone()),
-                cfg.and_then(|c| c.default_model.clone()),
-            )
-        }
-        ProviderType::OpenAI => {
-            let cfg = config.providers.openai.as_ref();
-            (
-                cfg.map(|c| c.api_key.clone()),
-                cfg.and_then(|c| c.base_url.clone()),
-                cfg.and_then(|c| c.default_model.clone()),
-            )
-        }
-        ProviderType::Ollama => {
-            let cfg = config.providers.ollama.as_ref();
-            (
-                None, // Ollama doesn't need API key
-                cfg.map(|c| c.url.clone()),
-                cfg.and_then(|c| c.default_model.clone()),
-            )
-        }
-    };
+    gateway_running: bool,
+) -> Result<drbot_tui::ExitAction> {
+    // NOTE: The TUI is gateway-backed. Provider/model selection happens via the gateway
+    // (Ctrl+P, Ctrl+M, /provider, /model), including CLI providers like `claude-cli`/`codex-cli`.
+    // Keep the CLI args for compatibility, but don't hard-fail on unknown providers.
+    let _ = provider_name;
 
     let tui_config = AppConfig {
-        provider_type,
-        api_key,
-        base_url,
-        model: model.or(default_model),
+        provider_type: drbot_tui::ProviderType::default(),
+        api_key: None,
+        base_url: None,
+        model,
         system_prompt: system,
+        gateway_url: Some(gateway_ws_url(config)),
+        gateway_auth_token: gateway_login_token(config),
+        gateway_running,
         max_history: 100,
     };
 
@@ -885,7 +992,79 @@ async fn run_tui(
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+fn gateway_ws_url(config: &Config) -> String {
+    let scheme = if config.gateway.tls_enabled {
+        "wss"
+    } else {
+        "ws"
+    };
+    // If the gateway is bound to a wildcard address, clients should connect via localhost.
+    let host = config.gateway.host.trim();
+    let host = match host {
+        "" | "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    format!("{}://{}:{}/ws", scheme, host, config.gateway.port)
+}
+
+/// Token to use for `auth.login` when connecting to the gateway.
+///
+/// If `gateway.auth_token` is configured, use it (required for auth-required gateways).
+/// Otherwise, use a stable local token so sessions persist across reconnects even when
+/// the gateway doesn't require auth.
+fn gateway_login_token(config: &Config) -> Option<String> {
+    if let Some(token) = config
+        .gateway
+        .auth_token
+        .as_deref()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    {
+        return Some(token.to_string());
+    }
+
+    let Some(dir) = Config::config_dir() else {
+        return None;
+    };
+    let path = dir.join("gateway-client-token");
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let token = existing.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&path, format!("{}\n", token));
+    }
+    Some(token)
+}
+
+async fn gateway_is_listening(config: &Config) -> bool {
+    let host = config.gateway.host.trim();
+    let host = match host {
+        "" | "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    let addr = format!("{}:{}", host, config.gateway.port);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok())
+}
+
 async fn run_gateway(config: Config) -> Result<()> {
+    run_gateway_with_external_shutdown(config, std::future::pending::<()>()).await
+}
+
+async fn run_gateway_with_external_shutdown(
+    config: Config,
+    external_shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     info!("drbot v{} starting...", env!("CARGO_PKG_VERSION"));
 
     let gateway = Gateway::new(config);
@@ -898,6 +1077,7 @@ async fn run_gateway(config: Config) -> Result<()> {
     // Set up graceful shutdown
     let shutdown_action_for_shutdown = shutdown_action.clone();
     let shutdown = async move {
+        tokio::pin!(external_shutdown);
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -911,6 +1091,11 @@ async fn run_gateway(config: Config) -> Result<()> {
 
             loop {
                 tokio::select! {
+                    _ = &mut external_shutdown => {
+                        info!("shutdown requested (external)");
+                        shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
                     _ = tokio::signal::ctrl_c() => {
                         info!("signal SIGINT received");
                         shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
@@ -966,11 +1151,16 @@ async fn run_gateway(config: Config) -> Result<()> {
         #[cfg(not(unix))]
         {
             let _ = &state_for_shutdown;
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install CTRL+C handler");
-            info!("Received shutdown signal");
-            shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+            tokio::select! {
+                _ = &mut external_shutdown => {
+                    info!("shutdown requested (external)");
+                    shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received shutdown signal");
+                    shutdown_action_for_shutdown.store(ACTION_STOP, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
     };
 
@@ -3397,27 +3587,113 @@ export!(Component);
     Ok(())
 }
 /// Create a provider from config.
-fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provider>> {
+async fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provider>> {
     use drbot_ollama::OllamaProvider;
     use drbot_openai::OpenAIProvider;
 
+    fn env_flag_enabled(name: &str) -> bool {
+        let Ok(v) = std::env::var(name) else {
+            return false;
+        };
+        let v = v.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    }
+
+    fn normalize_http_url(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Ollama commonly uses OLLAMA_HOST like "127.0.0.1:11434".
+        if trimmed.contains("://") {
+            Some(trimmed.to_string())
+        } else {
+            Some(format!("http://{}", trimmed))
+        }
+    }
+
+    fn ollama_base_url_best_effort(config: &Config) -> String {
+        if let Some(ollama) = &config.providers.ollama {
+            let u = ollama.url.trim();
+            if !u.is_empty() {
+                return u.to_string();
+            }
+        }
+
+        if let Ok(v) = std::env::var("DRBOT_OLLAMA_URL") {
+            if let Some(u) = normalize_http_url(&v) {
+                return u;
+            }
+        }
+        if let Ok(v) = std::env::var("OLLAMA_HOST") {
+            if let Some(u) = normalize_http_url(&v) {
+                return u;
+            }
+        }
+
+        drbot_ollama::DEFAULT_BASE_URL.to_string()
+    }
+
     match provider_name {
         "auto" => {
-            // Auto-select: prefer Ollama > Anthropic > OpenAI (local-first)
-            if let Some(ollama_config) = &config.providers.ollama {
-                let mut p = OllamaProvider::new().with_base_url(&ollama_config.url);
-                if let Some(default_model) = &ollama_config.default_model {
+            // Auto-select prefers cost-savers first:
+            // - CLI tools (claude-cli / codex-cli) if installed on PATH
+            // - Ollama if configured OR running (even without config)
+            // - API providers as fallback
+            //
+            // You can disable CLI auto-detect with: DRBOT_AUTO_DISABLE_CLI_PRESETS=1
+            let cli_presets_disabled = env_flag_enabled("DRBOT_AUTO_DISABLE_CLI_PRESETS");
+
+            if !cli_presets_disabled {
+                let p = CliProvider::claude_cli();
+                if p.check_command_exists().is_ok() {
+                    info!("Auto-selected provider: claude-cli");
+                    return Ok(Arc::new(p));
+                }
+
+                let p = CliProvider::codex_cli();
+                if p.check_command_exists().is_ok() {
+                    info!("Auto-selected provider: codex-cli");
+                    return Ok(Arc::new(p));
+                }
+            }
+
+            let base_url = ollama_base_url_best_effort(config);
+            let mut allow_ollama = config.providers.ollama.is_some();
+            if !allow_ollama {
+                allow_ollama = check_ollama_health_with_timeout(
+                    &base_url,
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+                .unwrap_or(false);
+            }
+
+            if allow_ollama {
+                let mut p = OllamaProvider::new().with_base_url(&base_url);
+                let default_model = config
+                    .providers
+                    .ollama
+                    .as_ref()
+                    .and_then(|c| c.default_model.clone())
+                    .or_else(|| config.providers.default_model.clone());
+                if let Some(default_model) = default_model {
                     p = p.with_default_model(default_model);
                 }
                 info!("Auto-selected provider: ollama");
                 return Ok(Arc::new(p));
             }
+
             if let Some(anthropic_config) = &config.providers.anthropic {
                 let mut p = AnthropicProvider::new(&anthropic_config.api_key);
                 if let Some(base_url) = &anthropic_config.base_url {
                     p = p.with_base_url(base_url);
                 }
-                if let Some(default_model) = &anthropic_config.default_model {
+                let default_model = anthropic_config
+                    .default_model
+                    .clone()
+                    .or_else(|| config.providers.default_model.clone());
+                if let Some(default_model) = default_model {
                     p = p.with_default_model(default_model);
                 }
                 if let Some(max_tokens) = anthropic_config.max_tokens {
@@ -3431,12 +3707,41 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
                 if let Some(base_url) = &openai_config.base_url {
                     p = p.with_base_url(base_url);
                 }
-                if let Some(default_model) = &openai_config.default_model {
+                let default_model = openai_config
+                    .default_model
+                    .clone()
+                    .or_else(|| config.providers.default_model.clone());
+                if let Some(default_model) = default_model {
                     p = p.with_default_model(default_model);
                 }
                 info!("Auto-selected provider: openai");
                 return Ok(Arc::new(p));
             }
+
+            for cfg in config.providers.openai_compatible.iter() {
+                let mut p = OpenAIProvider::new(&cfg.api_key)
+                    .with_provider_name(cfg.name.clone())
+                    .with_base_url(cfg.base_url.clone())
+                    .with_extra_headers(cfg.headers.clone());
+                let default_model = cfg
+                    .default_model
+                    .clone()
+                    .or_else(|| config.providers.default_model.clone());
+                if let Some(default_model) = default_model {
+                    p = p.with_default_model(default_model);
+                }
+                info!(provider = %cfg.name, "Auto-selected provider: openai-compatible");
+                return Ok(Arc::new(p));
+            }
+
+            for cfg in config.providers.cli.iter() {
+                let p = CliProvider::from_config(cfg);
+                if p.check_command_exists().is_ok() {
+                    info!(provider = %cfg.name, "Auto-selected provider: cli");
+                    return Ok(Arc::new(p));
+                }
+            }
+
             Err(anyhow::anyhow!(
                 "No providers configured. Run 'drbot wizard' to configure."
             ))
@@ -3451,7 +3756,11 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
             if let Some(base_url) = &anthropic_config.base_url {
                 p = p.with_base_url(base_url);
             }
-            if let Some(default_model) = &anthropic_config.default_model {
+            let default_model = anthropic_config
+                .default_model
+                .clone()
+                .or_else(|| config.providers.default_model.clone());
+            if let Some(default_model) = default_model {
                 p = p.with_default_model(default_model);
             }
             if let Some(max_tokens) = anthropic_config.max_tokens {
@@ -3469,17 +3778,36 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
             if let Some(base_url) = &openai_config.base_url {
                 p = p.with_base_url(base_url);
             }
-            if let Some(default_model) = &openai_config.default_model {
+            let default_model = openai_config
+                .default_model
+                .clone()
+                .or_else(|| config.providers.default_model.clone());
+            if let Some(default_model) = default_model {
                 p = p.with_default_model(default_model);
             }
             Ok(Arc::new(p))
         }
         "ollama" | "local" => {
-            let ollama_config = config.providers.ollama.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("Ollama provider not configured. Run 'drbot wizard' to configure.")
-            })?;
-            let mut p = OllamaProvider::new().with_base_url(&ollama_config.url);
-            if let Some(default_model) = &ollama_config.default_model {
+            let base_url = ollama_base_url_best_effort(config);
+            let ok =
+                check_ollama_health_with_timeout(&base_url, std::time::Duration::from_millis(350))
+                    .await
+                    .unwrap_or(false);
+            if !ok {
+                return Err(anyhow::anyhow!(
+                    "Ollama not reachable at {} (start Ollama or run 'drbot wizard')",
+                    base_url.trim()
+                ));
+            }
+
+            let mut p = OllamaProvider::new().with_base_url(&base_url);
+            let default_model = config
+                .providers
+                .ollama
+                .as_ref()
+                .and_then(|c| c.default_model.clone())
+                .or_else(|| config.providers.default_model.clone());
+            if let Some(default_model) = default_model {
                 p = p.with_default_model(default_model);
             }
             Ok(Arc::new(p))
@@ -3494,6 +3822,11 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
             p.check_command_exists()?;
             Ok(Arc::new(p))
         }
+        "codex-oss" | "codex-local" => {
+            let p = CliProvider::codex_oss_ollama();
+            p.check_command_exists()?;
+            Ok(Arc::new(p))
+        }
         other => {
             // Check custom CLI providers from config
             if let Some(cli_cfg) = config.providers.cli.iter().find(|c| c.name == other) {
@@ -3501,8 +3834,29 @@ fn create_provider(config: &Config, provider_name: &str) -> Result<Arc<dyn Provi
                 p.check_command_exists()?;
                 return Ok(Arc::new(p));
             }
+
+            // Check OpenAI-compatible providers from config (OpenRouter, xAI, etc).
+            if let Some(cfg) = config
+                .providers
+                .openai_compatible
+                .iter()
+                .find(|c| c.name == other)
+            {
+                let mut p = OpenAIProvider::new(&cfg.api_key)
+                    .with_provider_name(cfg.name.clone())
+                    .with_base_url(cfg.base_url.clone())
+                    .with_extra_headers(cfg.headers.clone());
+                let default_model = cfg
+                    .default_model
+                    .clone()
+                    .or_else(|| config.providers.default_model.clone());
+                if let Some(default_model) = default_model {
+                    p = p.with_default_model(default_model);
+                }
+                return Ok(Arc::new(p));
+            }
             Err(anyhow::anyhow!(
-                "Unknown provider: {}. Supported: auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli",
+                "Unknown provider: {}. Supported: auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli, codex-oss",
                 provider_name
             ))
         }
@@ -3553,20 +3907,6 @@ fn init_persona_registry() -> PersonaRegistry {
     let _ = registry.register(technical);
 
     registry
-}
-
-#[derive(Debug, Clone)]
-struct ToolCallSpec {
-    tool: String,
-    args: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
-struct ToolModeConfig {
-    enabled: bool,
-    auto_approve: bool,
-    root: PathBuf,
-    max_rounds: usize,
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -3631,114 +3971,135 @@ fn resolve_single_message(
     Ok(Some(msg))
 }
 
-fn canonicalize_root(root: &Path) -> Result<PathBuf> {
-    root.canonicalize()
-        .map_err(|e| anyhow::anyhow!("Failed to resolve root '{}': {}", root.display(), e))
+fn resolve_default_chat_workspace_dir(config: &Config) -> Option<PathBuf> {
+    use drbot_gateway::openclaw_paths;
+
+    let state_dir = openclaw_paths::resolve_openclaw_state_dir(config)?;
+    let agent_id = openclaw_paths::DEFAULT_AGENT_ID;
+
+    // Honor `agents.json` workspace overrides (OpenClaw parity).
+    let agents_path = state_dir.join("agents.json");
+    if let Ok(raw) = std::fs::read_to_string(&agents_path) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(agents) = value.get("agents").and_then(|v| v.as_array()) {
+                for agent in agents {
+                    let raw_id = agent.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
+                    if openclaw_paths::normalize_agent_id(raw_id) != agent_id {
+                        continue;
+                    }
+                    let workspace = agent
+                        .get("workspace")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .unwrap_or("");
+                    if workspace.is_empty() {
+                        continue;
+                    }
+                    return Some(openclaw_paths::resolve_user_path(workspace));
+                }
+            }
+        }
+    }
+
+    Some(state_dir.join("agents").join(agent_id))
 }
 
-fn resolve_path_under_root(root: &Path, path: &str, must_exist: bool) -> Result<PathBuf> {
-    let expanded = expand_tilde(path);
-    let input = Path::new(expanded.as_str());
+fn ensure_chat_workspace_bootstrap(workspace_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(workspace_dir)?;
 
-    if input.is_absolute() {
-        let canon = if must_exist {
-            input.canonicalize()
-        } else {
-            // For writes, canonicalize the parent directory.
-            let parent = input
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", input.display()))?;
-            let parent_canon = parent.canonicalize().map_err(|e| {
+    let identity_path = workspace_dir.join("IDENTITY.md");
+    if !identity_path.exists() {
+        let _ = std::fs::write(&identity_path, "# drbot\n");
+    }
+
+    let user_path = workspace_dir.join("USER.md");
+    if !user_path.exists() {
+        let _ = std::fs::write(
+            &user_path,
+            r#"# User
+
+Stable facts and preferences that should carry across sessions.
+
+- Name:
+- Timezone:
+- Preferred tone/style:
+- Formatting preferences (e.g., bullets, terse/verbose):
+- Defaults (units, currency, locale):
+- Avoid / don't do:
+"#,
+        );
+    }
+
+    let memory_path = workspace_dir.join("MEMORY.md");
+    let memory_alt_path = workspace_dir.join("memory.md");
+    if !memory_path.exists() && !memory_alt_path.exists() {
+        let _ = std::fs::write(
+            &memory_path,
+            r#"# Memory
+
+Long-term notes for the assistant.
+
+- Keep *always-relevant* items short and stable.
+- Put longer docs/notes in `memory/` as separate Markdown files (easier to search).
+
+## Pinned
+
+## Preferences
+
+## Knowledge base
+"#,
+        );
+    }
+
+    let memory_dir = workspace_dir.join("memory");
+    std::fs::create_dir_all(&memory_dir)?;
+    let readme = memory_dir.join("README.md");
+    if !readme.exists() {
+        let _ = std::fs::write(
+            &readme,
+            r#"# Knowledge Base
+
+Put longer notes/docs here as Markdown files (the assistant can search them when needed).
+
+Suggested files:
+- `projects.md` (current work + status)
+- `people.md` (names + relationships)
+- `procedures.md` (how you like things done)
+- `preferences.md` (style, tools, defaults)
+"#,
+        );
+    }
+
+    // Best-effort personalization: auto-fill local timezone if the field is still blank.
+    let _ = drbot_gateway::workspace_autosave::ensure_user_timezone_best_effort(workspace_dir);
+
+    Ok(())
+}
+
+async fn run_kb(action: KbAction) -> Result<()> {
+    match action {
+        KbAction::Init { dir } => {
+            let start = match dir.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(raw) => PathBuf::from(expand_tilde(raw)),
+                None => std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?,
+            };
+            let start = start.canonicalize().unwrap_or(start);
+            let project_root =
+                drbot_tool_mode::find_git_root_best_effort(&start).unwrap_or(start);
+            let project_drbot_dir = project_root.join(".drbot");
+
+            drbot_tool_mode::ensure_project_kb_bootstrap(&project_drbot_dir).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to resolve parent directory '{}': {}",
-                    parent.display(),
+                    "Failed to initialize {}: {}",
+                    project_drbot_dir.display(),
                     e
                 )
             })?;
-            let name = input
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", input.display()))?;
-            Ok(parent_canon.join(name))
-        }?;
 
-        if !canon.starts_with(root) {
-            return Err(anyhow::anyhow!(
-                "Path '{}' is outside tool root '{}'",
-                canon.display(),
-                root.display()
-            ));
+            println!("Initialized project KB: {}", project_drbot_dir.display());
+            Ok(())
         }
-        return Ok(canon);
     }
-
-    let joined = root.join(input);
-    if must_exist {
-        let canon = joined
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("Failed to resolve path '{}': {}", joined.display(), e))?;
-        if !canon.starts_with(root) {
-            return Err(anyhow::anyhow!(
-                "Path '{}' is outside tool root '{}'",
-                canon.display(),
-                root.display()
-            ));
-        }
-        return Ok(canon);
-    }
-
-    // For writes, canonicalize parent directory (must exist).
-    let parent = joined
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", joined.display()))?;
-    let parent_canon = parent.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to resolve parent directory '{}': {}",
-            parent.display(),
-            e
-        )
-    })?;
-    if !parent_canon.starts_with(root) {
-        return Err(anyhow::anyhow!(
-            "Path '{}' is outside tool root '{}'",
-            parent_canon.display(),
-            root.display()
-        ));
-    }
-    let name = joined
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", joined.display()))?;
-    Ok(parent_canon.join(name))
-}
-
-fn build_agent_system_prompt(base: Option<String>, tool_root: &Path) -> String {
-    let mut s = base.unwrap_or_else(|| "You are drbot, a helpful AI assistant.".to_string());
-    s.push_str("\n\n");
-    s.push_str("You are operating in a terminal with access to local tools.\n");
-    s.push_str("When you need to run a tool, respond ONLY with a fenced code block with language drbot_tool containing JSON.\n");
-    s.push_str("The JSON must be either a single object or an array of objects in this form:\n");
-    s.push_str("{\"tool\":\"bash\",\"args\":{\"command\":\"git status\"}}\n");
-    s.push_str("\nAvailable tools:\n");
-    s.push_str("- bash: Run a shell command.\n");
-    s.push_str("  args: { \"command\": string, \"cwd\"?: string }\n");
-    s.push_str("  If cwd is provided, it must be a path under the tool root.\n");
-    s.push_str("- read_file: Read a UTF-8 text file under the tool root.\n");
-    s.push_str("  args: { \"path\": string }\n");
-    s.push_str("- write_file: Write/replace a UTF-8 text file under the tool root.\n");
-    s.push_str("  args: { \"path\": string, \"content\": string }\n");
-    s.push_str("- list_dir / list_directory: List a directory under the tool root.\n");
-    s.push_str("  args: { \"path\": string }\n");
-    s.push_str("- search: Search for a pattern under a path (uses ripgrep when available).\n");
-    s.push_str("  args: { \"pattern\": string, \"path\": string }\n");
-    s.push_str("- apply_patch: Apply a unified diff patch to files under the tool root.\n");
-    s.push_str("  args: { \"patch\": string }\n");
-    s.push_str("\nRules:\n");
-    s.push_str("- In tool mode, you are an autonomous coding agent: when the user asks you to create/modify/run something, do it with tools (don't ask the user to run commands).\n");
-    s.push_str("- Use relative paths unless absolutely necessary.\n");
-    s.push_str("- Each bash tool call does NOT preserve state between calls (including cd). Prefer args.cwd instead of `cd ... && ...`.\n");
-    s.push_str("- Prefer safe, read-only commands (git status/diff, rg, cargo test, etc.).\n");
-    s.push_str("- After a tool runs, you will receive a message starting with [Tool Result] or [Tool Denied]. Use it to continue.\n");
-    s.push_str(&format!("\nTool root: {}\n", tool_root.display()));
-    s
 }
 
 fn resolve_skill_url_timeout_secs() -> u64 {
@@ -4055,236 +4416,6 @@ async fn fetch_skill_pack_from_url(url: &str) -> Result<String> {
     Ok(out)
 }
 
-fn extract_tool_calls(text: &str) -> Vec<ToolCallSpec> {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum BlockKind {
-        ToolJson,
-        BashCommand,
-    }
-
-    fn parse_fence_lang(trimmed: &str) -> Option<String> {
-        if !trimmed.starts_with("```") {
-            return None;
-        }
-        Some(
-            trimmed
-                .trim_start_matches("```")
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase(),
-        )
-    }
-
-    fn normalize_bash_block(mut block: String) -> String {
-        // Strip common prompt prefixes (`$ `) to improve execution success.
-        let mut out = String::new();
-        for line in block.lines() {
-            let l = line.trim_end();
-            let l = l.strip_prefix("$ ").unwrap_or(l);
-            out.push_str(l);
-            out.push('\n');
-        }
-        out.trim().to_string()
-    }
-
-    let mut calls: Vec<ToolCallSpec> = Vec::new();
-    let mut in_block = false;
-    let mut block = String::new();
-    let mut kind: Option<BlockKind> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !in_block {
-            let Some(lang) = parse_fence_lang(trimmed) else {
-                continue;
-            };
-            let block_kind = match lang.as_str() {
-                "drbot_tool" | "json" => Some(BlockKind::ToolJson),
-                "bash" | "sh" | "shell" | "zsh" => Some(BlockKind::BashCommand),
-                _ => None,
-            };
-            if let Some(bk) = block_kind {
-                in_block = true;
-                kind = Some(bk);
-                block.clear();
-            }
-            continue;
-        }
-
-        if trimmed.starts_with("```") {
-            // End block -> parse
-            match kind {
-                Some(BlockKind::ToolJson) => {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&block) {
-                        match value {
-                            serde_json::Value::Array(items) => {
-                                for item in items {
-                                    if let Some(call) = parse_tool_call_value(&item) {
-                                        calls.push(call);
-                                    }
-                                }
-                            }
-                            other => {
-                                if let Some(call) = parse_tool_call_value(&other) {
-                                    calls.push(call);
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(BlockKind::BashCommand) => {
-                    let command = normalize_bash_block(std::mem::take(&mut block));
-                    if !command.is_empty() {
-                        calls.push(ToolCallSpec {
-                            tool: "bash".to_string(),
-                            args: serde_json::json!({ "command": command }),
-                        });
-                    }
-                }
-                None => {}
-            }
-
-            in_block = false;
-            kind = None;
-            block.clear();
-            continue;
-        }
-
-        block.push_str(line);
-        block.push('\n');
-    }
-
-    if !calls.is_empty() {
-        return calls;
-    }
-
-    // Allow lightweight patterns that local models often emit when "tool mode" prompts are ignored.
-    // Example: `bash: cd app && pnpm test`
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let lowered = trimmed.to_ascii_lowercase();
-        if let Some(rest) = lowered.strip_prefix("bash:") {
-            let cmd = trimmed[trimmed.len() - rest.len()..].trim();
-            if !cmd.is_empty() {
-                return vec![ToolCallSpec {
-                    tool: "bash".to_string(),
-                    args: serde_json::json!({ "command": cmd }),
-                }];
-            }
-        }
-    }
-
-    // Fallback: some models ignore the requested code-fence language and emit a raw JSON object/array.
-    // Extract the first JSON value that looks like a tool call.
-    fn extract_json_value_bounds(
-        s: &str,
-        start: usize,
-        open: char,
-        close: char,
-    ) -> Option<(usize, usize)> {
-        let slice = s.get(start..)?;
-        let mut depth: i64 = 0;
-        let mut in_string = false;
-        let mut escape = false;
-
-        for (off, ch) in slice.char_indices() {
-            if in_string {
-                if escape {
-                    escape = false;
-                    continue;
-                }
-                match ch {
-                    '\\' => escape = true,
-                    '"' => in_string = false,
-                    _ => {}
-                }
-                continue;
-            }
-
-            match ch {
-                '"' => in_string = true,
-                c if c == open => depth += 1,
-                c if c == close => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((start, start + off + ch.len_utf8()));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        None
-    }
-
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        let (open, close) = match ch {
-            '{' => ('{', '}'),
-            '[' => ('[', ']'),
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-
-        let Some((start, end)) = extract_json_value_bounds(text, i, open, close) else {
-            i += 1;
-            continue;
-        };
-        let json_str = &text[start..end];
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-            match value {
-                serde_json::Value::Array(items) => {
-                    for item in items {
-                        if let Some(call) = parse_tool_call_value(&item) {
-                            calls.push(call);
-                        }
-                    }
-                }
-                other => {
-                    if let Some(call) = parse_tool_call_value(&other) {
-                        calls.push(call);
-                    }
-                }
-            }
-            if !calls.is_empty() {
-                break;
-            }
-        }
-
-        i = end;
-    }
-
-    calls
-}
-
-fn parse_tool_call_value(value: &serde_json::Value) -> Option<ToolCallSpec> {
-    const SUPPORTED_TOOLS: &[&str] = &[
-        "bash",
-        "read_file",
-        "write_file",
-        "list_dir",
-        "list_directory",
-        "search",
-        "apply_patch",
-    ];
-
-    let tool = value.get("tool")?.as_str()?.to_string();
-    if !SUPPORTED_TOOLS.iter().any(|t| *t == tool) {
-        return None;
-    }
-    let args = value
-        .get("args")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    Some(ToolCallSpec { tool, args })
-}
-
 fn prompt_approve(prompt: &str) -> Result<bool> {
     print!("{}", prompt);
     io::stdout().flush()?;
@@ -4292,713 +4423,6 @@ fn prompt_approve(prompt: &str) -> Result<bool> {
     io::stdin().read_line(&mut input)?;
     let ans = input.trim().to_lowercase();
     Ok(ans == "y" || ans == "yes")
-}
-
-#[derive(Debug, Clone, Default)]
-struct BashAutoApprovePolicy {
-    allow_all: bool,
-    extra_prefixes: Vec<String>,
-    override_prefixes: Option<Vec<String>>,
-}
-
-fn bash_command_is_safe_for_auto_approve(command: &str, policy: &BashAutoApprovePolicy) -> bool {
-    const SAFE_PREFIXES: &[&str] = &[
-        "git", "cargo", "rg", "ls", "cat", "sed", "grep", "find", "head", "tail", "wc", "sort",
-        "uniq", "pwd", "echo",
-    ];
-    const FORBIDDEN_COMMANDS: &[&str] = &["sudo", "rm", "mkfs", "dd", "shutdown", "reboot"];
-
-    let cmd = command.trim();
-    if cmd.is_empty() {
-        return false;
-    }
-
-    // Extremely conservative: block clearly destructive commands even when auto-approving.
-    //
-    // Avoid substring matching like `"dd "` which would incorrectly block innocuous commands
-    // containing that sequence (e.g. `pnpm add ...`).
-    let normalized = cmd.replace("&&", ";").replace("||", ";").replace('\n', ";");
-    for segment in normalized.split(';') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        for part in segment.split('|') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            let first = part.split_whitespace().next().unwrap_or("");
-            let first_lower = first.to_ascii_lowercase();
-            let first_lower = first_lower.trim_start_matches('\\');
-            let base = first_lower.rsplit('/').next().unwrap_or(first_lower);
-            if FORBIDDEN_COMMANDS.contains(&base) {
-                return false;
-            }
-        }
-    }
-
-    if policy.allow_all {
-        return true;
-    }
-
-    let allowed: Vec<String> = if let Some(list) = &policy.override_prefixes {
-        list.clone()
-    } else if policy.extra_prefixes.is_empty() {
-        SAFE_PREFIXES
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        let mut seen = std::collections::HashSet::<String>::new();
-        let mut out: Vec<String> = Vec::new();
-        for p in SAFE_PREFIXES.iter().map(|s| s.to_string()) {
-            if seen.insert(p.clone()) {
-                out.push(p);
-            }
-        }
-        for p in &policy.extra_prefixes {
-            if seen.insert(p.clone()) {
-                out.push(p.clone());
-            }
-        }
-        out
-    };
-
-    let first = cmd.split_whitespace().next().unwrap_or("");
-    allowed
-        .iter()
-        .any(|p| first == p || first.ends_with(&format!("/{}", p)))
-}
-
-fn truncate_for_context(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!("{}...\n[truncated]", truncated)
-}
-
-async fn maybe_spool_tool_output(
-    root: &Path,
-    tool: &str,
-    output: &str,
-    max_chars: usize,
-) -> Result<String> {
-    let char_count = output.chars().count();
-    if char_count <= max_chars {
-        return Ok(output.to_string());
-    }
-
-    let dir = root.join(".drbot").join("tool-output");
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create tool-output dir: {}", e))?;
-
-    let mut slug = tool
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>();
-    slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() {
-        slug = "tool".to_string();
-    }
-
-    let path = dir.join(format!("{}-{}.txt", slug, Uuid::new_v4()));
-    tokio::fs::write(&path, output.as_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to write tool output: {}", e))?;
-
-    let rel = path
-        .strip_prefix(root)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let truncated = truncate_for_context(output, max_chars);
-
-    Ok(format!(
-        "[output truncated: {} chars; full output saved to {}]\n{}",
-        char_count, rel, truncated
-    ))
-}
-
-async fn run_bash_tool(root: &Path, cwd: &Path, command: &str) -> Result<(String, bool)> {
-    use tokio::process::Command;
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        Command::new("bash")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(cwd)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("bash tool timed out"))?
-    .map_err(|e| anyhow::anyhow!("Failed to run bash tool: {}", e))?;
-
-    let code = output.status.code().unwrap_or(-1);
-    let is_error = code != 0;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    let mut out = String::new();
-    out.push_str(&format!("exit_code: {}\n", code));
-    if !stdout.trim().is_empty() {
-        out.push_str("stdout:\n");
-        out.push_str(&stdout);
-        if !stdout.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    if !stderr.trim().is_empty() {
-        out.push_str("stderr:\n");
-        out.push_str(&stderr);
-        if !stderr.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-
-    let rendered = out.trim_end().to_string();
-    let rendered = maybe_spool_tool_output(root, "bash", &rendered, 40_000).await?;
-    Ok((rendered, is_error))
-}
-
-async fn run_read_file_tool(root: &Path, path: &str) -> Result<String> {
-    let file = resolve_path_under_root(root, path, true)?;
-    let bytes = tokio::fs::read(&file)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", file.display(), e))?;
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    Ok(truncate_for_context(&text, 120_000))
-}
-
-async fn run_write_file_tool(root: &Path, path: &str, content: &str) -> Result<String> {
-    let file = resolve_path_under_root(root, path, false)?;
-    tokio::fs::write(&file, content)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", file.display(), e))?;
-    Ok(format!(
-        "Wrote {} bytes to {}",
-        content.len(),
-        file.display()
-    ))
-}
-
-async fn run_list_dir_tool(root: &Path, path: &str) -> Result<String> {
-    let dir = resolve_path_under_root(root, path, true)?;
-    let mut entries = tokio::fs::read_dir(&dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read dir '{}': {}", dir.display(), e))?;
-    let mut items = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read dir entry: {}", e))?
-    {
-        let meta = entry.metadata().await.ok();
-        let suffix = if meta.map(|m| m.is_dir()).unwrap_or(false) {
-            "/"
-        } else {
-            ""
-        };
-        items.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
-    }
-    items.sort();
-    let rendered = items.join("\n");
-    let rendered = maybe_spool_tool_output(root, "list_dir", &rendered, 40_000).await?;
-    Ok(rendered)
-}
-
-async fn run_search_tool(root: &Path, pattern: &str, path: &str) -> Result<(String, bool)> {
-    use tokio::process::Command;
-
-    let target = resolve_path_under_root(root, path, true)?;
-
-    // Prefer ripgrep; fall back to grep.
-    let rg = Command::new("bash")
-        .arg("-lc")
-        .arg("command -v rg >/dev/null 2>&1")
-        .current_dir(root)
-        .output()
-        .await;
-
-    let (cmd, args): (&str, Vec<String>) = match rg {
-        Ok(out) if out.status.success() => (
-            "rg",
-            vec![
-                "-n".to_string(),
-                "--hidden".to_string(),
-                "--no-heading".to_string(),
-                pattern.to_string(),
-                target.to_string_lossy().to_string(),
-            ],
-        ),
-        _ => (
-            "grep",
-            vec![
-                "-R".to_string(),
-                "-n".to_string(),
-                pattern.to_string(),
-                target.to_string_lossy().to_string(),
-            ],
-        ),
-    };
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        Command::new(cmd).args(&args).current_dir(root).output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("search tool timed out"))?
-    .map_err(|e| anyhow::anyhow!("Failed to run search tool: {}", e))?;
-
-    let code = output.status.code().unwrap_or(-1);
-    let is_error = code != 0 && code != 1; // grep/rg use 1 for "no matches"
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    let mut out = String::new();
-    out.push_str(&format!("exit_code: {}\n", code));
-    if !stdout.trim().is_empty() {
-        out.push_str("stdout:\n");
-        out.push_str(&stdout);
-        if !stdout.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    if !stderr.trim().is_empty() {
-        out.push_str("stderr:\n");
-        out.push_str(&stderr);
-        if !stderr.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-
-    let rendered = out.trim_end().to_string();
-    let rendered = maybe_spool_tool_output(root, "search", &rendered, 40_000).await?;
-    Ok((rendered, is_error))
-}
-
-#[derive(Debug, Clone)]
-struct UnifiedDiffHunk {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-    lines: Vec<(char, String)>,
-}
-
-#[derive(Debug, Clone)]
-struct UnifiedDiffFile {
-    old_path: String,
-    new_path: String,
-    hunks: Vec<UnifiedDiffHunk>,
-}
-
-fn strip_unified_diff_path(raw: &str) -> String {
-    let token = raw.trim().trim_matches('"');
-    if token == "/dev/null" {
-        return token.to_string();
-    }
-    token
-        .strip_prefix("a/")
-        .or_else(|| token.strip_prefix("b/"))
-        .unwrap_or(token)
-        .to_string()
-}
-
-fn parse_unified_diff_hunk_header(line: &str) -> Result<(usize, usize, usize, usize)> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("@@") {
-        return Err(anyhow::anyhow!("invalid hunk header: {}", line));
-    }
-    let Some(end) = trimmed[2..].find("@@").map(|i| i + 2) else {
-        return Err(anyhow::anyhow!("invalid hunk header: {}", line));
-    };
-    let body = trimmed[2..end].trim();
-    let mut parts = body.split_whitespace();
-    let old = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid hunk header: {}", line))?;
-    let new = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid hunk header: {}", line))?;
-
-    fn parse_range(token: &str, sigil: char) -> Result<(usize, usize)> {
-        let t = token
-            .strip_prefix(sigil)
-            .ok_or_else(|| anyhow::anyhow!("invalid hunk range: {}", token))?;
-        let mut it = t.split(',');
-        let start = it
-            .next()
-            .unwrap_or("")
-            .parse::<usize>()
-            .map_err(|_| anyhow::anyhow!("invalid hunk start: {}", token))?;
-        let count = it
-            .next()
-            .map(|v| v.parse::<usize>())
-            .transpose()
-            .map_err(|_| anyhow::anyhow!("invalid hunk count: {}", token))?
-            .unwrap_or(1);
-        Ok((start, count))
-    }
-
-    let (old_start, old_count) = parse_range(old, '-')?;
-    let (new_start, new_count) = parse_range(new, '+')?;
-    Ok((old_start, old_count, new_start, new_count))
-}
-
-fn parse_unified_diff(patch: &str) -> Result<Vec<UnifiedDiffFile>> {
-    let mut files: Vec<UnifiedDiffFile> = Vec::new();
-    let mut cur_old: Option<String> = None;
-    let mut cur_new: Option<String> = None;
-    let mut cur_hunks: Vec<UnifiedDiffHunk> = Vec::new();
-    let mut cur_hunk: Option<UnifiedDiffHunk> = None;
-
-    fn finish_hunk(cur_hunks: &mut Vec<UnifiedDiffHunk>, cur_hunk: &mut Option<UnifiedDiffHunk>) {
-        if let Some(h) = cur_hunk.take() {
-            cur_hunks.push(h);
-        }
-    }
-
-    fn finish_file(
-        files: &mut Vec<UnifiedDiffFile>,
-        cur_old: &mut Option<String>,
-        cur_new: &mut Option<String>,
-        cur_hunks: &mut Vec<UnifiedDiffHunk>,
-        cur_hunk: &mut Option<UnifiedDiffHunk>,
-    ) {
-        finish_hunk(cur_hunks, cur_hunk);
-        if let (Some(old_path), Some(new_path)) = (cur_old.take(), cur_new.take()) {
-            files.push(UnifiedDiffFile {
-                old_path,
-                new_path,
-                hunks: std::mem::take(cur_hunks),
-            });
-        } else {
-            cur_old.take();
-            cur_new.take();
-            cur_hunks.clear();
-        }
-    }
-
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("--- ") {
-            finish_file(
-                &mut files,
-                &mut cur_old,
-                &mut cur_new,
-                &mut cur_hunks,
-                &mut cur_hunk,
-            );
-            let token = rest.trim().split_whitespace().next().unwrap_or("");
-            if token.is_empty() {
-                return Err(anyhow::anyhow!("invalid --- line: {}", line));
-            }
-            cur_old = Some(strip_unified_diff_path(token));
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let token = rest.trim().split_whitespace().next().unwrap_or("");
-            if token.is_empty() {
-                return Err(anyhow::anyhow!("invalid +++ line: {}", line));
-            }
-            cur_new = Some(strip_unified_diff_path(token));
-            continue;
-        }
-        if line.trim_start().starts_with("@@") {
-            finish_hunk(&mut cur_hunks, &mut cur_hunk);
-            let (old_start, old_count, new_start, new_count) =
-                parse_unified_diff_hunk_header(line)?;
-            cur_hunk = Some(UnifiedDiffHunk {
-                old_start,
-                old_count,
-                new_start,
-                new_count,
-                lines: Vec::new(),
-            });
-            continue;
-        }
-        if let Some(h) = cur_hunk.as_mut() {
-            if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ') {
-                let kind = line.chars().next().unwrap();
-                let text = line[1..].to_string();
-                h.lines.push((kind, text));
-            } else if line.starts_with('\\') {
-                // "\ No newline at end of file" - ignore.
-            }
-        }
-    }
-
-    finish_file(
-        &mut files,
-        &mut cur_old,
-        &mut cur_new,
-        &mut cur_hunks,
-        &mut cur_hunk,
-    );
-    Ok(files)
-}
-
-fn apply_unified_diff_to_text(original: &str, hunks: &[UnifiedDiffHunk]) -> Result<String> {
-    let had_trailing_newline = original.ends_with('\n');
-    let mut orig_lines: Vec<String> = original.split('\n').map(|s| s.to_string()).collect();
-    if had_trailing_newline {
-        if orig_lines.last().is_some_and(|l| l.is_empty()) {
-            orig_lines.pop();
-        }
-    }
-
-    let mut out: Vec<String> = Vec::new();
-    let mut orig_idx: usize = 0;
-
-    for hunk in hunks {
-        let target = hunk.old_start.saturating_sub(1);
-        if target < orig_idx {
-            return Err(anyhow::anyhow!("overlapping or out-of-order hunks"));
-        }
-        if target > orig_lines.len() {
-            return Err(anyhow::anyhow!("hunk starts past end of file"));
-        }
-
-        out.extend_from_slice(&orig_lines[orig_idx..target]);
-        let mut pos = target;
-        for (kind, text) in &hunk.lines {
-            match *kind {
-                ' ' => {
-                    let cur = orig_lines.get(pos).ok_or_else(|| {
-                        anyhow::anyhow!("context past end of file at line {}", pos + 1)
-                    })?;
-                    if cur != text {
-                        return Err(anyhow::anyhow!(
-                            "context mismatch at line {} (expected {:?}, found {:?})",
-                            pos + 1,
-                            text,
-                            cur
-                        ));
-                    }
-                    out.push(text.clone());
-                    pos += 1;
-                }
-                '-' => {
-                    let cur = orig_lines.get(pos).ok_or_else(|| {
-                        anyhow::anyhow!("remove past end of file at line {}", pos + 1)
-                    })?;
-                    if cur != text {
-                        return Err(anyhow::anyhow!(
-                            "remove mismatch at line {} (expected {:?}, found {:?})",
-                            pos + 1,
-                            text,
-                            cur
-                        ));
-                    }
-                    pos += 1;
-                }
-                '+' => {
-                    out.push(text.clone());
-                }
-                other => {
-                    return Err(anyhow::anyhow!("unknown hunk line kind: {}", other));
-                }
-            }
-        }
-        orig_idx = pos;
-    }
-
-    out.extend_from_slice(&orig_lines[orig_idx..]);
-
-    let mut rendered = out.join("\n");
-    if had_trailing_newline {
-        rendered.push('\n');
-    }
-    Ok(rendered)
-}
-
-async fn run_apply_patch_tool(root: &Path, patch: &str) -> Result<String> {
-    let files = parse_unified_diff(patch)?;
-    if files.is_empty() {
-        return Err(anyhow::anyhow!("apply_patch: no file patches found"));
-    }
-
-    let mut out_lines: Vec<String> = Vec::new();
-    for fp in files {
-        let old_path = fp.old_path.clone();
-        let new_path = fp.new_path.clone();
-
-        if old_path != "/dev/null" && new_path != "/dev/null" && old_path != new_path {
-            return Err(anyhow::anyhow!(
-                "apply_patch: renames are not supported ({} -> {})",
-                old_path,
-                new_path
-            ));
-        }
-
-        if new_path == "/dev/null" {
-            let file = resolve_path_under_root(root, &old_path, true)?;
-            tokio::fs::remove_file(&file)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete '{}': {}", file.display(), e))?;
-            out_lines.push(format!("deleted {}", old_path));
-            continue;
-        }
-
-        let target_path = new_path.clone();
-        let original = if old_path == "/dev/null" {
-            String::new()
-        } else {
-            let file = resolve_path_under_root(root, &target_path, true)?;
-            let bytes = tokio::fs::read(&file)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", file.display(), e))?;
-            String::from_utf8_lossy(&bytes).to_string()
-        };
-
-        let mut updated = apply_unified_diff_to_text(&original, &fp.hunks)?;
-        if old_path == "/dev/null" && !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        let _ = run_write_file_tool(root, &target_path, &updated).await?;
-        out_lines.push(format!("patched {}", target_path));
-    }
-
-    Ok(out_lines.join("\n"))
-}
-
-async fn execute_tool_call(
-    tool_cfg: &ToolModeConfig,
-    call: &ToolCallSpec,
-) -> Result<(String, bool)> {
-    match call.tool.as_str() {
-        "bash" => {
-            let command = call
-                .args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("bash tool requires args.command"))?;
-            let cwd = call
-                .args
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty());
-            let cwd_path = if let Some(cwd) = cwd {
-                let dir = resolve_path_under_root(&tool_cfg.root, cwd, true)?;
-                if !dir.is_dir() {
-                    return Err(anyhow::anyhow!("bash.cwd is not a directory: {}", cwd));
-                }
-                dir
-            } else {
-                tool_cfg.root.clone()
-            };
-            let (output, is_error) = run_bash_tool(&tool_cfg.root, &cwd_path, command).await?;
-            Ok((output, is_error))
-        }
-        "read_file" => {
-            let path = call
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("read_file tool requires args.path"))?;
-            let output = run_read_file_tool(&tool_cfg.root, path).await?;
-            Ok((output, false))
-        }
-        "write_file" => {
-            let path = call
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("write_file tool requires args.path"))?;
-            let content = call
-                .args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("write_file tool requires args.content"))?;
-            let output = run_write_file_tool(&tool_cfg.root, path, content).await?;
-            Ok((output, false))
-        }
-        "list_dir" | "list_directory" => {
-            let path = call
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let output = run_list_dir_tool(&tool_cfg.root, path).await?;
-            Ok((output, false))
-        }
-        "search" => {
-            let pattern = call
-                .args
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("search tool requires args.pattern"))?;
-            let path = call
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let (output, is_error) = run_search_tool(&tool_cfg.root, pattern, path).await?;
-            Ok((output, is_error))
-        }
-        "apply_patch" => {
-            let patch = call
-                .args
-                .get("patch")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("apply_patch tool requires args.patch"))?;
-            let output = run_apply_patch_tool(&tool_cfg.root, patch).await?;
-            Ok((output, false))
-        }
-        other => Err(anyhow::anyhow!("Unknown tool: {}", other)),
-    }
-}
-
-fn should_reprompt_for_tool_calls(user_text: &str, assistant_text: &str) -> bool {
-    fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-        needles.iter().any(|n| haystack.contains(n))
-    }
-
-    let user = user_text.to_ascii_lowercase();
-    let assistant = assistant_text.to_ascii_lowercase();
-
-    // If the user is asking for actions/edits/runs, we strongly prefer tool calls.
-    let user_intends_actions = contains_any(
-        &user,
-        &[
-            "create",
-            "scaffold",
-            "build",
-            "install",
-            "run",
-            "execute",
-            "fix",
-            "update",
-            "edit",
-            "write",
-            "implement",
-            "refactor",
-            "add ",
-            "remove",
-            "generate",
-            "test",
-            "compile",
-            "lint",
-            "format",
-            "apply",
-            "patch",
-        ],
-    );
-
-    // If the assistant is outputting command-like content without tool calls, reprompt.
-    let assistant_looks_actionable = contains_any(
-        &assistant,
-        &[
-            "```", // code fences (often `bash` without tool JSON)
-            "$ ", "cd ", "pnpm ", "npm ", "npx ", "node ", "cargo ", "git ", "rg ", "cat <<",
-        ],
-    );
-
-    user_intends_actions || assistant_looks_actionable
 }
 
 async fn run_chat(
@@ -5026,8 +4450,2316 @@ async fn run_chat(
     list_personas: bool,
     context_size: Option<usize>,
 ) -> Result<()> {
+    let force_direct = match std::env::var("DRBOT_CHAT_DIRECT") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    };
+
+    if !force_direct {
+        match run_chat_gateway(
+            config,
+            provider_name.clone(),
+            model.clone(),
+            system.clone(),
+            skill_url.clone(),
+            agent,
+            yes,
+            bash_auto_approve_prefixes.clone(),
+            bash_auto_approve_allowlist.clone(),
+            bash_auto_approve_all,
+            agent_strict,
+            root.clone(),
+            max_tool_rounds,
+            single_message.clone(),
+            message_file.clone(),
+            stream,
+            session_id.clone(),
+            new_session,
+            list_sessions,
+            title.clone(),
+            persona_name.clone(),
+            list_personas,
+            context_size,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Gateway-backed chat failed; falling back to direct provider mode (set DRBOT_CHAT_DIRECT=1 to force direct)"
+                );
+            }
+        }
+    }
+
+    run_chat_direct(
+        config,
+        provider_name,
+        model,
+        system,
+        skill_url,
+        agent,
+        yes,
+        bash_auto_approve_prefixes,
+        bash_auto_approve_allowlist,
+        bash_auto_approve_all,
+        agent_strict,
+        root,
+        max_tool_rounds,
+        single_message,
+        message_file,
+        stream,
+        session_id,
+        new_session,
+        list_sessions,
+        title,
+        persona_name,
+        list_personas,
+        context_size,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_gateway(
+    config: &Config,
+    provider_name: Option<String>,
+    model: Option<String>,
+    system: Option<String>,
+    skill_url: Option<String>,
+    agent: bool,
+    yes: bool,
+    bash_auto_approve_prefixes: Option<String>,
+    bash_auto_approve_allowlist: Option<String>,
+    bash_auto_approve_all: bool,
+    agent_strict: bool,
+    root: Option<String>,
+    max_tool_rounds: usize,
+    single_message: Option<String>,
+    message_file: Option<String>,
+    stream: bool,
+    session_id: Option<String>,
+    new_session: bool,
+    list_sessions: bool,
+    title: Option<String>,
+    persona_name: Option<String>,
+    list_personas: bool,
+    context_size: Option<usize>,
+) -> Result<()> {
+    use crate::gateway_client::GatewayClient;
+    use drbot_protocol::{
+        event::{chat as chat_events, provider as provider_events},
+        event_types, AuthLoginParams, ChatOptions as GatewayChatOptions, ChatSendParams,
+        ProviderListParams, ProviderListResult, ProviderModelsParams, ProviderModelsResult,
+        ProviderSelectParams, ProviderSelectResult, Request, Response, SessionClearParams,
+        SessionCreateParams, SessionCreateResult, SessionGetParams, SessionGetResult,
+        SessionListParams, SessionListResult, SessionUpdateParams,
+    };
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    let persona_registry = init_persona_registry();
+
+    if list_personas {
+        println!("Available Personas");
+        println!("==================");
+        println!();
+        for persona in persona_registry.list() {
+            println!("  {:12} - {}", persona.id, persona.description);
+        }
+        println!();
+        println!("Use with: drbot chat --persona <name>");
+        return Ok(());
+    }
+
+    let single_message = resolve_single_message(single_message, message_file)?;
+
+    // Best-effort: start/attach gateway (like the default `drbot` TUI flow).
+    let mut shutdown_tx: Option<oneshot::Sender<()>> = None;
+    let mut gateway_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
+
+    if !gateway_is_listening(config).await {
+        let (tx, rx) = oneshot::channel::<()>();
+        shutdown_tx = Some(tx);
+        let gateway_config = config.clone();
+        gateway_task = Some(tokio::spawn(async move {
+            run_gateway_with_external_shutdown(gateway_config, async move {
+                let _ = rx.await;
+            })
+            .await
+        }));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if gateway_is_listening(config).await {
+                break;
+            }
+            if gateway_task.as_ref().is_some_and(|t| t.is_finished()) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        if !gateway_is_listening(config).await {
+            let err = match gateway_task.take() {
+                Some(t) => match t.await {
+                    Ok(Ok(())) => anyhow::anyhow!("Gateway exited before chat started"),
+                    Ok(Err(e)) => e,
+                    Err(e) => anyhow::anyhow!("Gateway task failed: {}", e),
+                },
+                None => anyhow::anyhow!("Gateway did not start listening"),
+            };
+            return Err(err);
+        }
+    }
+
+    let result: Result<()> = async {
+        let url = gateway_ws_url(config);
+        let (client, mut event_rx, mut response_rx) = GatewayClient::connect(&url).await?;
+
+        if let Some(token) = gateway_login_token(config) {
+            let resp = client
+                .request("auth.login", AuthLoginParams { token })
+                .await?;
+            if let Some(err) = resp.error {
+                return Err(anyhow::anyhow!("Gateway auth failed: {}", err.message));
+            }
+        }
+
+        async fn expect_ok(resp: Response, method: &str) -> Result<serde_json::Value> {
+            if let Some(err) = resp.error {
+                return Err(anyhow::anyhow!("{} error: {}", method, err.message));
+            }
+            resp.result
+                .ok_or_else(|| anyhow::anyhow!("{} returned no result", method))
+        }
+
+        // Sessions: list + exit (doesn't require a provider).
+        if list_sessions {
+            let resp = client
+                .request(
+                    "session.list",
+                    SessionListParams {
+                        limit: Some(20),
+                        offset: None,
+                        state: Some("all".to_string()),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "session.list").await?;
+            let parsed: SessionListResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if parsed.sessions.is_empty() {
+                println!("No sessions found.");
+                return Ok(());
+            }
+
+            println!("Recent Sessions");
+            println!("===============");
+            println!();
+            for s in parsed.sessions.iter().take(20) {
+                let title = s.title.as_deref().unwrap_or("Untitled");
+                let updated = s.updated_at.format("%Y-%m-%d %H:%M");
+                println!(
+                    "  {} - {} ({} messages, {})",
+                    &s.id.to_string()[..8],
+                    title,
+                    s.message_count,
+                    updated
+                );
+            }
+            println!();
+            println!("Resume with: drbot chat --session <id>");
+            return Ok(());
+        }
+
+        // Tool/agent mode config (runs tools locally while chatting via the gateway).
+        let tool_root = if agent {
+            let root_path = root
+                .as_deref()
+                .map(|p| PathBuf::from(expand_tilde(p)))
+                .unwrap_or(std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?);
+            let (resolved, used_default) =
+                resolve_tool_root_with_allowlist(root_path, &config.assistant.workspace_allowlist)?;
+            if used_default && (agent || root.is_some()) {
+                warn!(
+                    root = %resolved.display(),
+                    "tool root not in allowlist; using allowed workspace root"
+                );
+                eprintln!(
+                    "Warning: tool root not in allowlist; using {}",
+                    resolved.display()
+                );
+            }
+            resolved
+        } else {
+            let root_path =
+                std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let (resolved, used_default) =
+                resolve_tool_root_with_allowlist(root_path, &config.assistant.workspace_allowlist)?;
+            if used_default && root.is_some() {
+                warn!(
+                    root = %resolved.display(),
+                    "tool root not in allowlist; using allowed workspace root"
+                );
+            }
+            resolved
+        };
+
+        let mut tool_cfg = ToolModeConfig {
+            enabled: agent,
+            auto_approve: yes,
+            root: tool_root,
+            max_rounds: max_tool_rounds.max(1),
+            autonomy_mode: config.assistant.autonomy_mode,
+            tool_allowlist: config.assistant.tool_allowlist.clone(),
+            tool_denylist: config.assistant.tool_denylist.clone(),
+        };
+
+        let bash_policy = {
+            fn parse_csv(raw: &str) -> Vec<String> {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            }
+
+            let mut override_prefixes: Option<Vec<String>> = bash_auto_approve_allowlist
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(parse_csv);
+
+            if let Some(list) = &override_prefixes {
+                if list.is_empty() {
+                    override_prefixes = None;
+                }
+            }
+
+            let mut extra_prefixes: Vec<String> = bash_auto_approve_prefixes
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(parse_csv)
+                .unwrap_or_default();
+
+            let mut allow_all = bash_auto_approve_all;
+            allow_all = allow_all
+                || override_prefixes
+                    .as_ref()
+                    .map(|v| v.iter().any(|p| p == "*" || p.eq_ignore_ascii_case("all")))
+                    .unwrap_or(false)
+                || extra_prefixes
+                    .iter()
+                    .any(|p| p == "*" || p.eq_ignore_ascii_case("all"));
+
+            if allow_all {
+                override_prefixes = None;
+                extra_prefixes.clear();
+            }
+
+        BashAutoApprovePolicy {
+            allow_all,
+            extra_prefixes,
+            override_prefixes,
+        }
+    };
+
+        let skill_pack = if let Some(url) = skill_url
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            Some(fetch_skill_pack_from_url(url).await?)
+        } else {
+            None
+        };
+
+        // Provider: select explicit provider if requested; otherwise ensure something is active.
+        let mut active_provider: Option<String>;
+        if let Some(requested) = provider_name
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let resp = client
+                .request(
+                    "provider.select",
+                    ProviderSelectParams {
+                        provider: requested.to_string(),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "provider.select").await?;
+            let parsed: ProviderSelectResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+            active_provider = Some(parsed.provider.name);
+        } else {
+            let resp = client
+                .request("provider.list", ProviderListParams::default())
+                .await?;
+            let result = expect_ok(resp, "provider.list").await?;
+            let parsed: ProviderListResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+            active_provider = parsed
+                .providers
+                .iter()
+                .find(|p| p.status.starts_with("active"))
+                .map(|p| p.name.clone());
+
+            if active_provider.is_none() {
+                let resp = client
+                    .request(
+                        "provider.select",
+                        ProviderSelectParams {
+                            provider: "auto".to_string(),
+                        },
+                    )
+                    .await?;
+                let result = expect_ok(resp, "provider.select").await?;
+                let parsed: ProviderSelectResult =
+                    serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+                active_provider = Some(parsed.provider.name);
+            }
+        }
+
+        // Helper to resolve session ID by UUID or prefix.
+        async fn resolve_session_id_prefix(
+            client: &GatewayClient,
+            raw: &str,
+        ) -> Result<Uuid> {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow::anyhow!("session id is empty"));
+            }
+            if let Ok(uuid) = Uuid::parse_str(trimmed) {
+                return Ok(uuid);
+            }
+
+            let resp = client
+                .request(
+                    "session.list",
+                    SessionListParams {
+                        limit: Some(200),
+                        offset: None,
+                        state: Some("all".to_string()),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "session.list").await?;
+            let parsed: SessionListResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let mut matches = parsed
+                .sessions
+                .into_iter()
+                .filter(|s| s.id.to_string().starts_with(trimmed))
+                .collect::<Vec<_>>();
+
+            if matches.is_empty() {
+                return Err(anyhow::anyhow!("Session not found: {}", trimmed));
+            }
+            if matches.len() > 1 {
+                matches.sort_by_key(|s| s.updated_at);
+                matches.reverse();
+                let suggestions = matches
+                    .into_iter()
+                    .take(5)
+                    .map(|s| s.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow::anyhow!(
+                    "Session prefix is ambiguous: {} (matches: {})",
+                    trimmed,
+                    suggestions
+                ));
+            }
+            Ok(matches.remove(0).id)
+        }
+
+        let git_root = drbot_tool_mode::find_git_root_best_effort(&tool_cfg.root);
+        let in_git_project = git_root.is_some();
+        let project_key_base = git_root
+            .unwrap_or_else(|| tool_cfg.root.clone())
+            .to_string_lossy()
+            .to_string();
+        let project_drbot_dir = drbot_tool_mode::resolve_project_drbot_dir_best_effort(&tool_cfg.root);
+        if in_git_project && drbot_tool_mode::project_kb_auto_init_enabled() {
+            drbot_tool_mode::ensure_project_kb_bootstrap_best_effort(&project_drbot_dir);
+        }
+        let session_map_key = if tool_cfg.enabled {
+            format!("{}#agent", project_key_base)
+        } else {
+            format!("{}#chat", project_key_base)
+        };
+        let mut session_prefs = GatewayChatPrefs::load_best_effort();
+        let mapped_session_uuid = session_prefs
+            .last_session_by_project
+            .get(&session_map_key)
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        // Avoid polluting a "normal chat" session with tool-mode prompts when using --agent.
+        // Users can still resume a specific session via --session.
+        let user_requested_new_session = new_session;
+        let session_id_requested = session_id
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let new_session =
+            user_requested_new_session || (agent && !session_id_requested && mapped_session_uuid.is_none());
+        let default_session_title = if agent { "Gateway Agent" } else { "Gateway Chat" };
+
+        // Establish a session (resume by id, resume most recent, or create).
+        let mut session_uuid_maybe_stale = false;
+        let mut session_uuid: Uuid = if let Some(raw) = session_id
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            resolve_session_id_prefix(&client, raw).await?
+        } else if new_session {
+            let resp = client
+                .request(
+                    "session.create",
+                    SessionCreateParams {
+                        title: title
+                            .clone()
+                            .or_else(|| Some(default_session_title.to_string())),
+                        provider: active_provider.clone(),
+                        model: model.clone(),
+                        system_prompt: system.clone(),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "session.create").await?;
+            let parsed: SessionCreateResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+            parsed.session_id
+        } else if let Some(mapped) = mapped_session_uuid {
+            session_uuid_maybe_stale = true;
+            mapped
+        } else if in_git_project {
+            let resp = client
+                .request(
+                    "session.create",
+                    SessionCreateParams {
+                        title: title
+                            .clone()
+                            .or_else(|| Some(default_session_title.to_string())),
+                        provider: active_provider.clone(),
+                        model: model.clone(),
+                        system_prompt: system.clone(),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "session.create").await?;
+            let parsed: SessionCreateResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+            parsed.session_id
+        } else {
+            let resp = client
+                .request(
+                    "session.list",
+                    SessionListParams {
+                        limit: Some(1),
+                        offset: None,
+                        state: Some("active".to_string()),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "session.list").await?;
+            let parsed: SessionListResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if let Some(first) = parsed.sessions.first() {
+                session_uuid_maybe_stale = true;
+                first.id
+            } else {
+                let resp = client
+                    .request(
+                        "session.create",
+                        SessionCreateParams {
+                            title: title
+                                .clone()
+                                .or_else(|| Some(default_session_title.to_string())),
+                            provider: active_provider.clone(),
+                            model: model.clone(),
+                            system_prompt: system.clone(),
+                        },
+                    )
+                    .await?;
+                let result = expect_ok(resp, "session.create").await?;
+                let parsed: SessionCreateResult =
+                    serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+                parsed.session_id
+            }
+        };
+
+        session_prefs
+            .last_session_by_project
+            .insert(session_map_key.clone(), session_uuid.to_string());
+        session_prefs.save_best_effort();
+
+        let mut remember_session = |id: Uuid| {
+            session_prefs
+                .last_session_by_project
+                .insert(session_map_key.clone(), id.to_string());
+            session_prefs.save_best_effort();
+        };
+
+        // Load session details (and align provider/model header state).
+        let resp = client
+            .request("session.get", SessionGetParams { session_id: session_uuid })
+            .await?;
+        let result = match expect_ok(resp, "session.get").await {
+            Ok(r) => r,
+            Err(e) => {
+                if session_id_requested || !session_uuid_maybe_stale {
+                    return Err(e);
+                }
+
+                let resp = client
+                    .request(
+                        "session.create",
+                        SessionCreateParams {
+                            title: title
+                                .clone()
+                                .or_else(|| Some(default_session_title.to_string())),
+                            provider: active_provider.clone(),
+                            model: model.clone(),
+                            system_prompt: system.clone(),
+                        },
+                    )
+                    .await?;
+                let result = expect_ok(resp, "session.create").await?;
+                let parsed: SessionCreateResult =
+                    serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+                session_uuid = parsed.session_id;
+                remember_session(session_uuid);
+
+                let resp = client
+                    .request("session.get", SessionGetParams { session_id: session_uuid })
+                    .await?;
+                expect_ok(resp, "session.get").await?
+            }
+        };
+        let mut parsed: SessionGetResult =
+            serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        if let Some(p) = parsed
+            .session
+            .provider
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            // Best-effort: keep active provider aligned with the session.
+            let resp = client
+                .request(
+                    "provider.select",
+                    ProviderSelectParams {
+                        provider: p.to_string(),
+                    },
+                )
+                .await;
+            if let Ok(resp) = resp {
+                if resp.error.is_none() {
+                    active_provider = Some(p.to_string());
+                }
+            }
+        }
+
+        let mut model_override: Option<String> = parsed.session.model.clone();
+        let mut session_system_prompt: Option<String> = parsed.system_prompt.clone();
+
+        // Apply persona/system/model overrides as a session.update before chatting.
+        let active_persona = persona_name
+            .as_ref()
+            .and_then(|name| persona_registry.get(name));
+        let system_override = system
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let system_clear_requested = system
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty());
+
+        let desired_base_system_prompt: Option<String> = {
+            let mut base = if let Some(persona) = active_persona.as_ref() {
+                let persona_prompt = persona.build_system_prompt();
+                let underlying = if system_clear_requested {
+                    system_override.clone()
+                } else {
+                    system_override.clone().or_else(|| session_system_prompt.clone())
+                };
+
+                match underlying {
+                    Some(user_system) => {
+                        let persona_trim = persona_prompt.trim();
+                        let user_trim = user_system.trim();
+                        if user_trim.contains(persona_trim) {
+                            Some(user_trim.to_string())
+                        } else {
+                            Some(format!("{}\n\n{}", persona_trim, user_trim))
+                        }
+                    }
+                    None => Some(persona_prompt),
+                }
+            } else if system_clear_requested {
+                system_override.clone()
+            } else {
+                system_override.clone().or_else(|| session_system_prompt.clone())
+            };
+
+            if let Some(pack) = skill_pack.as_ref() {
+                let pack_trim = pack.trim();
+                if !pack_trim.is_empty() {
+                    base = Some(match base {
+                        Some(existing) => {
+                            let existing_trim = existing.trim();
+                            if existing_trim.contains(pack_trim) {
+                                existing_trim.to_string()
+                            } else {
+                                format!("{}\n\n---\n\n{}", existing_trim, pack_trim)
+                            }
+                        }
+                        None => pack_trim.to_string(),
+                    });
+                }
+            }
+
+            base
+        };
+
+        let mut update = SessionUpdateParams {
+            session_id: session_uuid,
+            ..Default::default()
+        };
+        let mut need_update = false;
+
+        if let Some(mdl) = model
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            update.model = Some(mdl.to_string());
+            model_override = Some(mdl.to_string());
+            need_update = true;
+        }
+
+        let persist_base_prompt = active_persona.is_some()
+            || system_override.is_some()
+            || system_clear_requested
+            || skill_pack.is_some();
+        if persist_base_prompt {
+            if system_clear_requested && desired_base_system_prompt.is_none() {
+                update.clear_system_prompt = true;
+                session_system_prompt = None;
+                need_update = true;
+            } else if let Some(sys) = desired_base_system_prompt
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                update.system_prompt = Some(sys.to_string());
+                session_system_prompt = Some(sys.to_string());
+                need_update = true;
+            }
+        }
+
+        // If an explicit provider was requested, persist it to the session as well (and clear the model).
+        if let Some(p) = provider_name
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            update.provider = Some(p.to_string());
+            update.clear_model = model_override.is_none();
+            model_override = if update.clear_model {
+                None
+            } else {
+                model_override
+            };
+            need_update = true;
+        }
+
+        if need_update {
+            let resp = client.request("session.update", update).await?;
+            // Don't hard fail; chat.send will still work even if persistence fails.
+            if let Some(err) = resp.error {
+                eprintln!("Warning: session.update failed: {}", err.message);
+            } else {
+                // Refresh session for accurate header state.
+                let resp = client
+                    .request(
+                        "session.get",
+                        SessionGetParams {
+                            session_id: session_uuid,
+                        },
+                    )
+                    .await?;
+                if let Ok(result) = expect_ok(resp, "session.get").await {
+                    if let Ok(new_parsed) = serde_json::from_value::<SessionGetResult>(result) {
+                        parsed = new_parsed;
+                        model_override = parsed.session.model.clone();
+                        session_system_prompt = parsed.system_prompt.clone();
+                    }
+                }
+            }
+        }
+
+        // Gateway chat doesn't use the local ContextManager yet; keep flag to avoid unused warnings.
+        let _ = context_size;
+
+        let tool_root_for_prompt = tool_cfg.root.clone();
+        let build_effective_system_prompt =
+            |tool_enabled: bool, base_system: &Option<String>| -> Option<String> {
+                if tool_enabled {
+                    Some(build_agent_system_prompt_with_policy(
+                        base_system.clone(),
+                        &tool_root_for_prompt,
+                        &tool_cfg.tool_allowlist,
+                        &tool_cfg.tool_denylist,
+                    ))
+                } else {
+                    base_system.clone()
+                }
+            };
+
+        let session_prefix = &session_uuid.to_string()[..8];
+        let provider_label = active_provider.as_deref().unwrap_or("auto");
+        let persona_label = active_persona
+            .as_ref()
+            .map(|p| format!(" [Persona: {}]", p.name))
+            .unwrap_or_default();
+
+        let has_single_message = single_message
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_single_message {
+            let chat_mode = if tool_cfg.enabled {
+                "Gateway Agent"
+            } else {
+                "Gateway Chat"
+            };
+            println!(
+                "drbot v{} - {} ({}) [Session: {}]{}",
+                env!("CARGO_PKG_VERSION"),
+                chat_mode,
+                provider_label,
+                session_prefix,
+                persona_label
+            );
+            println!("Commands: /help, /quit, /provider, /model, /sessions, /session, /new, /clear, /info, /agent, /approve, /tools");
+            if tool_cfg.enabled {
+                println!(
+                    "Tool mode: ON (auto-approve: {})  Autonomy: {:?}  Root: {}  Max rounds: {}",
+                    if tool_cfg.auto_approve { "ON" } else { "OFF" },
+                    tool_cfg.autonomy_mode,
+                    tool_cfg.root.display(),
+                    tool_cfg.max_rounds
+                );
+            }
+            if !parsed.messages.is_empty() {
+                println!("Resuming session with {} messages.", parsed.messages.len());
+            }
+            println!();
+        }
+
+        async fn print_provider_list(client: &GatewayClient) -> Result<()> {
+            let resp = client
+                .request("provider.list", ProviderListParams::default())
+                .await?;
+            let result = expect_ok(resp, "provider.list").await?;
+            let parsed: ProviderListResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+            println!("Providers:");
+            for p in parsed.providers {
+                println!("  - {} ({})  models: {}", p.name, p.status, p.models.len());
+            }
+            Ok(())
+        }
+
+        async fn print_model_list(client: &GatewayClient, cur: Option<&str>) -> Result<()> {
+            let resp = client
+                .request("provider.models", ProviderModelsParams { provider: None })
+                .await?;
+            let result = expect_ok(resp, "provider.models").await?;
+            let parsed: ProviderModelsResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("Current model: {}", cur.unwrap_or("(default)"));
+            println!("Available models:");
+            for m in parsed.models {
+                println!("  - {}  {}", m.id, m.name);
+            }
+            Ok(())
+        }
+
+        async fn print_sessions(client: &GatewayClient) -> Result<()> {
+            let resp = client
+                .request(
+                    "session.list",
+                    SessionListParams {
+                        limit: Some(20),
+                        offset: None,
+                        state: Some("all".to_string()),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "session.list").await?;
+            let parsed: SessionListResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if parsed.sessions.is_empty() {
+                println!("No sessions found.");
+                return Ok(());
+            }
+            println!("Sessions:");
+            for s in parsed.sessions.iter().take(20) {
+                let provider = s.provider.as_deref().unwrap_or("(default)");
+                let model = s.model.as_deref().unwrap_or("(default)");
+                let title = s.title.as_deref().unwrap_or("Untitled");
+                println!(
+                    "  - {}  {}  provider:{}  model:{}  {}",
+                    s.id, s.state, provider, model, title
+                );
+            }
+            Ok(())
+        }
+
+        async fn print_session_info(client: &GatewayClient, id: Uuid) -> Result<()> {
+            let resp = client
+                .request("session.get", SessionGetParams { session_id: id })
+                .await?;
+            let result = expect_ok(resp, "session.get").await?;
+            let parsed: SessionGetResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("Session: {}", parsed.session.id);
+            println!("State: {}", parsed.session.state);
+            println!(
+                "Title: {}",
+                parsed.session.title.as_deref().unwrap_or("(untitled)")
+            );
+            println!(
+                "Provider: {}",
+                parsed.session.provider.as_deref().unwrap_or("(default)")
+            );
+            println!(
+                "Model: {}",
+                parsed.session.model.as_deref().unwrap_or("(default)")
+            );
+            println!(
+                "System prompt: {}",
+                parsed
+                    .system_prompt
+                    .as_deref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("(none)")
+            );
+            println!("Messages: {}", parsed.messages.len());
+            Ok(())
+        }
+
+        async fn send_chat_streaming(
+            client: &GatewayClient,
+            event_rx: &mut tokio::sync::mpsc::Receiver<drbot_protocol::Event>,
+            response_rx: &mut tokio::sync::mpsc::Receiver<Response>,
+            session_id: Uuid,
+            message: &str,
+            model_override: &mut Option<String>,
+            opts: GatewayChatOptions,
+        ) -> Result<String> {
+            let params = ChatSendParams {
+                session_id: Some(session_id),
+                message: message.to_string(),
+                model: None,
+                stream: true,
+                options: Some(opts),
+            };
+            let req = Request::create("chat.send", params);
+            let request_id = req.id;
+
+            client.send_request(req).await?;
+
+            // Print streaming deltas until complete, while also watching for request-level errors.
+            let mut complete = false;
+            let mut response_ok = false;
+            let mut last_provider_changed: Option<String> = None;
+            let mut out = String::new();
+
+            loop {
+                tokio::select! {
+                    maybe_event = event_rx.recv() => {
+                        let Some(event) = maybe_event else {
+                            return Err(anyhow::anyhow!("Gateway event channel closed"));
+                        };
+
+                        match event.event_type.as_str() {
+                            event_types::CHAT_STREAM_START => {
+                                if let Ok(ev) = serde_json::from_value::<chat_events::StreamStartEvent>(event.data) {
+                                    if ev.request_id == request_id {
+                                        // Session ids should match, but keep it robust.
+                                        if ev.provider.is_some() {
+                                            // no-op (header is printed outside)
+                                        }
+                                    }
+                                }
+                            }
+                            event_types::CHAT_STREAM_DELTA => {
+                                if let Ok(ev) = serde_json::from_value::<chat_events::StreamDeltaEvent>(event.data) {
+                                    if ev.request_id == request_id {
+                                        out.push_str(&ev.delta);
+                                        print!("{}", ev.delta);
+                                        let _ = io::stdout().flush();
+                                    }
+                                }
+                            }
+                            event_types::CHAT_STREAM_COMPLETE => {
+                                if let Ok(ev) = serde_json::from_value::<chat_events::StreamCompleteEvent>(event.data) {
+                                    if ev.request_id == request_id {
+                                        complete = true;
+                                        if let Some(_usage) = ev.usage {
+                                            // Keep output simple; could be added to /info later.
+                                        }
+                                        println!();
+                                        if response_ok {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            event_types::CHAT_STREAM_ERROR => {
+                                if let Ok(ev) = serde_json::from_value::<chat_events::StreamErrorEvent>(event.data) {
+                                    if ev.request_id == request_id {
+                                        println!();
+                                        return Err(anyhow::anyhow!("{}", ev.error));
+                                    }
+                                }
+                            }
+                            event_types::PROVIDER_CHANGED => {
+                                if let Ok(ev) = serde_json::from_value::<provider_events::ChangedEvent>(event.data) {
+                                    last_provider_changed = Some(ev.provider.clone());
+                                }
+                            }
+                            "system.disconnected" => {
+                                return Err(anyhow::anyhow!("Gateway disconnected"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    maybe_resp = response_rx.recv() => {
+                        let Some(resp) = maybe_resp else {
+                            return Err(anyhow::anyhow!("Gateway response channel closed"));
+                        };
+                        if resp.id != request_id {
+                            continue;
+                        }
+                        if let Some(err) = resp.error {
+                            println!();
+                            return Err(anyhow::anyhow!("{}", err.message));
+                        }
+                        response_ok = true;
+                        // If the provider changed during this request (fallback), the gateway clears
+                        // any persisted model override to avoid cross-provider mismatch.
+                        if last_provider_changed.is_some() {
+                            *model_override = None;
+                        }
+                        if complete {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                        return Err(anyhow::anyhow!("chat.send timed out"));
+                    }
+                }
+
+                // Keep looping until we've observed both:
+                // - the request-level response (errors are delivered here)
+                // - the stream completion event (signals end-of-output)
+            }
+
+            Ok(out)
+        }
+
+        async fn send_chat_non_streaming(
+            client: &GatewayClient,
+            session_id: Uuid,
+            message: &str,
+            opts: GatewayChatOptions,
+        ) -> Result<String> {
+            let resp = client
+                .request(
+                    "chat.send",
+                    ChatSendParams {
+                        session_id: Some(session_id),
+                        message: message.to_string(),
+                        model: None,
+                        stream: false,
+                        options: Some(opts),
+                    },
+                )
+                .await?;
+            let result = expect_ok(resp, "chat.send").await?;
+            let parsed: drbot_protocol::ChatSendResult =
+                serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+            Ok(parsed.content.unwrap_or_default())
+        }
+
+        fn parse_kb_query_best_effort(message: &str) -> Option<String> {
+            let msg_trimmed = message.trim_start();
+            let msg_lower = msg_trimmed.to_ascii_lowercase();
+
+            let is_kb_cmd = msg_lower == "/kb"
+                || msg_lower.starts_with("/kb ")
+                || msg_lower.starts_with("/kb:")
+                || msg_lower.starts_with("kb:")
+                || msg_lower == "/notes"
+                || msg_lower.starts_with("/notes ")
+                || msg_lower.starts_with("/notes:")
+                || msg_lower.starts_with("notes:");
+
+            if !is_kb_cmd {
+                return None;
+            }
+
+            let query = if msg_lower == "/kb"
+                || msg_lower.starts_with("/kb ")
+                || msg_lower.starts_with("/kb:")
+            {
+                msg_trimmed[3..]
+                    .trim_start_matches(&[' ', ':'][..])
+                    .trim()
+                    .to_string()
+            } else if msg_lower.starts_with("kb:") {
+                msg_trimmed[3..].trim().to_string()
+            } else if msg_lower == "/notes"
+                || msg_lower.starts_with("/notes ")
+                || msg_lower.starts_with("/notes:")
+            {
+                msg_trimmed[6..]
+                    .trim_start_matches(&[' ', ':'][..])
+                    .trim()
+                    .to_string()
+            } else if msg_lower.starts_with("notes:") {
+                msg_trimmed[6..].trim().to_string()
+            } else {
+                String::new()
+            };
+
+            if query.trim().is_empty() {
+                None
+            } else {
+                Some(query)
+            }
+        }
+
+        // Single message mode (non-interactive).
+        if let Some(msg) = single_message.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if drbot_tool_mode::is_project_remember_command(msg)
+                || drbot_tool_mode::is_project_forget_command(msg)
+            {
+                let reply = if drbot_tool_mode::is_project_remember_command(msg) {
+                    match drbot_tool_mode::parse_project_remember_note(msg) {
+                        Some(note) => match drbot_tool_mode::remember_project_kb(&project_drbot_dir, &note) {
+                            Ok(updates) => {
+                                if updates.rejected {
+                                    "Nothing saved (refused to store sensitive/invalid content)."
+                                        .to_string()
+                                } else if updates.applied {
+                                    if updates.updates.is_empty() {
+                                        "Saved to project memory.".to_string()
+                                    } else {
+                                        let mut out = String::new();
+                                        out.push_str("Saved to project memory:\n");
+                                        for u in updates.updates.iter().take(12) {
+                                            out.push_str("- ");
+                                            out.push_str(u);
+                                            out.push('\n');
+                                        }
+                                        out.trim_end().to_string()
+                                    }
+                                } else {
+                                    "Nothing saved.".to_string()
+                                }
+                            }
+                            Err(e) => format!("Project remember error: {}", e),
+                        },
+                        None => "Usage: /remember project <note>".to_string(),
+                    }
+                } else {
+                    match drbot_tool_mode::parse_project_forget_arg(msg) {
+                        Some(arg) => match drbot_tool_mode::forget_project_kb(&project_drbot_dir, &arg) {
+                            Ok(updates) => {
+                                if updates.applied {
+                                    if updates.updates.is_empty() {
+                                        "Forgot from project memory.".to_string()
+                                    } else {
+                                        let mut out = String::new();
+                                        out.push_str("Forgot from project memory:\n");
+                                        for u in updates.updates.iter().take(12) {
+                                            out.push_str("- ");
+                                            out.push_str(u);
+                                            out.push('\n');
+                                        }
+                                        out.trim_end().to_string()
+                                    }
+                                } else {
+                                    "Nothing forgotten (no matching items).".to_string()
+                                }
+                            }
+                            Err(e) => format!("Project forget error: {}", e),
+                        },
+                        None => {
+                            "Usage: /forget project <all|pinned|conventions|runbooks|kb|text>"
+                                .to_string()
+                        }
+                    }
+                };
+                println!("{}\n", reply);
+                return Ok(());
+            }
+
+            let mut mem_parts = msg.split_whitespace();
+            let mem_cmd = mem_parts.next().unwrap_or("");
+            let mem_arg = mem_parts.next().unwrap_or("");
+            if (mem_cmd == "/memory" || mem_cmd == "/mem") && mem_arg.eq_ignore_ascii_case("project")
+            {
+                let reply = drbot_tool_mode::build_project_memory_overview(&project_drbot_dir);
+                println!("{}\n", reply);
+                return Ok(());
+            }
+
+            let effective_system_prompt =
+                build_effective_system_prompt(tool_cfg.enabled, &session_system_prompt);
+
+            if in_git_project {
+                let msg_trimmed = msg.trim_start();
+                let msg_lower = msg_trimmed.to_ascii_lowercase();
+                let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                    || msg_trimmed.starts_with("[Tool Denied]")
+                    || msg_trimmed.starts_with("[Tool Mode Strict]");
+                let is_local_cmd = msg_lower.starts_with("/remember")
+                    || msg_lower.starts_with("remember:")
+                    || msg_lower.starts_with("/forget")
+                    || msg_lower.starts_with("forget:")
+                    || msg_lower == "/memory"
+                    || msg_lower == "/mem"
+                    || msg_lower == "/profile"
+                    || msg_lower == "/kb"
+                    || msg_lower.starts_with("/kb ")
+                    || msg_lower.starts_with("/kb:")
+                    || msg_lower.starts_with("kb:")
+                    || msg_lower == "/notes"
+                    || msg_lower.starts_with("/notes ")
+                    || msg_lower.starts_with("/notes:")
+                    || msg_lower.starts_with("notes:");
+                if !is_internal_tool_message && !is_local_cmd {
+                    drbot_tool_mode::autosave_project_kb_best_effort(&project_drbot_dir, msg);
+                }
+            }
+
+            let mut strict_remaining = if agent_strict { 2usize } else { 0usize };
+            let mut rounds = 0usize;
+            let mut next_message = msg.to_string();
+            loop {
+                rounds += 1;
+                if tool_cfg.enabled && rounds > tool_cfg.max_rounds {
+                    return Err(anyhow::anyhow!(
+                        "Max tool rounds exceeded ({}).",
+                        tool_cfg.max_rounds
+                    ));
+                }
+
+                if stream {
+                    print!("Assistant: ");
+                    io::stdout().flush()?;
+                }
+
+                let opts = GatewayChatOptions {
+                    max_tokens: Some(4096),
+                    temperature: if tool_cfg.enabled { Some(0.2) } else { None },
+                    system_prompt: {
+                        let msg_trimmed = next_message.trim_start();
+                        let msg_lower = msg_trimmed.to_ascii_lowercase();
+                        let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                            || msg_trimmed.starts_with("[Tool Denied]")
+                            || msg_trimmed.starts_with("[Tool Mode Strict]");
+                        let is_local_cmd = msg_lower.starts_with("/remember")
+                            || msg_lower.starts_with("remember:")
+                            || msg_lower.starts_with("/forget")
+                            || msg_lower.starts_with("forget:")
+                            || msg_lower == "/memory"
+                            || msg_lower == "/mem"
+                            || msg_lower == "/profile"
+                            || msg_lower == "/kb"
+                            || msg_lower.starts_with("/kb ")
+                            || msg_lower.starts_with("/kb:")
+                            || msg_lower.starts_with("kb:")
+                            || msg_lower == "/notes"
+                            || msg_lower.starts_with("/notes ")
+                            || msg_lower.starts_with("/notes:")
+                            || msg_lower.starts_with("notes:");
+
+                        let project_notes = if is_internal_tool_message || is_local_cmd {
+                            None
+                        } else {
+                            drbot_gateway::workspace_notes_recall::recall_project_notes_prompt(
+                                &project_drbot_dir,
+                                &next_message,
+                            )
+                            .await
+                        };
+
+                        match (effective_system_prompt.as_deref(), project_notes.as_deref()) {
+                            (Some(core), Some(notes)) => {
+                                Some(format!("{}\n\n---\n\n{}", core.trim(), notes.trim()))
+                            }
+                            (None, Some(notes)) => Some(notes.to_string()),
+                            (core, None) => core.map(|s| s.to_string()),
+                        }
+                    },
+                    ..Default::default()
+                };
+                let response = if stream {
+                    send_chat_streaming(
+                        &client,
+                        &mut event_rx,
+                        &mut response_rx,
+                        session_uuid,
+                        &next_message,
+                        &mut model_override,
+                        opts,
+                    )
+                    .await?
+                } else {
+                    send_chat_non_streaming(&client, session_uuid, &next_message, opts).await?
+                };
+
+                if !stream {
+                    println!("{}", response);
+                }
+
+                if rounds == 1 {
+                    if in_git_project {
+                        if let Some(query) = parse_kb_query_best_effort(msg) {
+                            let project_reply =
+                                drbot_gateway::workspace_notes_recall::recall_project_notes_prompt_explicit(
+                                    &project_drbot_dir,
+                                    &query,
+                                )
+                                .await;
+
+                            println!();
+                            println!("Project KB (.drbot):");
+                            if let Some(reply) = project_reply
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
+                                println!("{}", reply);
+                            } else {
+                                println!("No relevant notes found.");
+                            }
+                            println!();
+                        }
+                    }
+
+                    let msg_lower = msg.trim_start().to_ascii_lowercase();
+                    let is_memory_cmd = msg_lower == "/memory" || msg_lower == "/mem";
+                    if is_memory_cmd && (in_git_project || project_drbot_dir.is_dir()) {
+                        println!();
+                        println!(
+                            "{}",
+                            drbot_tool_mode::build_project_memory_overview(&project_drbot_dir)
+                        );
+                        println!();
+                    }
+                }
+
+                if !tool_cfg.enabled {
+                    break;
+                }
+
+                let calls = extract_tool_calls(&response);
+                if calls.is_empty() {
+                    if agent_strict
+                        && strict_remaining > 0
+                        && should_reprompt_for_tool_calls(msg, &response)
+                    {
+                        strict_remaining -= 1;
+                        next_message = "[Tool Mode Strict] Convert the previous response into tool calls. Reply ONLY with a `drbot_tool` code block containing JSON tool calls (object or array). No prose.".to_string();
+                        continue;
+                    }
+                    break;
+                }
+
+                let mut tool_updates: Vec<String> = Vec::new();
+                for call in calls {
+                    let approved = match call.tool.as_str() {
+                        "read_file" | "list_dir" | "list_directory" | "search" => true,
+                        "bash" => {
+                            let command = call
+                                .args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            bash_command_is_safe_for_auto_approve(command, &bash_policy)
+                        }
+                        _ => tool_cfg.auto_approve,
+                    };
+
+                    if !approved {
+                        match call.tool.as_str() {
+                            "bash" => {
+                                let command = call
+                                    .args
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                println!("\n[Tool Denied] bash (unsafe_for_auto_approve)");
+                                println!("command: {}", command);
+                                println!();
+                                tool_updates.push(format!(
+                                    "[Tool Denied] tool=bash reason=unsafe_for_auto_approve\ncommand: {}",
+                                    command
+                                ));
+                            }
+                            "write_file" => {
+                                let path = call
+                                    .args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let bytes = call
+                                    .args
+                                    .get("content")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.len())
+                                    .unwrap_or(0);
+                                println!("\n[Tool Denied] write_file (approval_required)");
+                                println!("path: {}  bytes: {}", path, bytes);
+                                println!("hint: re-run with -y/--yes (or enable /approve in interactive mode)");
+                                println!();
+                                tool_updates.push(format!(
+                                    "[Tool Denied] tool=write_file reason=approval_required\npath: {}\nbytes: {}",
+                                    path, bytes
+                                ));
+                            }
+                            "apply_patch" => {
+                                let bytes = call
+                                    .args
+                                    .get("patch")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.len())
+                                    .unwrap_or(0);
+                                println!("\n[Tool Denied] apply_patch (approval_required)");
+                                println!("bytes: {}", bytes);
+                                println!("hint: re-run with -y/--yes (or enable /approve in interactive mode)");
+                                println!();
+                                tool_updates.push(format!(
+                                    "[Tool Denied] tool=apply_patch reason=approval_required\nbytes: {}",
+                                    bytes
+                                ));
+                            }
+                            other => {
+                                println!("\n[Tool Denied] {} (approval_required)", other);
+                                println!("hint: re-run with -y/--yes (or enable /approve in interactive mode)");
+                                println!();
+                                tool_updates.push(format!(
+                                    "[Tool Denied] tool={} reason=approval_required",
+                                    other
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
+                    let (output, is_error) = match execute_tool_call(&tool_cfg, &call).await {
+                        Ok((out, err)) => (out, err),
+                        Err(e) => (format!("Error: {}", e), true),
+                    };
+
+                    println!(
+                        "\n[Tool Result] {}{}\n",
+                        call.tool,
+                        if is_error { " (error)" } else { "" }
+                    );
+                    println!("{}", output);
+                    println!();
+
+                    tool_updates.push(format!(
+                        "[Tool Result] tool={}{}\n{}",
+                        call.tool,
+                        if is_error { " (error)" } else { "" },
+                        output
+                    ));
+                }
+
+                next_message = tool_updates.join("\n\n");
+            }
+
+            return Ok(());
+        }
+
+        // Interactive loop.
+        loop {
+            print!("You: ");
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input)? == 0 {
+                println!("\nGoodbye!");
+                break;
+            }
+            let input = input.trim();
+            if input.is_empty() {
+                continue;
+            }
+
+            if input == "/quit" || input == "quit" || input == "exit" {
+                println!("Goodbye!");
+                break;
+            }
+
+            let mut mem_parts = input.split_whitespace();
+            let mem_cmd = mem_parts.next().unwrap_or("");
+            let mem_arg = mem_parts.next().unwrap_or("");
+            if (mem_cmd == "/memory" || mem_cmd == "/mem") && mem_arg.eq_ignore_ascii_case("project")
+            {
+                let reply = drbot_tool_mode::build_project_memory_overview(&project_drbot_dir);
+                println!("\n{}\n", reply);
+                continue;
+            }
+
+            if drbot_tool_mode::is_project_remember_command(input)
+                || drbot_tool_mode::is_project_forget_command(input)
+            {
+                let reply = if drbot_tool_mode::is_project_remember_command(input) {
+                    match drbot_tool_mode::parse_project_remember_note(input) {
+                        Some(note) => match drbot_tool_mode::remember_project_kb(&project_drbot_dir, &note) {
+                            Ok(updates) => {
+                                if updates.rejected {
+                                    "Nothing saved (refused to store sensitive/invalid content)."
+                                        .to_string()
+                                } else if updates.applied {
+                                    if updates.updates.is_empty() {
+                                        "Saved to project memory.".to_string()
+                                    } else {
+                                        let mut out = String::new();
+                                        out.push_str("Saved to project memory:\n");
+                                        for u in updates.updates.iter().take(12) {
+                                            out.push_str("- ");
+                                            out.push_str(u);
+                                            out.push('\n');
+                                        }
+                                        out.trim_end().to_string()
+                                    }
+                                } else {
+                                    "Nothing saved.".to_string()
+                                }
+                            }
+                            Err(e) => format!("Project remember error: {}", e),
+                        },
+                        None => "Usage: /remember project <note>".to_string(),
+                    }
+                } else {
+                    match drbot_tool_mode::parse_project_forget_arg(input) {
+                        Some(arg) => match drbot_tool_mode::forget_project_kb(&project_drbot_dir, &arg) {
+                            Ok(updates) => {
+                                if updates.applied {
+                                    if updates.updates.is_empty() {
+                                        "Forgot from project memory.".to_string()
+                                    } else {
+                                        let mut out = String::new();
+                                        out.push_str("Forgot from project memory:\n");
+                                        for u in updates.updates.iter().take(12) {
+                                            out.push_str("- ");
+                                            out.push_str(u);
+                                            out.push('\n');
+                                        }
+                                        out.trim_end().to_string()
+                                    }
+                                } else {
+                                    "Nothing forgotten (no matching items).".to_string()
+                                }
+                            }
+                            Err(e) => format!("Project forget error: {}", e),
+                        },
+                        None => {
+                            "Usage: /forget project <all|pinned|conventions|runbooks|kb|text>"
+                                .to_string()
+                        }
+                    }
+                };
+                println!("\n{}\n", reply);
+                continue;
+            }
+
+            if input == "/help" {
+                println!(
+                    "Commands:\n  /help - Show this help\n  /quit - Exit\n\n  /remember <note> - Save to memory (workspace)\n  /forget <name|timezone|style|all|text> - Forget from memory (workspace)\n  /remember project <note> - Save to project memory (.drbot)\n  /forget project <all|pinned|conventions|runbooks|kb|text> - Forget from project memory (.drbot)\n  /profile - Show USER.md profile (workspace)\n  /memory, /mem - Show memory overview (workspace + project)\n  /memory project - Show project memory only (.drbot)\n  /kb <query>, /notes <query> - Search notes (workspace + .drbot)\n\n  /provider list - List providers\n  /provider <name> - Select provider\n  /model list - List models\n  /model <id> - Set model override\n  /model clear - Use provider default\n\n  /sessions - List sessions\n  /session <uuid|prefix> - Open a session\n  /new - Start a new session\n  /clear - Clear current session history\n  /info - Show current session info\n\n  /agent on|off - Toggle tool mode\n  /approve on|off - Toggle auto-approve\n  /tools - Show tool status"
+                );
+                continue;
+            }
+
+            if input.starts_with("/tools") {
+                println!();
+                println!("Tools");
+                println!("-----");
+                println!("bash       - run a shell command (args: command, cwd?)");
+                println!("read_file  - read a file under root");
+                println!("write_file - write a file under root");
+                println!("list_dir / list_directory - list a directory under root");
+                println!("search     - search for a pattern under root");
+                println!("apply_patch - apply a unified diff patch under root");
+                println!();
+                println!(
+                    "Tool mode: {} (autonomy: {:?})",
+                    if tool_cfg.enabled { "ON" } else { "OFF" },
+                    tool_cfg.autonomy_mode
+                );
+                println!(
+                    "Auto-approve: {}",
+                    if tool_cfg.auto_approve { "ON" } else { "OFF" }
+                );
+                println!("Strict agent: {}", if agent_strict { "ON" } else { "OFF" });
+                println!("Root: {}", tool_cfg.root.display());
+                println!("Max tool rounds: {}", tool_cfg.max_rounds);
+                let allowlist = if tool_cfg.tool_allowlist.is_empty() {
+                    "all".to_string()
+                } else {
+                    tool_cfg.tool_allowlist.join(", ")
+                };
+                let denylist = if tool_cfg.tool_denylist.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    tool_cfg.tool_denylist.join(", ")
+                };
+                println!("Tool allowlist: {}", allowlist);
+                println!("Tool denylist: {}", denylist);
+                println!();
+                continue;
+            }
+
+            if input.starts_with("/approve") {
+                let arg = input.split_whitespace().nth(1).unwrap_or("");
+                match arg {
+                    "on" | "yes" | "true" => {
+                        tool_cfg.auto_approve = true;
+                        println!("\nAuto-approve: ON\n");
+                    }
+                    "off" | "no" | "false" => {
+                        tool_cfg.auto_approve = false;
+                        println!("\nAuto-approve: OFF\n");
+                    }
+                    _ => {
+                        println!(
+                            "\nAuto-approve: {} (use: /approve on|off)\n",
+                            if tool_cfg.auto_approve { "ON" } else { "OFF" }
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if input.starts_with("/agent") {
+                let arg = input.split_whitespace().nth(1).unwrap_or("");
+                match arg {
+                    "on" | "yes" | "true" => {
+                        tool_cfg.enabled = true;
+                        println!("\nTool mode: ON (autonomy: {:?})\n", tool_cfg.autonomy_mode);
+                    }
+                    "off" | "no" | "false" => {
+                        tool_cfg.enabled = false;
+                        println!("\nTool mode: OFF (autonomy: {:?})\n", tool_cfg.autonomy_mode);
+                    }
+                    _ => {
+                        println!(
+                            "\nTool mode: {} (autonomy: {:?}) (use: /agent on|off)\n",
+                            if tool_cfg.enabled { "ON" } else { "OFF" },
+                            tool_cfg.autonomy_mode
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if input == "/provider" || input == "/provider list" {
+                print_provider_list(&client).await?;
+                println!();
+                continue;
+            }
+            if let Some(rest) = input.strip_prefix("/provider ") {
+                let name = rest.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let resp = client
+                    .request(
+                        "provider.select",
+                        ProviderSelectParams {
+                            provider: name.to_string(),
+                        },
+                    )
+                    .await?;
+                if let Some(err) = resp.error {
+                    eprintln!("provider.select error: {}", err.message);
+                    continue;
+                }
+                let name = resp
+                    .result
+                    .and_then(|v| serde_json::from_value::<ProviderSelectResult>(v).ok())
+                    .map(|r| r.provider.name)
+                    .unwrap_or_else(|| name.to_string());
+                active_provider = Some(name.clone());
+                model_override = None;
+
+                // Persist provider to the session (and clear model to avoid mismatch).
+                let resp = client
+                    .request(
+                        "session.update",
+                        SessionUpdateParams {
+                            session_id: session_uuid,
+                            provider: Some(name.clone()),
+                            clear_model: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                if let Some(err) = resp.error {
+                    eprintln!("Warning: session.update failed: {}", err.message);
+                }
+
+                println!("Provider set to {}. Model reset to provider default.\n", name);
+                continue;
+            }
+
+            if input == "/model" || input == "/model list" {
+                // provider.models requires an active provider; if missing, try auto-select.
+                if active_provider.is_none() {
+                    let _ = client
+                        .request(
+                            "provider.select",
+                            ProviderSelectParams {
+                                provider: "auto".to_string(),
+                            },
+                        )
+                        .await;
+                }
+                print_model_list(&client, model_override.as_deref()).await?;
+                println!();
+                continue;
+            }
+            if let Some(rest) = input.strip_prefix("/model ") {
+                let arg = rest.trim();
+                if arg.is_empty() {
+                    continue;
+                }
+                if matches!(arg, "clear" | "default") {
+                    model_override = None;
+                    let resp = client
+                        .request(
+                            "session.update",
+                            SessionUpdateParams {
+                                session_id: session_uuid,
+                                clear_model: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    if let Some(err) = resp.error {
+                        eprintln!("Warning: session.update failed: {}", err.message);
+                    }
+                    println!("Model: (default)\n");
+                    continue;
+                }
+
+                model_override = Some(arg.to_string());
+                let resp = client
+                    .request(
+                        "session.update",
+                        SessionUpdateParams {
+                            session_id: session_uuid,
+                            model: Some(arg.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                if let Some(err) = resp.error {
+                    eprintln!("Warning: session.update failed: {}", err.message);
+                }
+                println!("Model set: {}\n", arg);
+                continue;
+            }
+
+            if input == "/sessions" || input == "/sessions list" {
+                print_sessions(&client).await?;
+                println!();
+                continue;
+            }
+
+            if input == "/info" || input == "/session" || input == "/session show" {
+                print_session_info(&client, session_uuid).await?;
+                println!();
+                continue;
+            }
+
+            if let Some(rest) = input.strip_prefix("/session ") {
+                let raw = rest.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let resolved = resolve_session_id_prefix(&client, raw).await?;
+                session_uuid = resolved;
+                remember_session(session_uuid);
+
+                let resp = client
+                    .request("session.get", SessionGetParams { session_id: session_uuid })
+                    .await?;
+                let result = expect_ok(resp, "session.get").await?;
+                let parsed: SessionGetResult =
+                    serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                // Align provider/model local state with the session.
+                model_override = parsed.session.model.clone();
+                session_system_prompt = parsed.system_prompt.clone();
+
+                if let Some(p) = parsed
+                    .session
+                    .provider
+                    .as_deref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    let _ = client
+                        .request(
+                            "provider.select",
+                            ProviderSelectParams {
+                                provider: p.to_string(),
+                            },
+                        )
+                        .await;
+                    active_provider = Some(p.to_string());
+                }
+
+                println!(
+                    "Opened session: {} (messages: {})\n",
+                    &session_uuid.to_string()[..8],
+                    parsed.messages.len()
+                );
+                continue;
+            }
+
+            if input == "/new" {
+                let resp = client
+                    .request(
+                        "session.create",
+                        SessionCreateParams {
+                            title: Some(
+                                if tool_cfg.enabled {
+                                    "Gateway Agent"
+                                } else {
+                                    "Gateway Chat"
+                                }
+                                .to_string(),
+                            ),
+                            provider: active_provider.clone(),
+                            model: model_override.clone(),
+                            system_prompt: session_system_prompt.clone(),
+                        },
+                    )
+                    .await?;
+                let result = expect_ok(resp, "session.create").await?;
+                let parsed: SessionCreateResult =
+                    serde_json::from_value(result).map_err(|e| anyhow::anyhow!("{}", e))?;
+                session_uuid = parsed.session_id;
+                remember_session(session_uuid);
+                println!("New session started: {}\n", &session_uuid.to_string()[..8]);
+                continue;
+            }
+
+            if input == "/clear" {
+                let resp = client
+                    .request(
+                        "session.clear",
+                        SessionClearParams {
+                            session_id: session_uuid,
+                        },
+                    )
+                    .await?;
+                if let Some(err) = resp.error {
+                    eprintln!("session.clear error: {}", err.message);
+                } else {
+                    println!("Session cleared.\n");
+                }
+                continue;
+            }
+
+            // Normal chat message.
+            let effective_system_prompt =
+                build_effective_system_prompt(tool_cfg.enabled, &session_system_prompt);
+
+            let user_text = input.to_string();
+            if in_git_project {
+                let msg_trimmed = user_text.trim_start();
+                let msg_lower = msg_trimmed.to_ascii_lowercase();
+                let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                    || msg_trimmed.starts_with("[Tool Denied]")
+                    || msg_trimmed.starts_with("[Tool Mode Strict]");
+                let is_local_cmd = msg_lower.starts_with("/remember")
+                    || msg_lower.starts_with("remember:")
+                    || msg_lower.starts_with("/forget")
+                    || msg_lower.starts_with("forget:")
+                    || msg_lower == "/memory"
+                    || msg_lower == "/mem"
+                    || msg_lower == "/profile"
+                    || msg_lower == "/kb"
+                    || msg_lower.starts_with("/kb ")
+                    || msg_lower.starts_with("/kb:")
+                    || msg_lower.starts_with("kb:")
+                    || msg_lower == "/notes"
+                    || msg_lower.starts_with("/notes ")
+                    || msg_lower.starts_with("/notes:")
+                    || msg_lower.starts_with("notes:");
+                if !is_internal_tool_message && !is_local_cmd {
+                    drbot_tool_mode::autosave_project_kb_best_effort(&project_drbot_dir, &user_text);
+                }
+            }
+            let mut strict_remaining = if agent_strict { 2usize } else { 0usize };
+            let mut rounds = 0usize;
+            let mut next_message = user_text.clone();
+            loop {
+                rounds += 1;
+                if tool_cfg.enabled && rounds > tool_cfg.max_rounds {
+                    eprintln!("\nError: Max tool rounds exceeded ({}).", tool_cfg.max_rounds);
+                    break;
+                }
+
+                print!("\nAssistant: ");
+                io::stdout().flush()?;
+                let opts = GatewayChatOptions {
+                    max_tokens: Some(4096),
+                    temperature: if tool_cfg.enabled { Some(0.2) } else { None },
+                    system_prompt: {
+                        let msg_trimmed = next_message.trim_start();
+                        let msg_lower = msg_trimmed.to_ascii_lowercase();
+                        let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                            || msg_trimmed.starts_with("[Tool Denied]")
+                            || msg_trimmed.starts_with("[Tool Mode Strict]");
+                        let is_local_cmd = msg_lower.starts_with("/remember")
+                            || msg_lower.starts_with("remember:")
+                            || msg_lower.starts_with("/forget")
+                            || msg_lower.starts_with("forget:")
+                            || msg_lower == "/memory"
+                            || msg_lower == "/mem"
+                            || msg_lower == "/profile"
+                            || msg_lower == "/kb"
+                            || msg_lower.starts_with("/kb ")
+                            || msg_lower.starts_with("/kb:")
+                            || msg_lower.starts_with("kb:")
+                            || msg_lower == "/notes"
+                            || msg_lower.starts_with("/notes ")
+                            || msg_lower.starts_with("/notes:")
+                            || msg_lower.starts_with("notes:");
+
+                        let project_notes = if is_internal_tool_message || is_local_cmd {
+                            None
+                        } else {
+                            drbot_gateway::workspace_notes_recall::recall_project_notes_prompt(
+                                &project_drbot_dir,
+                                &next_message,
+                            )
+                            .await
+                        };
+
+                        match (effective_system_prompt.as_deref(), project_notes.as_deref()) {
+                            (Some(core), Some(notes)) => {
+                                Some(format!("{}\n\n---\n\n{}", core.trim(), notes.trim()))
+                            }
+                            (None, Some(notes)) => Some(notes.to_string()),
+                            (core, None) => core.map(|s| s.to_string()),
+                        }
+                    },
+                    ..Default::default()
+                };
+
+                let response = if stream {
+                    match send_chat_streaming(
+                        &client,
+                        &mut event_rx,
+                        &mut response_rx,
+                        session_uuid,
+                        &next_message,
+                        &mut model_override,
+                        opts,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("\nError: {}", e);
+                            break;
+                        }
+                    }
+                } else {
+                    match send_chat_non_streaming(&client, session_uuid, &next_message, opts).await {
+                        Ok(out) => {
+                            println!("{}", out);
+                            out
+                        }
+                        Err(e) => {
+                            eprintln!("\nError: {}", e);
+                            break;
+                        }
+                    }
+                };
+                println!();
+
+                if rounds == 1 {
+                    if in_git_project {
+                        if let Some(query) = parse_kb_query_best_effort(&user_text) {
+                            let project_reply =
+                                drbot_gateway::workspace_notes_recall::recall_project_notes_prompt_explicit(
+                                    &project_drbot_dir,
+                                    &query,
+                                )
+                                .await;
+
+                            println!("Project KB (.drbot):");
+                            if let Some(reply) = project_reply
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
+                                println!("{}", reply);
+                            } else {
+                                println!("No relevant notes found.");
+                            }
+                            println!();
+                        }
+                    }
+
+                    let msg_lower = user_text.trim_start().to_ascii_lowercase();
+                    let is_memory_cmd = msg_lower == "/memory" || msg_lower == "/mem";
+                    if is_memory_cmd && (in_git_project || project_drbot_dir.is_dir()) {
+                        println!(
+                            "{}",
+                            drbot_tool_mode::build_project_memory_overview(&project_drbot_dir)
+                        );
+                        println!();
+                    }
+                }
+
+                if !tool_cfg.enabled {
+                    break;
+                }
+
+                let calls = extract_tool_calls(&response);
+                if calls.is_empty() {
+                    if agent_strict
+                        && strict_remaining > 0
+                        && should_reprompt_for_tool_calls(&user_text, &response)
+                    {
+                        strict_remaining -= 1;
+                        next_message = "[Tool Mode Strict] Convert the previous response into tool calls. Reply ONLY with a `drbot_tool` code block containing JSON tool calls (object or array). No prose.".to_string();
+                        continue;
+                    }
+                    break;
+                }
+
+                let mut tool_updates: Vec<String> = Vec::new();
+                for call in calls {
+                    // Default to "automated in place":
+                    // - Read-only tools run without prompting.
+                    // - Safe bash commands run without prompting.
+                    // - Writes require explicit approval unless auto-approve is enabled.
+                    let mut approved = match call.tool.as_str() {
+                        "read_file" | "list_dir" | "list_directory" | "search" => true,
+                        "bash" => {
+                            let command = call
+                                .args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            bash_command_is_safe_for_auto_approve(command, &bash_policy)
+                        }
+                        _ => tool_cfg.auto_approve,
+                    };
+
+                    // Print tool summary (even when auto-approved) for transparency.
+                    match call.tool.as_str() {
+                        "bash" => {
+                            let command = call
+                                .args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let cwd = call.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                            if cwd.trim().is_empty() {
+                                println!("[Tool] bash\n  command: {}", command);
+                            } else {
+                                println!(
+                                    "[Tool] bash\n  cwd: {}\n  command: {}",
+                                    cwd.trim(),
+                                    command
+                                );
+                            }
+                        }
+                        "read_file" => {
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            println!("[Tool] read_file\n  path: {}", path);
+                        }
+                        "write_file" => {
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            let bytes = call
+                                .args
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            println!("[Tool] write_file\n  path: {}\n  bytes: {}", path, bytes);
+                        }
+                        "list_dir" | "list_directory" => {
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                            println!("[Tool] list_dir\n  path: {}", path);
+                        }
+                        "search" => {
+                            let pattern =
+                                call.args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                            println!("[Tool] search\n  pattern: {}\n  path: {}", pattern, path);
+                        }
+                        "apply_patch" => {
+                            let bytes = call
+                                .args
+                                .get("patch")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            println!("[Tool] apply_patch\n  bytes: {}", bytes);
+                        }
+                        _ => {
+                            println!("[Tool] {}", call.tool);
+                        }
+                    }
+
+                    if !approved {
+                        approved = prompt_approve("Approve? [y/N] ")? && tool_cfg.enabled;
+                    }
+
+                    if !approved {
+                        tool_updates.push(format!(
+                            "[Tool Denied] tool={} reason=user_denied",
+                            call.tool
+                        ));
+                        continue;
+                    }
+
+                    let (output, is_error) = match execute_tool_call(&tool_cfg, &call).await {
+                        Ok((out, err)) => (out, err),
+                        Err(e) => (format!("Error: {}", e), true),
+                    };
+
+                    println!(
+                        "[Tool Result] {}{}\n",
+                        call.tool,
+                        if is_error { " (error)" } else { "" }
+                    );
+                    println!("{}", output);
+                    println!();
+
+                    tool_updates.push(format!(
+                        "[Tool Result] tool={}{}\n{}",
+                        call.tool,
+                        if is_error { " (error)" } else { "" },
+                        output
+                    ));
+                }
+
+                next_message = tool_updates.join("\n\n");
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    // If we spawned a gateway in-process, shut it down on exit (best effort).
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+    if let Some(task) = gateway_task.take() {
+        if let Err(e) = task.await {
+            warn!(error = %e, "Gateway task join failed");
+        }
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CliChatPrefs {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    last_session_by_project: BTreeMap<String, String>,
+}
+
+impl Default for CliChatPrefs {
+    fn default() -> Self {
+        Self {
+            last_session_by_project: BTreeMap::new(),
+        }
+    }
+}
+
+impl CliChatPrefs {
+    fn path() -> Option<PathBuf> {
+        Config::config_dir().map(|dir| dir.join("cli-chat-prefs.json"))
+    }
+
+    fn write_atomic_best_effort(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let tmp = path.with_extension(format!(
+            "tmp.{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        ));
+        if std::fs::write(&tmp, content).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+
+        if std::fs::rename(&tmp, path).is_err() {
+            // Windows doesn't allow renaming over an existing file.
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::rename(&tmp, path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn load_best_effort() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save_best_effort(&self) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+        let Ok(raw) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        Self::write_atomic_best_effort(&path, &raw);
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GatewayChatPrefs {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    last_session_by_project: BTreeMap<String, String>,
+}
+
+impl Default for GatewayChatPrefs {
+    fn default() -> Self {
+        Self {
+            last_session_by_project: BTreeMap::new(),
+        }
+    }
+}
+
+impl GatewayChatPrefs {
+    fn path() -> Option<PathBuf> {
+        Config::config_dir().map(|dir| dir.join("gateway-chat-prefs.json"))
+    }
+
+    fn load_best_effort() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save_best_effort(&self) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+        let Ok(raw) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        CliChatPrefs::write_atomic_best_effort(&path, &raw);
+    }
+}
+
+async fn run_chat_direct(
+    config: &Config,
+    provider_name: Option<String>,
+    model: Option<String>,
+    system: Option<String>,
+    skill_url: Option<String>,
+    agent: bool,
+    yes: bool,
+    bash_auto_approve_prefixes: Option<String>,
+    bash_auto_approve_allowlist: Option<String>,
+    bash_auto_approve_all: bool,
+    agent_strict: bool,
+    root: Option<String>,
+    max_tool_rounds: usize,
+    single_message: Option<String>,
+    message_file: Option<String>,
+    stream: bool,
+    session_id: Option<String>,
+    new_session: bool,
+    list_sessions: bool,
+    title: Option<String>,
+    persona_name: Option<String>,
+    list_personas: bool,
+    context_size: Option<usize>,
+) -> Result<()> {
     // Initialize persona registry
     let persona_registry = init_persona_registry();
+
+    let project_start_dir = if agent {
+        root.as_deref()
+            .map(|p| PathBuf::from(expand_tilde(p)))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let project_start_dir = project_start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_start_dir.clone());
+    let git_root = drbot_tool_mode::find_git_root_best_effort(&project_start_dir);
+    let in_git_project = git_root.is_some();
+    let project_root = git_root.unwrap_or(project_start_dir);
+    let project_key = project_root.to_string_lossy().to_string();
+    let session_map_key = if agent {
+        format!("{}#agent", project_key)
+    } else {
+        format!("{}#chat", project_key)
+    };
 
     // Handle --list-personas
     if list_personas {
@@ -5087,7 +6819,7 @@ async fn run_chat(
         .unwrap_or_else(|| "auto".to_string());
 
     // Create the provider
-    let mut provider = create_provider(config, &provider_name)?;
+    let mut provider = create_provider(config, &provider_name).await?;
     let mut current_provider_name = provider.name().to_string();
 
     // Get or create session
@@ -5132,46 +6864,116 @@ async fn run_chat(
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         session
     } else {
-        // Try to resume last CLI session or create new
-        let sessions = store
-            .list(ListOptions {
-                channel_type: Some("cli".to_string()),
-                limit: Some(1),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        // Try to resume last session for this project (best effort), else resume last CLI session.
+        let mut prefs = CliChatPrefs::load_best_effort();
+        let mapped_session = prefs
+            .last_session_by_project
+            .get(&session_map_key)
+            .and_then(|s| Uuid::parse_str(s).ok());
 
-        if let Some(mut last_session) = sessions.into_iter().next() {
-            // Load messages
-            last_session = store
-                .get(last_session.id)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?
-                .unwrap_or(last_session);
-            last_session
-        } else {
+        let new_for_project = || async {
             let mut session = Session::new(user_id, "cli", "terminal");
             // See note above: ensure CLI sessions don't collide on UNIQUE(channel_type, channel_id).
             session.channel_id = format!("terminal:{}", session.id);
-            session.title = title.or_else(|| Some("CLI Chat".to_string()));
+            session.title = title.clone().or_else(|| Some("CLI Chat".to_string()));
             session.model = model.clone();
             session.system_prompt = system.clone();
             store
                 .create(&session)
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            session
+            Ok::<Session, anyhow::Error>(session)
+        };
+
+        let resume_global_last = || async {
+            let sessions = store
+                .list(ListOptions {
+                    channel_type: Some("cli".to_string()),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if let Some(mut last_session) = sessions.into_iter().next() {
+                // Load messages
+                last_session = store
+                    .get(last_session.id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?
+                    .unwrap_or(last_session);
+                Ok::<Session, anyhow::Error>(last_session)
+            } else {
+                new_for_project().await
+            }
+        };
+
+        if let Some(uuid) = mapped_session {
+            if let Ok(Some(session)) = store.get(uuid).await {
+                if session.channel_type == "cli" && session.is_active() {
+                    session
+                } else {
+                    prefs.last_session_by_project.remove(&session_map_key);
+                    prefs.save_best_effort();
+                    if in_git_project {
+                        new_for_project().await?
+                    } else {
+                        resume_global_last().await?
+                    }
+                }
+            } else {
+                prefs.last_session_by_project.remove(&session_map_key);
+                prefs.save_best_effort();
+                if in_git_project {
+                    new_for_project().await?
+                } else {
+                    resume_global_last().await?
+                }
+            }
+        } else if in_git_project {
+            new_for_project().await?
+        } else {
+            resume_global_last().await?
         }
     };
 
+    if session.channel_type == "cli" && session.is_active() {
+        let mut prefs = CliChatPrefs::load_best_effort();
+        prefs.last_session_by_project
+            .insert(session_map_key.clone(), session.id.to_string());
+        prefs.save_best_effort();
+    }
+
+    let root_provided = root.is_some();
     let tool_root = if agent {
         let root_path = root
             .map(|p| PathBuf::from(expand_tilde(&p)))
             .unwrap_or(std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?);
-        canonicalize_root(&root_path)?
+        let (resolved, used_default) =
+            resolve_tool_root_with_allowlist(root_path, &config.assistant.workspace_allowlist)?;
+        if used_default && (agent || root_provided) {
+            warn!(
+                root = %resolved.display(),
+                "tool root not in allowlist; using allowed workspace root"
+            );
+            eprintln!(
+                "Warning: tool root not in allowlist; using {}",
+                resolved.display()
+            );
+        }
+        resolved
     } else {
-        canonicalize_root(&std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?)?
+        let root_path =
+            std::env::current_dir().map_err(|e| anyhow::anyhow!("{}", e))?;
+        let (resolved, used_default) =
+            resolve_tool_root_with_allowlist(root_path, &config.assistant.workspace_allowlist)?;
+        if used_default && root_provided {
+            warn!(
+                root = %resolved.display(),
+                "tool root not in allowlist; using allowed workspace root"
+            );
+        }
+        resolved
     };
 
     let mut tool_cfg = ToolModeConfig {
@@ -5179,6 +6981,9 @@ async fn run_chat(
         auto_approve: yes,
         root: tool_root,
         max_rounds: max_tool_rounds.max(1),
+        autonomy_mode: config.assistant.autonomy_mode,
+        tool_allowlist: config.assistant.tool_allowlist.clone(),
+        tool_denylist: config.assistant.tool_denylist.clone(),
     };
 
     let bash_policy = {
@@ -5260,14 +7065,72 @@ async fn run_chat(
         base_system
     };
 
-    let system_prompt = if tool_cfg.enabled {
-        Some(build_agent_system_prompt(
-            base_system.clone(),
-            &tool_cfg.root,
-        ))
-    } else {
-        base_system.clone()
-    };
+    let workspace_dir = resolve_default_chat_workspace_dir(config);
+    if let Some(dir) = workspace_dir.as_deref() {
+        if let Err(err) = ensure_chat_workspace_bootstrap(dir) {
+            warn!(
+                error = %err,
+                workspace = %dir.to_string_lossy(),
+                "Failed to bootstrap workspace memory files"
+            );
+        }
+    }
+
+    // Project-local KB (repo-scoped): `.drbot/memory/*.md` under the nearest git root.
+    let project_drbot_dir = drbot_tool_mode::resolve_project_drbot_dir_best_effort(&tool_cfg.root);
+    let in_git_project_for_notes = drbot_tool_mode::find_git_root_best_effort(&tool_cfg.root).is_some();
+    if in_git_project_for_notes && drbot_tool_mode::project_kb_auto_init_enabled() {
+        drbot_tool_mode::ensure_project_kb_bootstrap_best_effort(&project_drbot_dir);
+    }
+
+    let base_system_prompt_tool_on = Some(build_agent_system_prompt_with_policy(
+        base_system.clone(),
+        &tool_cfg.root,
+        &tool_cfg.tool_allowlist,
+        &tool_cfg.tool_denylist,
+    ));
+    let base_system_prompt_tool_off = base_system.clone();
+
+    let build_effective_system_prompt =
+        |tool_enabled: bool, notes: Option<&str>| -> Option<String> {
+            let core = if tool_enabled {
+                base_system_prompt_tool_on.as_deref()
+            } else {
+                base_system_prompt_tool_off.as_deref()
+            };
+
+            let mut sections: Vec<String> = Vec::new();
+            if let Some(core) = core {
+                let trimmed = core.trim();
+                if !trimmed.is_empty() {
+                    sections.push(trimmed.to_string());
+                }
+            }
+
+            if let Some(dir) = workspace_dir.as_deref() {
+                let ctx =
+                    drbot_gateway::workspace_chat_context::build_chat_workspace_context_prompt(dir);
+                let trimmed = ctx.trim();
+                if !trimmed.is_empty() {
+                    sections.push(trimmed.to_string());
+                }
+            }
+
+            if let Some(notes) = notes {
+                let trimmed = notes.trim();
+                if !trimmed.is_empty() {
+                    sections.push(trimmed.to_string());
+                }
+            }
+
+            if sections.is_empty() {
+                None
+            } else {
+                Some(sections.join("\n\n---\n\n"))
+            }
+        };
+
+    let base_effective_system_prompt = build_effective_system_prompt(tool_cfg.enabled, None);
 
     // Build chat options (system prompt may change if tool mode toggles)
     let mut options = ChatOptions {
@@ -5276,7 +7139,7 @@ async fn run_chat(
         temperature: if tool_cfg.enabled { Some(0.2) } else { None },
         top_p: None,
         stop_sequences: None,
-        system_prompt: system_prompt.clone(),
+        system_prompt: base_effective_system_prompt.clone(),
         tools: None,
     };
 
@@ -5291,7 +7154,7 @@ async fn run_chat(
     let mut context_manager = ContextManager::new(context_config);
 
     // Add system prompt to context if present
-    if let Some(sys) = &system_prompt {
+    if let Some(sys) = &base_effective_system_prompt {
         let _ = context_manager.add_message(&Message::system(sys));
     }
 
@@ -5302,16 +7165,246 @@ async fn run_chat(
 
     // Single message mode
     if let Some(msg) = single_message {
-        if tool_cfg.enabled && !tool_cfg.auto_approve {
-            return Err(anyhow::anyhow!(
-                "Tool mode requires approval. Use -y/--yes for non-interactive mode."
-            ));
+        let msg_trimmed = msg.trim_start();
+        if drbot_tool_mode::is_project_remember_command(msg_trimmed)
+            || drbot_tool_mode::is_project_forget_command(msg_trimmed)
+        {
+            let reply = if drbot_tool_mode::is_project_remember_command(msg_trimmed) {
+                match drbot_tool_mode::parse_project_remember_note(msg_trimmed) {
+                    Some(note) => match drbot_tool_mode::remember_project_kb(&project_drbot_dir, &note) {
+                        Ok(updates) => {
+                            if updates.rejected {
+                                "Nothing saved (refused to store sensitive/invalid content)."
+                                    .to_string()
+                            } else if updates.applied {
+                                if updates.updates.is_empty() {
+                                    "Saved to project memory.".to_string()
+                                } else {
+                                    let mut out = String::new();
+                                    out.push_str("Saved to project memory:\n");
+                                    for u in updates.updates.iter().take(12) {
+                                        out.push_str("- ");
+                                        out.push_str(u);
+                                        out.push('\n');
+                                    }
+                                    out.trim_end().to_string()
+                                }
+                            } else {
+                                "Nothing saved.".to_string()
+                            }
+                        }
+                        Err(e) => format!("Project remember error: {}", e),
+                    },
+                    None => "Usage: /remember project <note>".to_string(),
+                }
+            } else {
+                match drbot_tool_mode::parse_project_forget_arg(msg_trimmed) {
+                    Some(arg) => match drbot_tool_mode::forget_project_kb(&project_drbot_dir, &arg) {
+                        Ok(updates) => {
+                            if updates.applied {
+                                if updates.updates.is_empty() {
+                                    "Forgot from project memory.".to_string()
+                                } else {
+                                    let mut out = String::new();
+                                    out.push_str("Forgot from project memory:\n");
+                                    for u in updates.updates.iter().take(12) {
+                                        out.push_str("- ");
+                                        out.push_str(u);
+                                        out.push('\n');
+                                    }
+                                    out.trim_end().to_string()
+                                }
+                            } else {
+                                "Nothing forgotten (no matching items).".to_string()
+                            }
+                        }
+                        Err(e) => format!("Project forget error: {}", e),
+                    },
+                    None => {
+                        "Usage: /forget project <all|pinned|conventions|runbooks|kb|text>"
+                            .to_string()
+                    }
+                }
+            };
+
+            session.add_message(Message::user(&msg));
+            session.add_message(Message::assistant(&reply));
+            session.update_timestamp();
+            let _ = store.update(&session).await;
+
+            println!("{}\n", reply);
+            return Ok(());
+        }
+
+        let mut mem_parts = msg_trimmed.split_whitespace();
+        let mem_cmd = mem_parts.next().unwrap_or("");
+        let mem_arg = mem_parts.next().unwrap_or("");
+        if (mem_cmd == "/memory" || mem_cmd == "/mem") && mem_arg.eq_ignore_ascii_case("project") {
+            let reply = drbot_tool_mode::build_project_memory_overview(&project_drbot_dir);
+            println!("{}\n", reply);
+            return Ok(());
+        }
+
+        let msg_lower = msg_trimmed.to_ascii_lowercase();
+        let is_remember_cmd =
+            msg_lower.starts_with("/remember") || msg_lower.starts_with("remember:");
+        let is_forget_cmd = msg_lower.starts_with("/forget") || msg_lower.starts_with("forget:");
+        let is_memory_cmd = msg_lower == "/memory" || msg_lower == "/mem";
+        let is_profile_cmd = msg_lower == "/profile";
+        let is_kb_cmd = msg_lower == "/kb"
+            || msg_lower.starts_with("/kb ")
+            || msg_lower.starts_with("/kb:")
+            || msg_lower.starts_with("kb:")
+            || msg_lower == "/notes"
+            || msg_lower.starts_with("/notes ")
+            || msg_lower.starts_with("/notes:")
+            || msg_lower.starts_with("notes:");
+        let is_local_cmd =
+            is_remember_cmd || is_forget_cmd || is_memory_cmd || is_profile_cmd || is_kb_cmd;
+
+        if is_local_cmd {
+            let Some(dir) = workspace_dir.as_deref() else {
+                return Err(anyhow::anyhow!("Workspace directory is unavailable"));
+            };
+
+            let should_persist = is_remember_cmd || is_forget_cmd;
+            let reply = if is_remember_cmd || is_forget_cmd {
+                let updates = if is_remember_cmd {
+                    drbot_gateway::workspace_autosave::autosave_workspace_best_effort(dir, &msg)
+                } else {
+                    drbot_gateway::workspace_autosave::forget_workspace_best_effort(dir, &msg)
+                };
+
+                if updates.applied {
+                    if updates.updates.is_empty() {
+                        if is_remember_cmd {
+                            "Saved to memory.".to_string()
+                        } else {
+                            "Forgot.".to_string()
+                        }
+                    } else {
+                        let mut out = String::new();
+                        out.push_str(if is_remember_cmd {
+                            "Saved to memory:\n"
+                        } else {
+                            "Forgot:\n"
+                        });
+                        for u in updates.updates.iter().take(12) {
+                            out.push_str("- ");
+                            out.push_str(u);
+                            out.push('\n');
+                        }
+                        out.trim_end().to_string()
+                    }
+                } else if is_remember_cmd {
+                    if drbot_gateway::workspace_autosave::parse_remember_command(&msg).is_some() {
+                        "Nothing saved (refused to store sensitive/invalid content).".to_string()
+                    } else {
+                        "Usage: /remember <note>".to_string()
+                    }
+                } else if drbot_gateway::workspace_autosave::parse_forget_command(&msg).is_some() {
+                    "Nothing forgotten (no matching items).".to_string()
+                } else {
+                    "Usage: /forget <name|timezone|style|all|text>".to_string()
+                }
+            } else if is_profile_cmd {
+                drbot_gateway::workspace_memory_view::build_workspace_profile_overview(dir)
+            } else if is_memory_cmd {
+                let workspace = drbot_gateway::workspace_memory_view::build_workspace_memory_overview(dir);
+                let project = if in_git_project_for_notes || project_drbot_dir.is_dir() {
+                    drbot_tool_mode::build_project_memory_overview(&project_drbot_dir)
+                } else {
+                    String::new()
+                };
+                if project.trim().is_empty() {
+                    workspace
+                } else {
+                    format!("{}\n\n{}", workspace.trim(), project.trim())
+                }
+            } else if is_kb_cmd {
+                let query = if msg_lower == "/kb"
+                    || msg_lower.starts_with("/kb ")
+                    || msg_lower.starts_with("/kb:")
+                {
+                    msg_trimmed[3..].trim_start_matches(&[' ', ':'][..]).trim()
+                } else if msg_lower.starts_with("kb:") {
+                    msg_trimmed[3..].trim()
+                } else if msg_lower == "/notes"
+                    || msg_lower.starts_with("/notes ")
+                    || msg_lower.starts_with("/notes:")
+                {
+                    msg_trimmed[6..].trim_start_matches(&[' ', ':'][..]).trim()
+                } else if msg_lower.starts_with("notes:") {
+                    msg_trimmed[6..].trim()
+                } else {
+                    ""
+                };
+
+                if query.trim().is_empty() {
+                    "Usage: /kb <query>".to_string()
+                } else {
+                    drbot_gateway::workspace_notes_recall::recall_workspace_notes_prompt_explicit_with_project(
+                        dir,
+                        Some(&project_drbot_dir),
+                        query,
+                    )
+                    .await
+                    .unwrap_or_else(|| "No relevant notes found.".to_string())
+                }
+            } else {
+                "Unknown local command.".to_string()
+            };
+
+            if should_persist {
+                // Persist to local session transcript.
+                session.add_message(Message::user(&msg));
+                session.add_message(Message::assistant(&reply));
+                session.update_timestamp();
+                let _ = store.update(&session).await;
+            }
+
+            println!("{}\n", reply);
+            return Ok(());
         }
 
         // Add user message to context and session
         let user_msg = Message::user(&msg);
         let _ = context_manager.add_message(&user_msg);
         session.add_message(user_msg);
+
+        if let Some(dir) = workspace_dir.as_deref() {
+            drbot_gateway::workspace_autosave::autosave_workspace_best_effort(dir, &msg);
+        }
+        if in_git_project_for_notes {
+            let msg_trimmed = msg.trim_start();
+            let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                || msg_trimmed.starts_with("[Tool Denied]")
+                || msg_trimmed.starts_with("[Tool Mode Strict]");
+            if !is_internal_tool_message {
+                drbot_tool_mode::autosave_project_kb_best_effort(&project_drbot_dir, &msg);
+            }
+        }
+
+        let workspace_notes = match workspace_dir.as_deref() {
+            Some(dir) => {
+                drbot_gateway::workspace_notes_recall::recall_workspace_notes_prompt_with_project(
+                    dir,
+                    Some(&project_drbot_dir),
+                    &msg,
+                )
+                .await
+            }
+            None => {
+                drbot_gateway::workspace_notes_recall::recall_project_notes_prompt(
+                    &project_drbot_dir,
+                    &msg,
+                )
+                .await
+            }
+        };
+        let mut send_options = options.clone();
+        send_options.system_prompt =
+            build_effective_system_prompt(tool_cfg.enabled, workspace_notes.as_deref());
 
         let mut strict_remaining = if agent_strict { 2usize } else { 0usize };
         let mut rounds = 0usize;
@@ -5326,7 +7419,7 @@ async fn run_chat(
 
             let messages_to_send = context_manager.build_messages();
             let response =
-                send_chat(provider.as_ref(), &messages_to_send, &options, stream).await?;
+                send_chat(provider.as_ref(), &messages_to_send, &send_options, stream).await?;
 
             if !stream {
                 println!("{}", response);
@@ -5359,27 +7452,107 @@ async fn run_chat(
             }
 
             for call in calls {
-                if call.tool == "bash" {
-                    let command = call
-                        .args
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !bash_command_is_safe_for_auto_approve(command, &bash_policy) {
-                        let denied = Message::user(format!(
-                            "[Tool Denied] tool=bash reason=unsafe_for_auto_approve\ncommand: {}",
-                            command
-                        ));
-                        let _ = context_manager.add_message(&denied);
-                        session.add_message(denied);
-                        continue;
+                let approved = match call.tool.as_str() {
+                    "read_file" | "list_dir" | "list_directory" | "search" => true,
+                    "bash" => {
+                        let command = call
+                            .args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        bash_command_is_safe_for_auto_approve(command, &bash_policy)
                     }
+                    _ => tool_cfg.auto_approve,
+                };
+
+                if !approved {
+                    match call.tool.as_str() {
+                        "bash" => {
+                            let command = call
+                                .args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            println!("\n[Tool Denied] bash (unsafe_for_auto_approve)");
+                            println!("command: {}", command);
+                            println!();
+                            let denied = Message::user(format!(
+                                "[Tool Denied] tool=bash reason=unsafe_for_auto_approve\ncommand: {}",
+                                command
+                            ));
+                            let _ = context_manager.add_message(&denied);
+                            session.add_message(denied);
+                        }
+                        "write_file" => {
+                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            let bytes = call
+                                .args
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            println!("\n[Tool Denied] write_file (approval_required)");
+                            println!("path: {}  bytes: {}", path, bytes);
+                            println!(
+                                "hint: re-run with -y/--yes (or use interactive mode and approve)"
+                            );
+                            println!();
+                            let denied = Message::user(format!(
+                                "[Tool Denied] tool=write_file reason=approval_required\npath: {}\nbytes: {}",
+                                path, bytes
+                            ));
+                            let _ = context_manager.add_message(&denied);
+                            session.add_message(denied);
+                        }
+                        "apply_patch" => {
+                            let bytes = call
+                                .args
+                                .get("patch")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                            println!("\n[Tool Denied] apply_patch (approval_required)");
+                            println!("bytes: {}", bytes);
+                            println!(
+                                "hint: re-run with -y/--yes (or use interactive mode and approve)"
+                            );
+                            println!();
+                            let denied = Message::user(format!(
+                                "[Tool Denied] tool=apply_patch reason=approval_required\nbytes: {}",
+                                bytes
+                            ));
+                            let _ = context_manager.add_message(&denied);
+                            session.add_message(denied);
+                        }
+                        other => {
+                            println!("\n[Tool Denied] {} (approval_required)", other);
+                            println!(
+                                "hint: re-run with -y/--yes (or use interactive mode and approve)"
+                            );
+                            println!();
+                            let denied = Message::user(format!(
+                                "[Tool Denied] tool={} reason=approval_required",
+                                other
+                            ));
+                            let _ = context_manager.add_message(&denied);
+                            session.add_message(denied);
+                        }
+                    }
+                    continue;
                 }
 
                 let (output, is_error) = match execute_tool_call(&tool_cfg, &call).await {
                     Ok((out, err)) => (out, err),
                     Err(e) => (format!("Error: {}", e), true),
                 };
+
+                println!(
+                    "\n[Tool Result] {}{}\n",
+                    call.tool,
+                    if is_error { " (error)" } else { "" }
+                );
+                println!("{}", output);
+                println!();
 
                 let tool_result = Message::user(format!(
                     "[Tool Result] tool={}{}\n{}",
@@ -5410,11 +7583,12 @@ async fn run_chat(
         session_info,
         persona_info
     );
-    println!("Commands: /quit, /clear, /save, /info, /sessions, /new, /context, /tools, /approve, /agent, /model");
+    println!("Commands: /quit, /clear, /save, /info, /sessions, /new, /context, /tools, /approve, /agent, /provider, /model, /remember, /forget, /remember project, /forget project, /memory, /memory project, /profile, /kb");
     if tool_cfg.enabled {
         println!(
-            "Tool mode: ON (auto-approve: {})  Root: {}",
+            "Tool mode: ON (auto-approve: {})  Autonomy: {:?}  Root: {}",
             if tool_cfg.auto_approve { "ON" } else { "OFF" },
+            tool_cfg.autonomy_mode,
             tool_cfg.root.display()
         );
     }
@@ -5443,6 +7617,208 @@ async fn run_chat(
 
         // Check for commands
         if input.is_empty() {
+            continue;
+        }
+
+        let input_lower = input.to_ascii_lowercase();
+        let mut mem_parts = input.split_whitespace();
+        let mem_cmd = mem_parts.next().unwrap_or("");
+        let mem_arg = mem_parts.next().unwrap_or("");
+        if (mem_cmd == "/memory" || mem_cmd == "/mem") && mem_arg.eq_ignore_ascii_case("project") {
+            let reply = drbot_tool_mode::build_project_memory_overview(&project_drbot_dir);
+            println!("\n{}\n", reply);
+            continue;
+        }
+        if drbot_tool_mode::is_project_remember_command(input)
+            || drbot_tool_mode::is_project_forget_command(input)
+        {
+            let reply = if drbot_tool_mode::is_project_remember_command(input) {
+                match drbot_tool_mode::parse_project_remember_note(input) {
+                    Some(note) => match drbot_tool_mode::remember_project_kb(&project_drbot_dir, &note) {
+                        Ok(updates) => {
+                            if updates.rejected {
+                                "Nothing saved (refused to store sensitive/invalid content)."
+                                    .to_string()
+                            } else if updates.applied {
+                                if updates.updates.is_empty() {
+                                    "Saved to project memory.".to_string()
+                                } else {
+                                    let mut out = String::new();
+                                    out.push_str("Saved to project memory:\n");
+                                    for u in updates.updates.iter().take(12) {
+                                        out.push_str("- ");
+                                        out.push_str(u);
+                                        out.push('\n');
+                                    }
+                                    out.trim_end().to_string()
+                                }
+                            } else {
+                                "Nothing saved.".to_string()
+                            }
+                        }
+                        Err(e) => format!("Project remember error: {}", e),
+                    },
+                    None => "Usage: /remember project <note>".to_string(),
+                }
+            } else {
+                match drbot_tool_mode::parse_project_forget_arg(input) {
+                    Some(arg) => match drbot_tool_mode::forget_project_kb(&project_drbot_dir, &arg) {
+                        Ok(updates) => {
+                            if updates.applied {
+                                if updates.updates.is_empty() {
+                                    "Forgot from project memory.".to_string()
+                                } else {
+                                    let mut out = String::new();
+                                    out.push_str("Forgot from project memory:\n");
+                                    for u in updates.updates.iter().take(12) {
+                                        out.push_str("- ");
+                                        out.push_str(u);
+                                        out.push('\n');
+                                    }
+                                    out.trim_end().to_string()
+                                }
+                            } else {
+                                "Nothing forgotten (no matching items).".to_string()
+                            }
+                        }
+                        Err(e) => format!("Project forget error: {}", e),
+                    },
+                    None => {
+                        "Usage: /forget project <all|pinned|conventions|runbooks|kb|text>"
+                            .to_string()
+                    }
+                }
+            };
+
+            session.add_message(Message::user(input));
+            session.add_message(Message::assistant(&reply));
+            session.update_timestamp();
+            let _ = store.update(&session).await;
+
+            println!("\n{}\n", reply);
+            continue;
+        }
+        let is_remember_cmd =
+            input_lower.starts_with("/remember") || input_lower.starts_with("remember:");
+        let is_forget_cmd =
+            input_lower.starts_with("/forget") || input_lower.starts_with("forget:");
+        if is_remember_cmd || is_forget_cmd {
+            if let Some(dir) = workspace_dir.as_deref() {
+                let updates = if is_remember_cmd {
+                    drbot_gateway::workspace_autosave::autosave_workspace_best_effort(dir, input)
+                } else {
+                    drbot_gateway::workspace_autosave::forget_workspace_best_effort(dir, input)
+                };
+                let reply = if updates.applied {
+                    if updates.updates.is_empty() {
+                        if is_remember_cmd {
+                            "Saved to memory.".to_string()
+                        } else {
+                            "Forgot.".to_string()
+                        }
+                    } else {
+                        let mut out = String::new();
+                        out.push_str(if is_remember_cmd {
+                            "Saved to memory:\n"
+                        } else {
+                            "Forgot:\n"
+                        });
+                        for u in updates.updates.iter().take(12) {
+                            out.push_str("- ");
+                            out.push_str(u);
+                            out.push('\n');
+                        }
+                        out.trim_end().to_string()
+                    }
+                } else if is_remember_cmd {
+                    if drbot_gateway::workspace_autosave::parse_remember_command(input).is_some() {
+                        "Nothing saved (refused to store sensitive/invalid content).".to_string()
+                    } else {
+                        "Usage: /remember <note>".to_string()
+                    }
+                } else if drbot_gateway::workspace_autosave::parse_forget_command(input).is_some() {
+                    "Nothing forgotten (no matching items).".to_string()
+                } else {
+                    "Usage: /forget <name|timezone|style|all|text>".to_string()
+                };
+
+                // Persist locally (but don't send to provider).
+                session.add_message(Message::user(input));
+                session.add_message(Message::assistant(&reply));
+                session.update_timestamp();
+                let _ = store.update(&session).await;
+
+                println!("\n{}\n", reply);
+                continue;
+            } else {
+                println!("\nWorkspace directory is unavailable.\n");
+                continue;
+            }
+        }
+
+        let is_memory_cmd = input_lower == "/memory" || input_lower == "/mem";
+        let is_profile_cmd = input_lower == "/profile";
+        let is_kb_cmd = input_lower == "/kb"
+            || input_lower.starts_with("/kb ")
+            || input_lower.starts_with("/kb:")
+            || input_lower.starts_with("kb:")
+            || input_lower == "/notes"
+            || input_lower.starts_with("/notes ")
+            || input_lower.starts_with("/notes:")
+            || input_lower.starts_with("notes:");
+        if is_memory_cmd || is_profile_cmd || is_kb_cmd {
+            if let Some(dir) = workspace_dir.as_deref() {
+                let reply = if is_profile_cmd {
+                    drbot_gateway::workspace_memory_view::build_workspace_profile_overview(dir)
+                } else if is_memory_cmd {
+                    let workspace =
+                        drbot_gateway::workspace_memory_view::build_workspace_memory_overview(dir);
+                    let project = if in_git_project_for_notes || project_drbot_dir.is_dir() {
+                        drbot_tool_mode::build_project_memory_overview(&project_drbot_dir)
+                    } else {
+                        String::new()
+                    };
+                    if project.trim().is_empty() {
+                        workspace
+                    } else {
+                        format!("{}\n\n{}", workspace.trim(), project.trim())
+                    }
+                } else {
+                    let query = if input_lower == "/kb"
+                        || input_lower.starts_with("/kb ")
+                        || input_lower.starts_with("/kb:")
+                    {
+                        input[3..].trim_start_matches(&[' ', ':'][..]).trim()
+                    } else if input_lower.starts_with("kb:") {
+                        input[3..].trim()
+                    } else if input_lower == "/notes"
+                        || input_lower.starts_with("/notes ")
+                        || input_lower.starts_with("/notes:")
+                    {
+                        input[6..].trim_start_matches(&[' ', ':'][..]).trim()
+                    } else if input_lower.starts_with("notes:") {
+                        input[6..].trim()
+                    } else {
+                        ""
+                    };
+
+                    if query.trim().is_empty() {
+                        "Usage: /kb <query>".to_string()
+                    } else {
+                        drbot_gateway::workspace_notes_recall::recall_workspace_notes_prompt_explicit_with_project(
+                            dir,
+                            Some(&project_drbot_dir),
+                            query,
+                        )
+                        .await
+                        .unwrap_or_else(|| "No relevant notes found.".to_string())
+                    }
+                };
+
+                println!("\n{}\n", reply);
+            } else {
+                println!("\nWorkspace directory is unavailable.\n");
+            }
             continue;
         }
 
@@ -5530,7 +7906,11 @@ async fn run_chat(
             println!("search     - search for a pattern under root");
             println!("apply_patch - apply a unified diff patch under root");
             println!();
-            println!("Tool mode: {}", if tool_cfg.enabled { "ON" } else { "OFF" });
+            println!(
+                "Tool mode: {} (autonomy: {:?})",
+                if tool_cfg.enabled { "ON" } else { "OFF" },
+                tool_cfg.autonomy_mode
+            );
             println!(
                 "Auto-approve: {}",
                 if tool_cfg.auto_approve { "ON" } else { "OFF" }
@@ -5538,6 +7918,18 @@ async fn run_chat(
             println!("Strict agent: {}", if agent_strict { "ON" } else { "OFF" });
             println!("Root: {}", tool_cfg.root.display());
             println!("Max tool rounds: {}", tool_cfg.max_rounds);
+            let allowlist = if tool_cfg.tool_allowlist.is_empty() {
+                "all".to_string()
+            } else {
+                tool_cfg.tool_allowlist.join(", ")
+            };
+            let denylist = if tool_cfg.tool_denylist.is_empty() {
+                "(none)".to_string()
+            } else {
+                tool_cfg.tool_denylist.join(", ")
+            };
+            println!("Tool allowlist: {}", allowlist);
+            println!("Tool denylist: {}", denylist);
             println!();
             continue;
         }
@@ -5568,24 +7960,178 @@ async fn run_chat(
             match arg {
                 "on" | "yes" | "true" => {
                     tool_cfg.enabled = true;
-                    options.system_prompt = Some(build_agent_system_prompt(
-                        base_system.clone(),
-                        &tool_cfg.root,
-                    ));
+                    options.system_prompt = build_effective_system_prompt(true, None);
                     options.temperature = Some(0.2);
-                    println!("\nTool mode: ON\n");
+                    println!("\nTool mode: ON (autonomy: {:?})\n", tool_cfg.autonomy_mode);
                 }
                 "off" | "no" | "false" => {
                     tool_cfg.enabled = false;
-                    options.system_prompt = base_system.clone();
+                    options.system_prompt = build_effective_system_prompt(false, None);
                     options.temperature = None;
-                    println!("\nTool mode: OFF\n");
+                    println!(
+                        "\nTool mode: OFF (autonomy: {:?})\n",
+                        tool_cfg.autonomy_mode
+                    );
                 }
                 _ => {
                     println!(
-                        "\nTool mode: {} (use: /agent on|off)\n",
-                        if tool_cfg.enabled { "ON" } else { "OFF" }
+                        "\nTool mode: {} (autonomy: {:?}) (use: /agent on|off)\n",
+                        if tool_cfg.enabled { "ON" } else { "OFF" },
+                        tool_cfg.autonomy_mode
                     );
+                }
+            }
+            continue;
+        }
+
+        if input == "/provider" || input.starts_with("/provider ") {
+            let arg = input.strip_prefix("/provider").unwrap().trim();
+            if arg.is_empty() {
+                println!(
+                    "\nProvider: {}\n(use: /provider list | /provider <name>)\n",
+                    current_provider_name
+                );
+                continue;
+            }
+
+            if arg == "list" {
+                fn normalize_http_url(raw: &str) -> Option<String> {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    if trimmed.contains("://") {
+                        Some(trimmed.to_string())
+                    } else {
+                        Some(format!("http://{}", trimmed))
+                    }
+                }
+
+                let ollama_url: String = if let Some(ollama) = &config.providers.ollama {
+                    ollama.url.trim().to_string()
+                } else if let Ok(v) = std::env::var("DRBOT_OLLAMA_URL") {
+                    normalize_http_url(&v)
+                        .unwrap_or_else(|| drbot_ollama::DEFAULT_BASE_URL.to_string())
+                } else if let Ok(v) = std::env::var("OLLAMA_HOST") {
+                    normalize_http_url(&v)
+                        .unwrap_or_else(|| drbot_ollama::DEFAULT_BASE_URL.to_string())
+                } else {
+                    drbot_ollama::DEFAULT_BASE_URL.to_string()
+                };
+
+                let claude_ok = CliProvider::claude_cli().check_command_exists().is_ok();
+                let codex_ok = CliProvider::codex_cli().check_command_exists().is_ok();
+                let ollama_ok = check_ollama_health_with_timeout(
+                    &ollama_url,
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+                .unwrap_or(false);
+                let codex_oss_ok = CliProvider::codex_oss_ollama()
+                    .check_command_exists()
+                    .is_ok()
+                    && ollama_ok;
+
+                let mut any_available = false;
+                if claude_ok
+                    || codex_ok
+                    || codex_oss_ok
+                    || ollama_ok
+                    || config.providers.anthropic.is_some()
+                    || config.providers.openai.is_some()
+                    || !config.providers.openai_compatible.is_empty()
+                    || !config.providers.cli.is_empty()
+                {
+                    any_available = true;
+                }
+
+                println!("\nProviders:");
+                println!(
+                    "  - auto ({})",
+                    if any_available {
+                        "available"
+                    } else {
+                        "unavailable: no providers available (try drbot wizard)"
+                    }
+                );
+                println!(
+                    "  - claude-cli ({})",
+                    if claude_ok {
+                        "available"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                println!(
+                    "  - codex-cli ({})",
+                    if codex_ok { "available" } else { "unavailable" }
+                );
+                println!(
+                    "  - codex-oss ({})",
+                    if codex_oss_ok {
+                        "available"
+                    } else if !ollama_ok {
+                        "unavailable: ollama not running"
+                    } else {
+                        "unavailable: codex CLI missing"
+                    }
+                );
+                println!(
+                    "  - ollama ({})  {}",
+                    if ollama_ok {
+                        "available"
+                    } else {
+                        "unavailable"
+                    },
+                    ollama_url
+                );
+                println!(
+                    "  - anthropic ({})",
+                    if config.providers.anthropic.is_some() {
+                        "configured"
+                    } else {
+                        "unconfigured"
+                    }
+                );
+                println!(
+                    "  - openai ({})",
+                    if config.providers.openai.is_some() {
+                        "configured"
+                    } else {
+                        "unconfigured"
+                    }
+                );
+
+                for cfg in config.providers.openai_compatible.iter() {
+                    println!("  - {} (openai-compatible) (configured)", cfg.name.trim());
+                }
+
+                for cfg in config.providers.cli.iter() {
+                    let p = CliProvider::from_config(cfg);
+                    let ok = p.check_command_exists().is_ok();
+                    println!(
+                        "  - {} (cli) ({})",
+                        cfg.name.trim(),
+                        if ok { "available" } else { "unavailable" }
+                    );
+                }
+
+                println!();
+                continue;
+            }
+
+            match create_provider(config, arg).await {
+                Ok(new_provider) => {
+                    current_provider_name = new_provider.name().to_string();
+                    provider = new_provider;
+                    options.model = None; // use provider default
+                    println!(
+                        "\nSwitched to provider: {} (default model)\n",
+                        current_provider_name
+                    );
+                }
+                Err(e) => {
+                    println!("\nFailed to switch provider: {}\n", e);
                 }
             }
             continue;
@@ -5605,7 +8151,7 @@ async fn run_chat(
                 let parts: Vec<&str> = arg.splitn(2, '/').collect();
                 let prov = parts[0];
                 let mdl = parts[1];
-                match create_provider(config, prov) {
+                match create_provider(config, prov).await {
                     Ok(new_provider) => {
                         current_provider_name = new_provider.name().to_string();
                         provider = new_provider;
@@ -5633,9 +8179,11 @@ async fn run_chat(
                     "claude-code",
                     "codex-cli",
                     "codex",
+                    "codex-oss",
+                    "codex-local",
                 ];
                 if known_providers.contains(&arg.to_lowercase().as_str()) {
-                    match create_provider(config, arg) {
+                    match create_provider(config, arg).await {
                         Ok(new_provider) => {
                             current_provider_name = new_provider.name().to_string();
                             provider = new_provider;
@@ -5721,6 +8269,40 @@ async fn run_chat(
         let _ = context_manager.add_message(&user_msg);
         session.add_message(user_msg.clone());
 
+        if let Some(dir) = workspace_dir.as_deref() {
+            drbot_gateway::workspace_autosave::autosave_workspace_best_effort(dir, input);
+        }
+        if in_git_project_for_notes {
+            let msg_trimmed = input.trim_start();
+            let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                || msg_trimmed.starts_with("[Tool Denied]")
+                || msg_trimmed.starts_with("[Tool Mode Strict]");
+            if !is_internal_tool_message {
+                drbot_tool_mode::autosave_project_kb_best_effort(&project_drbot_dir, input);
+            }
+        }
+
+        let workspace_notes = match workspace_dir.as_deref() {
+            Some(dir) => {
+                drbot_gateway::workspace_notes_recall::recall_workspace_notes_prompt_with_project(
+                    dir,
+                    Some(&project_drbot_dir),
+                    input,
+                )
+                .await
+            }
+            None => {
+                drbot_gateway::workspace_notes_recall::recall_project_notes_prompt(
+                    &project_drbot_dir,
+                    input,
+                )
+                .await
+            }
+        };
+        let mut send_options = options.clone();
+        send_options.system_prompt =
+            build_effective_system_prompt(tool_cfg.enabled, workspace_notes.as_deref());
+
         let mut strict_remaining = if agent_strict { 2usize } else { 0usize };
         let mut rounds = 0usize;
         loop {
@@ -5740,16 +8322,22 @@ async fn run_chat(
             print!("\nAssistant: ");
             io::stdout().flush()?;
 
-            let response =
-                match send_chat(provider.as_ref(), &messages_to_send, &options, stream).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("\nError: {}", e);
-                        // Remove the failed user message from session
-                        session.messages.pop();
-                        break;
-                    }
-                };
+            let response = match send_chat(
+                provider.as_ref(),
+                &messages_to_send,
+                &send_options,
+                stream,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("\nError: {}", e);
+                    // Remove the failed user message from session
+                    session.messages.pop();
+                    break;
+                }
+            };
 
             if !stream {
                 println!("{}", response);
@@ -5789,89 +8377,88 @@ async fn run_chat(
             }
 
             for call in calls {
-                let mut approved = false;
-
-                if tool_cfg.auto_approve {
-                    approved = if call.tool == "bash" {
+                // Default to "automated in place":
+                // - Read-only tools run without prompting.
+                // - Safe bash commands run without prompting.
+                // - Writes require explicit approval unless auto-approve is enabled.
+                let mut approved = match call.tool.as_str() {
+                    "read_file" | "list_dir" | "list_directory" | "search" => true,
+                    "bash" => {
                         let command = call
                             .args
                             .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         bash_command_is_safe_for_auto_approve(command, &bash_policy)
-                    } else {
-                        true
-                    };
+                    }
+                    _ => tool_cfg.auto_approve,
+                };
+
+                // Print tool summary (even when auto-approved) for transparency.
+                match call.tool.as_str() {
+                    "bash" => {
+                        let command = call
+                            .args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let cwd = call.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+                        if cwd.trim().is_empty() {
+                            println!("[Tool] bash\n  command: {}", command);
+                        } else {
+                            println!("[Tool] bash\n  cwd: {}\n  command: {}", cwd.trim(), command);
+                        }
+                    }
+                    "read_file" => {
+                        let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        println!("[Tool] read_file\n  path: {}", path);
+                    }
+                    "write_file" => {
+                        let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let bytes = call
+                            .args
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        println!("[Tool] write_file\n  path: {}\n  bytes: {}", path, bytes);
+                    }
+                    "list_dir" | "list_directory" => {
+                        let path = call
+                            .args
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(".");
+                        println!("[Tool] list_dir\n  path: {}", path);
+                    }
+                    "search" => {
+                        let pattern = call
+                            .args
+                            .get("pattern")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let path = call
+                            .args
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(".");
+                        println!("[Tool] search\n  pattern: {}\n  path: {}", pattern, path);
+                    }
+                    "apply_patch" => {
+                        let bytes = call
+                            .args
+                            .get("patch")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        println!("[Tool] apply_patch\n  bytes: {}", bytes);
+                    }
+                    _ => {
+                        println!("[Tool] {}", call.tool);
+                    }
                 }
 
                 if !approved {
-                    match call.tool.as_str() {
-                        "bash" => {
-                            let command = call
-                                .args
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let cwd = call.args.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-                            if cwd.trim().is_empty() {
-                                println!("[Tool] bash\n  command: {}", command);
-                            } else {
-                                println!(
-                                    "[Tool] bash\n  cwd: {}\n  command: {}",
-                                    cwd.trim(),
-                                    command
-                                );
-                            }
-                        }
-                        "read_file" => {
-                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                            println!("[Tool] read_file\n  path: {}", path);
-                        }
-                        "write_file" => {
-                            let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                            let bytes = call
-                                .args
-                                .get("content")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.len())
-                                .unwrap_or(0);
-                            println!("[Tool] write_file\n  path: {}\n  bytes: {}", path, bytes);
-                        }
-                        "list_dir" | "list_directory" => {
-                            let path = call
-                                .args
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".");
-                            println!("[Tool] list_dir\n  path: {}", path);
-                        }
-                        "search" => {
-                            let pattern = call
-                                .args
-                                .get("pattern")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let path = call
-                                .args
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(".");
-                            println!("[Tool] search\n  pattern: {}\n  path: {}", pattern, path);
-                        }
-                        "apply_patch" => {
-                            let bytes = call
-                                .args
-                                .get("patch")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.len())
-                                .unwrap_or(0);
-                            println!("[Tool] apply_patch\n  bytes: {}", bytes);
-                        }
-                        _ => {
-                            println!("[Tool] {}", call.tool);
-                        }
-                    }
-
                     approved = prompt_approve("Approve? [y/N] ")? && tool_cfg.enabled;
                 }
 
@@ -5967,6 +8554,43 @@ fn show_config(config: &Config) {
             "disabled"
         }
     );
+    println!(
+        "  Pairing required: {}",
+        if config.gateway.pairing_required {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "  Pairing allow local: {}",
+        if config.gateway.pairing_allow_local {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!();
+    println!("Assistant:");
+    println!("  Autonomy: {:?}", config.assistant.autonomy_mode);
+    if config.assistant.workspace_allowlist.is_empty() {
+        println!("  Workspace allowlist: (none)");
+    } else {
+        println!("  Workspace allowlist:");
+        for path in &config.assistant.workspace_allowlist {
+            println!("    - {}", path.display());
+        }
+    }
+    if config.assistant.tool_allowlist.is_empty() {
+        println!("  Tool allowlist: (all)");
+    } else {
+        println!("  Tool allowlist: {}", config.assistant.tool_allowlist.join(", "));
+    }
+    if config.assistant.tool_denylist.is_empty() {
+        println!("  Tool denylist: (none)");
+    } else {
+        println!("  Tool denylist: {}", config.assistant.tool_denylist.join(", "));
+    }
     println!();
     println!("Providers:");
     println!(
@@ -5990,107 +8614,6 @@ fn show_config(config: &Config) {
     println!("Storage:");
     println!("  Database: {}", config.storage.database_path.display());
     println!("  Media: {}", config.storage.media_path.display());
-}
-
-#[cfg(test)]
-mod tool_mode_tests {
-    use super::*;
-
-    #[test]
-    fn extract_single_tool_call() {
-        let text = r#"
-hello
-```drbot_tool
-{"tool":"bash","args":{"command":"git status"}}
-```
-"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool, "bash");
-        assert_eq!(
-            calls[0].args.get("command").and_then(|v| v.as_str()),
-            Some("git status")
-        );
-    }
-
-    #[test]
-    fn extract_multiple_tool_calls_array() {
-        let text = r#"
-```drbot_tool
-[
-  {"tool":"read_file","args":{"path":"src/main.rs"}},
-  {"tool":"search","args":{"pattern":"run_chat","path":"src"}}
-]
-```
-"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].tool, "read_file");
-        assert_eq!(calls[1].tool, "search");
-    }
-
-    #[test]
-    fn extract_bash_fence_as_tool_call() {
-        let text = r#"
-Here is the command:
-
-```bash
-cd app && pnpm test
-```
-"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool, "bash");
-        assert_eq!(
-            calls[0].args.get("command").and_then(|v| v.as_str()),
-            Some("cd app && pnpm test")
-        );
-    }
-
-    #[test]
-    fn extract_bash_colon_line_as_tool_call() {
-        let text = "bash: cd app && pnpm build";
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool, "bash");
-        assert_eq!(
-            calls[0].args.get("command").and_then(|v| v.as_str()),
-            Some("cd app && pnpm build")
-        );
-    }
-
-    #[test]
-    fn safe_bash_auto_approve() {
-        let policy = BashAutoApprovePolicy::default();
-        assert!(bash_command_is_safe_for_auto_approve("git status", &policy));
-        assert!(bash_command_is_safe_for_auto_approve(
-            "cargo test -q",
-            &policy
-        ));
-        assert!(!bash_command_is_safe_for_auto_approve("rm -rf /", &policy));
-        assert!(!bash_command_is_safe_for_auto_approve("sudo ls", &policy));
-        assert!(!bash_command_is_safe_for_auto_approve(
-            "dd if=/dev/zero of=/dev/null",
-            &policy
-        ));
-        assert!(!bash_command_is_safe_for_auto_approve(
-            "./script.sh",
-            &policy
-        ));
-    }
-
-    #[test]
-    fn safe_bash_auto_approve_does_not_false_positive_on_add() {
-        let policy = BashAutoApprovePolicy {
-            allow_all: false,
-            extra_prefixes: vec!["cd".to_string(), "pnpm".to_string()],
-            override_prefixes: None,
-        };
-        assert!(bash_command_is_safe_for_auto_approve(
-            "cd app && pnpm add @solana/client",
-            &policy
-        ));
-    }
 }
 
 async fn run_doctor(config: &Config) -> Result<()> {
@@ -6283,6 +8806,17 @@ async fn run_doctor(config: &Config) -> Result<()> {
                 },
             ],
         });
+        if !config.gateway.pairing_required {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Pairing not required for remote operators".to_string(),
+                details: vec![
+                    "OpenClaw operator connections can attach without device pairing."
+                        .to_string(),
+                    "Fix: set `gateway.pairing_required=true` (and keep auth enabled).".to_string(),
+                ],
+            });
+        }
         if !tls {
             findings.push(Finding {
                 severity: Severity::Warning,
@@ -6430,6 +8964,29 @@ async fn run_doctor(config: &Config) -> Result<()> {
         .collect::<std::collections::HashSet<_>>();
 
     let is_enabled = |name: &str| enabled.contains(&normalize_channel_name(name));
+    match config.assistant.autonomy_mode {
+        drbot_core::config::AutonomyMode::ReadOnly => {
+            findings.push(Finding {
+                severity: Severity::Info,
+                title: "Assistant autonomy: read-only".to_string(),
+                details: vec![
+                    "Tool writes and exec are disabled by default.".to_string(),
+                ],
+            });
+        }
+        drbot_core::config::AutonomyMode::Full => {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Assistant autonomy: full".to_string(),
+                details: vec![
+                    "Full autonomy enables tool runs without extra supervision.".to_string(),
+                    "Fix: consider `assistant.autonomy_mode=supervised` for safer defaults."
+                        .to_string(),
+                ],
+            });
+        }
+        drbot_core::config::AutonomyMode::Supervised => {}
+    }
     if is_enabled("telegram") {
         match &config.channels.telegram {
             None => findings.push(Finding {
@@ -6610,15 +9167,97 @@ async fn run_doctor(config: &Config) -> Result<()> {
             "not configured"
         }
     );
-    if let Some(ollama) = &config.providers.ollama {
-        match check_ollama_health(&ollama.url).await {
-            Ok(true) => println!("  Ollama: running ({})", ollama.url),
-            Ok(false) => println!("  Ollama: configured but not responding ({})", ollama.url),
-            Err(e) => println!("  Ollama: error checking ({}): {}", ollama.url, e),
+    let claude_cli = CliProvider::claude_cli();
+    println!(
+        "  Claude CLI: {}",
+        if claude_cli.check_command_exists().is_ok() {
+            "available"
+        } else {
+            "not found"
+        }
+    );
+    let codex_cli = CliProvider::codex_cli();
+    let codex_ok = codex_cli.check_command_exists().is_ok();
+    println!(
+        "  Codex CLI: {}",
+        if codex_ok { "available" } else { "not found" }
+    );
+
+    fn normalize_http_url(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Ollama commonly uses OLLAMA_HOST like "127.0.0.1:11434".
+        if trimmed.contains("://") {
+            Some(trimmed.to_string())
+        } else {
+            Some(format!("http://{}", trimmed))
+        }
+    }
+
+    let ollama_source;
+    let ollama_url: String = if let Some(ollama) = &config.providers.ollama {
+        ollama_source = "configured";
+        ollama.url.clone()
+    } else if let Ok(v) = std::env::var("DRBOT_OLLAMA_URL") {
+        if let Some(u) = normalize_http_url(&v) {
+            ollama_source = "env";
+            u
+        } else {
+            ollama_source = "default";
+            drbot_ollama::DEFAULT_BASE_URL.to_string()
+        }
+    } else if let Ok(v) = std::env::var("OLLAMA_HOST") {
+        if let Some(u) = normalize_http_url(&v) {
+            ollama_source = "env";
+            u
+        } else {
+            ollama_source = "default";
+            drbot_ollama::DEFAULT_BASE_URL.to_string()
         }
     } else {
-        println!("  Ollama: not configured");
-    }
+        ollama_source = "default";
+        drbot_ollama::DEFAULT_BASE_URL.to_string()
+    };
+
+    let ollama_ok = match check_ollama_health(&ollama_url).await {
+        Ok(true) => {
+            if ollama_source == "configured" {
+                println!("  Ollama: running ({})", ollama_url);
+            } else {
+                println!("  Ollama: running (auto-detected at {})", ollama_url);
+            }
+            true
+        }
+        Ok(false) => {
+            if ollama_source == "configured" {
+                println!("  Ollama: configured but not responding ({})", ollama_url);
+            } else {
+                println!("  Ollama: not running ({})", ollama_url);
+            }
+            false
+        }
+        Err(e) => {
+            if ollama_source == "configured" {
+                println!("  Ollama: error checking ({}): {}", ollama_url, e);
+            } else {
+                println!("  Ollama: error checking ({}): {}", ollama_url, e);
+            }
+            false
+        }
+    };
+
+    println!(
+        "  Codex OSS (Ollama): {}",
+        if codex_ok && ollama_ok {
+            "available"
+        } else if !codex_ok {
+            "not available (codex CLI missing)"
+        } else {
+            "not available (Ollama not running)"
+        }
+    );
     println!();
 
     // --------------------------------------------
@@ -6668,10 +9307,8 @@ async fn run_doctor(config: &Config) -> Result<()> {
 }
 
 /// Check if Ollama is running by hitting its health endpoint.
-async fn check_ollama_health(url: &str) -> Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+async fn check_ollama_health_with_timeout(url: &str, timeout: std::time::Duration) -> Result<bool> {
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
 
     // Ollama's API endpoint - try to list models
     let api_url = format!("{}/api/tags", url.trim_end_matches('/'));
@@ -6684,9 +9321,14 @@ async fn check_ollama_health(url: &str) -> Result<bool> {
     }
 }
 
+/// Check if Ollama is running by hitting its health endpoint.
+async fn check_ollama_health(url: &str) -> Result<bool> {
+    check_ollama_health_with_timeout(url, std::time::Duration::from_secs(5)).await
+}
+
 /// Interactive setup wizard.
 async fn run_wizard() -> Result<()> {
-    use drbot_core::config::{AnthropicConfig, OllamaConfig, OpenAIConfig};
+    use drbot_core::config::{AnthropicConfig, AutonomyMode, OllamaConfig, OpenAIConfig};
 
     println!();
     println!("╔═══════════════════════════════════════╗");
@@ -6702,13 +9344,137 @@ async fn run_wizard() -> Result<()> {
     println!("┌─ Provider Configuration ─────────────────┐");
     println!();
 
-    // Anthropic
-    print!("Configure Anthropic Claude? [Y/n]: ");
-    io::stdout().flush()?;
     let mut input = String::new();
+    fn parse_yes_no(raw: &str, default_yes: bool) -> bool {
+        let t = raw.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            default_yes
+        } else {
+            t.starts_with('y')
+        }
+    }
+
+    fn normalize_http_url(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Ollama commonly uses OLLAMA_HOST like "127.0.0.1:11434".
+        if trimmed.contains("://") {
+            Some(trimmed.to_string())
+        } else {
+            Some(format!("http://{}", trimmed))
+        }
+    }
+
+    fn parse_autonomy_mode(raw: &str) -> Option<AutonomyMode> {
+        let t = raw.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            return None;
+        }
+        match t.as_str() {
+            "read" | "readonly" | "read-only" | "read_only" => Some(AutonomyMode::ReadOnly),
+            "supervised" | "supervise" | "super" => Some(AutonomyMode::Supervised),
+            "full" => Some(AutonomyMode::Full),
+            _ => None,
+        }
+    }
+
+    fn parse_csv_list(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    }
+
+    // Detect cost-savers first (no API cost).
+    let claude_ok = CliProvider::claude_cli().check_command_exists().is_ok();
+    let codex_ok = CliProvider::codex_cli().check_command_exists().is_ok();
+
+    let ollama_url: String = if let Ok(v) = std::env::var("DRBOT_OLLAMA_URL") {
+        normalize_http_url(&v).unwrap_or_else(|| drbot_ollama::DEFAULT_BASE_URL.to_string())
+    } else if let Ok(v) = std::env::var("OLLAMA_HOST") {
+        normalize_http_url(&v).unwrap_or_else(|| drbot_ollama::DEFAULT_BASE_URL.to_string())
+    } else {
+        drbot_ollama::DEFAULT_BASE_URL.to_string()
+    };
+
+    let ollama_ok = match check_ollama_health(&ollama_url).await {
+        Ok(v) => v,
+        Err(_) => false,
+    };
+
+    println!("Local cost-savers (no API cost):");
+    println!(
+        "  Claude CLI (provider: claude-cli): {}",
+        if claude_ok { "available" } else { "not found" }
+    );
+    println!(
+        "  Codex CLI (provider: codex-cli): {}",
+        if codex_ok { "available" } else { "not found" }
+    );
+    println!(
+        "  Ollama (provider: ollama): {} ({})",
+        if ollama_ok { "running" } else { "not running" },
+        ollama_url
+    );
+    println!();
+    println!("Tip: If you set default provider to 'auto', drbot prefers:");
+    println!("  claude-cli/codex-cli → ollama → APIs");
+    println!();
+
+    // Ollama (optional). If it's already running and no CLI providers are available, default to yes.
+    let ollama_default_yes = ollama_ok && !(claude_ok || codex_ok);
+    print!(
+        "Configure Ollama settings (optional; auto-detected if running)? [{}]: ",
+        if ollama_default_yes { "Y/n" } else { "y/N" }
+    );
+    io::stdout().flush()?;
+    input.clear();
     io::stdin().read_line(&mut input)?;
-    let configure_anthropic =
-        input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
+    let configure_ollama = parse_yes_no(&input, ollama_default_yes);
+
+    if configure_ollama {
+        print!("  Ollama URL [{}]: ", ollama_url);
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let url = if input.trim().is_empty() {
+            ollama_url.clone()
+        } else {
+            input.trim().to_string()
+        };
+
+        print!("  Default model [llama3.2]: ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let model = if input.trim().is_empty() {
+            "llama3.2".to_string()
+        } else {
+            input.trim().to_string()
+        };
+
+        config.providers.ollama = Some(OllamaConfig {
+            url,
+            default_model: Some(model),
+        });
+        println!("  Ollama configured.");
+    }
+    println!();
+
+    // API providers (optional). If no cost-savers were detected, default to yes.
+    let api_default_yes = !(claude_ok || codex_ok || ollama_ok);
+
+    // Anthropic
+    print!(
+        "Configure Anthropic Claude (API)? [{}]: ",
+        if api_default_yes { "Y/n" } else { "y/N" }
+    );
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    let configure_anthropic = parse_yes_no(&input, api_default_yes);
 
     if configure_anthropic {
         // Check environment variable first
@@ -6720,7 +9486,7 @@ async fn run_wizard() -> Result<()> {
             io::stdout().flush()?;
             input.clear();
             io::stdin().read_line(&mut input)?;
-            if input.trim().is_empty() || input.trim().to_lowercase().starts_with('y') {
+            if parse_yes_no(&input, true) {
                 key
             } else {
                 print!("  Enter Anthropic API key: ");
@@ -6761,11 +9527,14 @@ async fn run_wizard() -> Result<()> {
     println!();
 
     // OpenAI
-    print!("Configure OpenAI? [Y/n]: ");
+    print!(
+        "Configure OpenAI (API)? [{}]: ",
+        if api_default_yes { "Y/n" } else { "y/N" }
+    );
     io::stdout().flush()?;
     input.clear();
     io::stdin().read_line(&mut input)?;
-    let configure_openai = input.trim().is_empty() || input.trim().to_lowercase().starts_with('y');
+    let configure_openai = parse_yes_no(&input, api_default_yes);
 
     if configure_openai {
         let env_key = std::env::var("OPENAI_API_KEY").ok();
@@ -6776,7 +9545,7 @@ async fn run_wizard() -> Result<()> {
             io::stdout().flush()?;
             input.clear();
             io::stdin().read_line(&mut input)?;
-            if input.trim().is_empty() || input.trim().to_lowercase().starts_with('y') {
+            if parse_yes_no(&input, true) {
                 key
             } else {
                 print!("  Enter OpenAI API key: ");
@@ -6816,66 +9585,31 @@ async fn run_wizard() -> Result<()> {
     }
     println!();
 
-    // Ollama
-    print!("Configure Ollama (local models)? [y/N]: ");
+    // Default provider: always offer "auto" (cost-savers first when available).
+    println!("Default provider controls what drbot picks when you don't pass --provider.");
+    println!("Recommended: auto (claude-cli/codex-cli → ollama → APIs).");
+    print!("Default provider [auto]: ");
     io::stdout().flush()?;
     input.clear();
     io::stdin().read_line(&mut input)?;
-    let configure_ollama = input.trim().to_lowercase().starts_with('y');
+    let chosen = if input.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        input.trim().to_string()
+    };
+    config.providers.default_provider = Some(chosen);
 
-    if configure_ollama {
-        print!("  Ollama URL [http://localhost:11434]: ");
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        let url = if input.trim().is_empty() {
-            "http://localhost:11434".to_string()
-        } else {
-            input.trim().to_string()
-        };
-
-        print!("  Default model [llama3.2]: ");
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        let model = if input.trim().is_empty() {
-            "llama3.2".to_string()
-        } else {
-            input.trim().to_string()
-        };
-
-        config.providers.ollama = Some(OllamaConfig {
-            url,
-            default_model: Some(model),
-        });
-        println!("  Ollama configured.");
-    }
-    println!();
-
-    // Default provider
-    let mut providers_available = Vec::new();
-    if config.providers.anthropic.is_some() {
-        providers_available.push("anthropic");
-    }
-    if config.providers.openai.is_some() {
-        providers_available.push("openai");
-    }
-    if config.providers.ollama.is_some() {
-        providers_available.push("ollama");
-    }
-
-    if !providers_available.is_empty() {
-        let default = providers_available[0];
-        print!("Default provider [{}]: ", default);
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        let chosen = if input.trim().is_empty() {
-            default.to_string()
-        } else {
-            input.trim().to_string()
-        };
-        config.providers.default_provider = Some(chosen);
+    let any_provider = claude_ok
+        || codex_ok
+        || ollama_ok
+        || config.providers.ollama.is_some()
+        || config.providers.anthropic.is_some()
+        || config.providers.openai.is_some();
+    if !any_provider {
+        println!();
+        println!(
+            "Warning: No providers configured or detected. Install claude/codex CLI, start Ollama, or configure an API key."
+        );
     }
 
     println!();
@@ -6916,6 +9650,62 @@ async fn run_wizard() -> Result<()> {
         if !input.trim().is_empty() {
             config.gateway.auth_token = Some(input.trim().to_string());
         }
+    }
+
+    println!();
+    println!("└───────────────────────────────────────────┘");
+    println!();
+
+    // --- Assistant Policy ---
+    println!("┌─ Assistant Policy ────────────────────────┐");
+    println!();
+    println!("Autonomy controls default tool behavior for agents.");
+    print!("Autonomy mode [supervised]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if let Some(mode) = parse_autonomy_mode(&input) {
+        config.assistant.autonomy_mode = mode;
+    }
+
+    print!("Workspace allowlist (comma-separated paths, blank = allow any): ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if !input.trim().is_empty() {
+        config.assistant.workspace_allowlist = parse_csv_list(&input)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    print!("Tool allowlist (comma-separated, blank = allow all): ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if !input.trim().is_empty() {
+        config.assistant.tool_allowlist = parse_csv_list(&input);
+    }
+
+    print!("Tool denylist (comma-separated, blank = deny none): ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if !input.trim().is_empty() {
+        config.assistant.tool_denylist = parse_csv_list(&input);
+    }
+
+    print!("Require pairing for non-local operator connections? [y/N]: ");
+    io::stdout().flush()?;
+    input.clear();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().to_lowercase().starts_with('y') {
+        config.gateway.pairing_required = true;
+        print!("  Allow local loopback without pairing? [Y/n]: ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        config.gateway.pairing_allow_local = !input.trim().to_lowercase().starts_with('n');
     }
 
     println!();

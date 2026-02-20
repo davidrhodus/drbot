@@ -8,6 +8,7 @@ pub mod markdown;
 pub mod message;
 pub mod session;
 pub mod user;
+pub mod workspace_notes_recall;
 
 pub use config::Config;
 pub use error::{Error, Result};

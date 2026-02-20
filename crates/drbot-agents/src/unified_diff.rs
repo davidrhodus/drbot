@@ -195,6 +195,15 @@ pub fn apply_unified_diff_to_text(
         }
 
         out.extend_from_slice(&orig_lines[orig_idx..target]);
+        let expected_out_len = hunk.new_start.saturating_sub(1);
+        if out.len() != expected_out_len {
+            return Err(format!(
+                "hunk new_start mismatch (expected new line {}, got {})",
+                hunk.new_start,
+                out.len() + 1
+            ));
+        }
+        let out_start_len = out.len();
         let mut pos = target;
         for (kind, text) in &hunk.lines {
             match *kind {
@@ -232,6 +241,21 @@ pub fn apply_unified_diff_to_text(
                 }
                 other => return Err(format!("unknown hunk line kind: {}", other)),
             }
+        }
+
+        let consumed_old = pos.saturating_sub(target);
+        if consumed_old != hunk.old_count {
+            return Err(format!(
+                "hunk old_count mismatch at -{} (expected {}, got {})",
+                hunk.old_start, hunk.old_count, consumed_old
+            ));
+        }
+        let produced_new = out.len().saturating_sub(out_start_len);
+        if produced_new != hunk.new_count {
+            return Err(format!(
+                "hunk new_count mismatch at +{} (expected {}, got {})",
+                hunk.new_start, hunk.new_count, produced_new
+            ));
         }
         orig_idx = pos;
     }

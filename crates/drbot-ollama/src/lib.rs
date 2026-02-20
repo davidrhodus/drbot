@@ -290,7 +290,6 @@ impl Provider for OllamaProvider {
 
             let mut byte_stream = response.bytes_stream();
             let mut buffer = String::new();
-            let mut final_usage: Option<(u32, u32)> = None;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -325,16 +324,14 @@ impl Provider for OllamaProvider {
                             // Check if done
                             if chunk.done {
                                 trace!("Stream complete");
-                                final_usage = chunk.eval_count.map(|eval| {
-                                    (chunk.prompt_eval_count.unwrap_or(0), eval)
+                                let usage = chunk.eval_count.map(|eval| Usage {
+                                    input_tokens: chunk.prompt_eval_count.unwrap_or(0) as usize,
+                                    output_tokens: eval as usize,
                                 });
 
                                 yield StreamEvent::Stop {
                                     reason: "stop".to_string(),
-                                    usage: final_usage.map(|(input, output)| Usage {
-                                        input_tokens: input as usize,
-                                        output_tokens: output as usize,
-                                    }),
+                                    usage,
                                 };
                                 break;
                             }

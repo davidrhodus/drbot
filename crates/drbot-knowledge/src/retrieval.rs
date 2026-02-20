@@ -2,7 +2,7 @@
 
 use crate::embeddings::cosine_similarity;
 use crate::store::KnowledgeStore;
-use crate::{KnowledgeEntry, KnowledgeError, Result, SearchResult};
+use crate::{KnowledgeEntry, Result, SearchResult};
 use uuid::Uuid;
 
 /// Retrieval options.
@@ -178,10 +178,12 @@ impl Default for Retriever {
 }
 
 /// Query augmentation to improve retrieval.
+#[allow(dead_code)]
 pub struct QueryAugmenter;
 
 impl QueryAugmenter {
     /// Augment a query with synonyms and related terms.
+    #[allow(dead_code)]
     pub fn augment(query: &str) -> Vec<String> {
         let mut queries = vec![query.to_string()];
 

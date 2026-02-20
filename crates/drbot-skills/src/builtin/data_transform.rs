@@ -172,8 +172,8 @@ impl Skill for DataTransformSkill {
                     let json = serde_json::to_string_pretty(&filtered)
                         .map_err(|e| crate::SkillError::ExecutionFailed(e.to_string()))?;
 
-                    Ok(SkillOutput::new(serde_json::json!(filtered))
-                        .with_text(&format!("Filtered to {} items", filtered.len())))
+                    let text = format!("Filtered to {} items\n{}", filtered.len(), json);
+                    Ok(SkillOutput::new(serde_json::json!(filtered)).with_text(&text))
                 } else {
                     Err(crate::SkillError::ExecutionFailed(
                         "Data must be an array for filter operation".into(),

@@ -1,9 +1,6 @@
 //! Update checking functionality.
 
-use crate::{
-    current_platform_key, ReleaseChannel, Result, UpdateCheckResult, UpdateConfig, UpdateError,
-    UpdateManifest,
-};
+use crate::{ReleaseChannel, Result, UpdateCheckResult, UpdateConfig, UpdateError, UpdateManifest};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;

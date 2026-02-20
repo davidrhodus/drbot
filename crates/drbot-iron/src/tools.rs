@@ -180,6 +180,7 @@ impl IronToolHost {
         }
     }
 
+    #[allow(dead_code)] // Convenience accessor; used by some callers/tests.
     pub fn config(&self) -> &IronToolHostConfig {
         &self.cfg
     }

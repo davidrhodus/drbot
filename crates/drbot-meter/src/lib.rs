@@ -142,9 +142,11 @@ impl Histogram {
     pub fn observe(&self, value: f64) {
         self.values.write().unwrap().push(value);
 
-        let _ = self.sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-            Some((f64::from_bits(bits) + value).to_bits())
-        });
+        let _ = self
+            .sum
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                Some((f64::from_bits(bits) + value).to_bits())
+            });
 
         self.count.fetch_add(1, Ordering::Relaxed);
     }

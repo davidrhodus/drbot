@@ -2,7 +2,7 @@
 
 use crate::planner::{Plan, Step};
 use crate::tools::AgentTool;
-use crate::{AgentError, AgentEvent, Result, ToolCall, ToolResult};
+use crate::{AgentError, AgentEvent, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -230,6 +230,7 @@ impl Default for Executor {
 
 /// Execution context for passing state between steps.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Scaffolding for richer step-to-step execution state; not wired in yet.
 pub struct ExecutionContext {
     /// Variables set during execution.
     pub variables: HashMap<String, serde_json::Value>,
@@ -237,6 +238,7 @@ pub struct ExecutionContext {
     pub step_results: HashMap<usize, String>,
 }
 
+#[allow(dead_code)]
 impl ExecutionContext {
     /// Create a new context.
     pub fn new() -> Self {

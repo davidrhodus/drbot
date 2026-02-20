@@ -2,7 +2,6 @@
 //!
 //! Manages multi-turn voice conversations with context.
 
-use crate::{VoiceConfig, VoiceError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

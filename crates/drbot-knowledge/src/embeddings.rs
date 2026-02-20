@@ -1,6 +1,6 @@
 //! Embedding providers for semantic search.
 
-use crate::{KnowledgeError, Result};
+use crate::Result;
 use async_trait::async_trait;
 
 /// Trait for embedding providers.
@@ -97,6 +97,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Euclidean distance between two vectors.
+#[allow(dead_code)]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return f32::MAX;

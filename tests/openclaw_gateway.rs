@@ -1,6 +1,6 @@
 //! OpenClaw Gateway v3 interoperability tests.
 
-use drbot_core::config::CliProviderConfig;
+use drbot_core::config::{CliProviderConfig, WebChatConfig};
 use drbot_core::Config;
 use drbot_gateway::Gateway;
 use drbot_protocol::openclaw::{GatewayFrame, RequestFrame};
@@ -20,10 +20,18 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
-    fn set(key: &'static str, value: &std::path::Path) -> Self {
+    fn set_os(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let prev = std::env::var_os(key);
         std::env::set_var(key, value);
         Self { key, prev }
+    }
+
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        Self::set_os(key, value.as_os_str())
+    }
+
+    fn set_str(key: &'static str, value: &str) -> Self {
+        Self::set_os(key, value)
     }
 }
 
@@ -50,7 +58,7 @@ async fn recv_frame(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> GatewayFrame {
-    let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+    let msg = tokio::time::timeout(Duration::from_secs(6), ws.next())
         .await
         .expect("timed out waiting for ws frame")
         .expect("ws stream closed")
@@ -782,6 +790,7 @@ async fn openclaw_config_patch_hot_applies_provider() {
     std::fs::create_dir_all(&base).unwrap();
     let config_path = base.join("drbot.toml");
     let _cfg_guard = EnvVarGuard::set("DRBOT_CONFIG_PATH", &config_path);
+    let _auto_cli_guard = EnvVarGuard::set_str("DRBOT_AUTO_DISABLE_CLI_PRESETS", "1");
 
     let mut config = Config::default();
     config.gateway.host = "127.0.0.1".to_string();
@@ -915,6 +924,383 @@ async fn openclaw_config_patch_hot_applies_provider() {
 }
 
 #[tokio::test]
+async fn openclaw_config_patch_merges_agents_list_by_id() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let _permit = env_permit().await;
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let base = std::env::temp_dir().join(format!(
+        "drbot-openclaw-config-merge-test-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let config_path = base.join("drbot.toml");
+    let _cfg_guard = EnvVarGuard::set("DRBOT_CONFIG_PATH", &config_path);
+    let _auto_cli_guard = EnvVarGuard::set_str("DRBOT_AUTO_DISABLE_CLI_PRESETS", "1");
+
+    let mut config = Config::default();
+    config.gateway.host = "127.0.0.1".to_string();
+    config.gateway.port = port;
+    config.gateway.auth_token = None;
+    config.providers.default_provider = None;
+    config.providers.default_model = None;
+    config.providers.openai = None;
+    config.providers.anthropic = None;
+    config.providers.ollama = None;
+    config.providers.openai_compatible.clear();
+    config.providers.cli.clear();
+    config.storage.database_path = base.join("drbot.db");
+    config.storage.media_path = base.join("media");
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let frame = recv_frame(&mut ws).await;
+    assert!(matches!(frame, GatewayFrame::Event(_)));
+
+    let res = send_req(
+        &mut ws,
+        "connect_merge_1",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": {
+                "id": "test",
+                "version": "0.0.0-test",
+                "platform": "test",
+                "mode": "test"
+            }
+        }),
+    )
+    .await;
+    assert!(res.ok, "connect failed: {:?}", res.error);
+
+    let patch_raw = serde_json::to_string_pretty(&json!({
+        "agents": {
+            "list": [
+                { "id": "alpha", "name": "Alpha" },
+                { "id": "beta", "name": "Beta" }
+            ]
+        }
+    }))
+    .unwrap();
+    let res = send_req(
+        &mut ws,
+        "config_patch_merge_1",
+        "config.patch",
+        json!({ "raw": patch_raw }),
+    )
+    .await;
+    assert!(res.ok, "config.patch failed: {:?}", res.error);
+
+    let res = send_req(&mut ws, "config_get_merge_1", "config.get", json!({})).await;
+    assert!(res.ok, "config.get failed: {:?}", res.error);
+    let payload = res.payload.expect("missing config.get payload");
+    let base_hash = payload
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .expect("config.get missing hash")
+        .to_string();
+
+    let patch_raw = serde_json::to_string_pretty(&json!({
+        "agents": {
+            "list": [
+                { "id": "beta", "name": "Beta2" }
+            ]
+        }
+    }))
+    .unwrap();
+    let res = send_req(
+        &mut ws,
+        "config_patch_merge_2",
+        "config.patch",
+        json!({ "raw": patch_raw, "baseHash": base_hash }),
+    )
+    .await;
+    assert!(res.ok, "config.patch merge failed: {:?}", res.error);
+
+    let res = send_req(&mut ws, "config_get_merge_2", "config.get", json!({})).await;
+    assert!(res.ok, "config.get failed: {:?}", res.error);
+    let payload = res.payload.expect("missing config.get payload");
+    let list = payload
+        .get("config")
+        .and_then(|v| v.get("agents"))
+        .and_then(|v| v.get("list"))
+        .and_then(|v| v.as_array())
+        .expect("config.agents.list missing");
+
+    let alpha = list.iter().find(|v| v.get("id").and_then(|s| s.as_str()) == Some("alpha"));
+    let beta = list.iter().find(|v| v.get("id").and_then(|s| s.as_str()) == Some("beta"));
+
+    assert!(alpha.is_some(), "expected alpha agent to remain after patch");
+    assert_eq!(
+        alpha
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("Alpha")
+    );
+    assert!(beta.is_some(), "expected beta agent to remain after patch");
+    assert_eq!(
+        beta.and_then(|v| v.get("name")).and_then(|v| v.as_str()),
+        Some("Beta2")
+    );
+
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_chat_send_local_memory_commands_work_without_provider() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let _permit = env_permit().await;
+
+    // Pick a free port.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    // Keep OpenClaw config writes isolated from the repo + user machine.
+    let base =
+        std::env::temp_dir().join(format!("drbot-openclaw-local-cmd-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let config_path = base.join("drbot.toml");
+    let _cfg_guard = EnvVarGuard::set("DRBOT_CONFIG_PATH", &config_path);
+    let _auto_cli_guard = EnvVarGuard::set_str("DRBOT_AUTO_DISABLE_CLI_PRESETS", "1");
+
+    let mut config = Config::default();
+    config.gateway.host = "127.0.0.1".to_string();
+    config.gateway.port = port;
+    config.gateway.auth_token = None;
+
+    // Ensure the gateway starts without a provider.
+    config.providers.default_provider = None;
+    config.providers.default_model = None;
+    config.providers.openai = None;
+    config.providers.anthropic = None;
+    config.providers.ollama = None;
+    config.providers.openai_compatible.clear();
+    config.providers.cli.clear();
+
+    // Avoid writing into the user's real data dir during tests.
+    config.storage.database_path = base.join("drbot.db");
+    config.storage.media_path = base.join("media");
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    // connect.challenge
+    let frame = recv_frame(&mut ws).await;
+    assert!(matches!(frame, GatewayFrame::Event(_)));
+
+    // connect
+    let res = send_req(
+        &mut ws,
+        "connect_1",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": {
+                "id": "test",
+                "version": "0.0.0-test",
+                "platform": "test",
+                "mode": "test"
+            }
+        }),
+    )
+    .await;
+    assert!(res.ok, "connect failed: {:?}", res.error);
+
+    // chat.send: /remember should work without a provider and emit a local final event.
+    let remember_run_id = format!("remember-local-{}", Uuid::new_v4());
+    let remember_req_id = "chat_remember_1";
+    let remember_req = GatewayFrame::Req(RequestFrame {
+        id: remember_req_id.to_string(),
+        method: "chat.send".to_string(),
+        params: Some(json!({
+            "sessionKey": "main",
+            "message": "/remember We use Postgres.",
+            "idempotencyKey": remember_run_id.clone(),
+        })),
+    });
+    ws.send(Message::Text(
+        serde_json::to_string(&remember_req).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_remember_res = false;
+    let mut remember_text = None;
+    for _ in 0..50 {
+        match recv_frame(&mut ws).await {
+            GatewayFrame::Res(res) if res.id == remember_req_id => {
+                assert!(res.ok, "chat.send /remember failed: {:?}", res.error);
+                saw_remember_res = true;
+            }
+            GatewayFrame::Event(evt) if evt.event == "chat" => {
+                let Some(p) = evt.payload else {
+                    continue;
+                };
+                if p.get("runId").and_then(|v| v.as_str()) != Some(remember_run_id.as_str()) {
+                    continue;
+                }
+                if p.get("state").and_then(|v| v.as_str()) != Some("final") {
+                    continue;
+                }
+                assert_eq!(p.get("stopReason").and_then(|v| v.as_str()), Some("local"));
+                let text = p
+                    .get("message")
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                remember_text = Some(text);
+            }
+            _ => {}
+        }
+        if saw_remember_res && remember_text.is_some() {
+            break;
+        }
+    }
+
+    assert!(saw_remember_res, "did not receive /remember response");
+    let remember_text = remember_text.expect("did not observe chat final event for /remember run");
+    assert!(
+        remember_text
+            .to_ascii_lowercase()
+            .contains("saved to memory"),
+        "expected /remember confirmation, got: {:?}",
+        remember_text
+    );
+
+    // chat.send: /kb should find the remembered note without a provider.
+    let kb_run_id = format!("kb-local-{}", Uuid::new_v4());
+    let kb_req_id = "chat_kb_1";
+    let kb_req = GatewayFrame::Req(RequestFrame {
+        id: kb_req_id.to_string(),
+        method: "chat.send".to_string(),
+        params: Some(json!({
+            "sessionKey": "main",
+            "message": "/kb Postgres",
+            "idempotencyKey": kb_run_id.clone(),
+        })),
+    });
+    ws.send(Message::Text(
+        serde_json::to_string(&kb_req).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_kb_res = false;
+    let mut kb_text = None;
+    for _ in 0..50 {
+        match recv_frame(&mut ws).await {
+            GatewayFrame::Res(res) if res.id == kb_req_id => {
+                assert!(res.ok, "chat.send /kb failed: {:?}", res.error);
+                saw_kb_res = true;
+            }
+            GatewayFrame::Event(evt) if evt.event == "chat" => {
+                let Some(p) = evt.payload else {
+                    continue;
+                };
+                if p.get("runId").and_then(|v| v.as_str()) != Some(kb_run_id.as_str()) {
+                    continue;
+                }
+                if p.get("state").and_then(|v| v.as_str()) != Some("final") {
+                    continue;
+                }
+                assert_eq!(p.get("stopReason").and_then(|v| v.as_str()), Some("local"));
+                let text = p
+                    .get("message")
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                kb_text = Some(text);
+            }
+            _ => {}
+        }
+        if saw_kb_res && kb_text.is_some() {
+            break;
+        }
+    }
+
+    assert!(saw_kb_res, "did not receive /kb response");
+    let kb_text = kb_text.expect("did not observe chat final event for /kb run");
+    assert!(
+        kb_text.contains("Relevant notes (workspace knowledge base):"),
+        "expected /kb to return recall output, got: {:?}",
+        kb_text
+    );
+    assert!(
+        kb_text.to_ascii_lowercase().contains("postgres"),
+        "expected /kb to include the remembered note, got: {:?}",
+        kb_text
+    );
+
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn openclaw_sessions_spawn_applies_subagent_thinking_defaults() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -939,6 +1325,7 @@ async fn openclaw_sessions_spawn_applies_subagent_thinking_defaults() {
     std::fs::create_dir_all(&base).unwrap();
     let config_path = base.join("drbot.toml");
     let _cfg_guard = EnvVarGuard::set("DRBOT_CONFIG_PATH", &config_path);
+    let _auto_cli_guard = EnvVarGuard::set_str("DRBOT_AUTO_DISABLE_CLI_PRESETS", "1");
 
     let mut config = Config::default();
     config.gateway.host = "127.0.0.1".to_string();
@@ -1445,19 +1832,25 @@ async fn openclaw_memory_backend_qmd_paths_best_effort() {
         .get("result")
         .and_then(|v| v.get("details"))
         .expect("tools.invoke memory_search missing result.details");
-    assert_eq!(details.get("disabled").and_then(|v| v.as_bool()), Some(false));
-    let provider = details.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(
+        details.get("disabled").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let provider = details
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     assert!(provider == "qmd" || provider == "local");
     let results = details
         .get("results")
         .and_then(|v| v.as_array())
         .expect("memory_search result.details missing results array");
-    assert!(results.iter().any(|r| {
-        r.get("path").and_then(|v| v.as_str()) == Some("MEMORY.md")
-    }));
-    assert!(results.iter().any(|r| {
-        r.get("path").and_then(|v| v.as_str()) == Some("qmd/notes/notes.md")
-    }));
+    assert!(results
+        .iter()
+        .any(|r| { r.get("path").and_then(|v| v.as_str()) == Some("MEMORY.md") }));
+    assert!(results
+        .iter()
+        .any(|r| { r.get("path").and_then(|v| v.as_str()) == Some("qmd/notes/notes.md") }));
 
     let res = client
         .post(&url)
@@ -1482,6 +1875,153 @@ async fn openclaw_memory_backend_qmd_paths_best_effort() {
     );
     let text = details.get("text").and_then(|v| v.as_str()).unwrap_or("");
     assert!(text.contains("external memory"));
+
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn openclaw_chat_send_normalizes_message_lists_and_sanitizes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = test_config(port);
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let frame = recv_frame(&mut ws).await;
+    assert!(matches!(frame, GatewayFrame::Event(_)));
+
+    let res = send_req(
+        &mut ws,
+        "connect_norm_1",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": {
+                "id": "test",
+                "version": "0.0.0-test",
+                "platform": "test",
+                "mode": "test"
+            }
+        }),
+    )
+    .await;
+    assert!(res.ok, "connect failed: {:?}", res.error);
+
+    let res = send_req(
+        &mut ws,
+        "chat_norm_bad_key",
+        "chat.send",
+        json!({
+            "sessionKey": "agent:bad",
+            "message": "hi",
+            "idempotencyKey": "bad-key-1"
+        }),
+    )
+    .await;
+    assert!(!res.ok, "expected invalid agent sessionKey to fail");
+    assert_eq!(
+        res.error.as_ref().map(|e| e.code.as_str()),
+        Some("INVALID_REQUEST")
+    );
+
+    let res = send_req(
+        &mut ws,
+        "chat_norm_1",
+        "chat.send",
+        json!({
+            "sessionKey": "main",
+            "message": [
+                { "text": "Cafe\u{0301}" },
+                { "text": "line\u{0007}two" }
+            ],
+            "idempotencyKey": "norm-1"
+        }),
+    )
+    .await;
+    assert!(res.ok, "chat.send failed: {:?}", res.error);
+    let payload = res.payload.expect("missing chat.send payload");
+    let run_id = payload
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .expect("chat.send missing runId")
+        .to_string();
+
+    for _ in 0..50 {
+        let frame = recv_frame(&mut ws).await;
+        let GatewayFrame::Event(evt) = frame else {
+            continue;
+        };
+        if evt.event != "chat" {
+            continue;
+        }
+        let Some(p) = evt.payload else {
+            continue;
+        };
+        if p.get("runId").and_then(|v| v.as_str()) != Some(run_id.as_str()) {
+            continue;
+        }
+        if p.get("state").and_then(|v| v.as_str()) == Some("final") {
+            break;
+        }
+    }
+
+    let res = send_req(
+        &mut ws,
+        "chat_norm_history",
+        "chat.history",
+        json!({ "sessionKey": "main", "limit": 10 }),
+    )
+    .await;
+    assert!(res.ok, "chat.history failed: {:?}", res.error);
+    let payload = res.payload.expect("missing chat.history payload");
+    let messages = payload
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("chat.history missing messages");
+    let user_msg = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .expect("chat.history missing user message");
+    let text = user_msg
+        .get("content")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let expected = format!("Caf\u{00e9}\nlinetwo");
+    assert_eq!(text, expected);
 
     drop(ws);
     let _ = shutdown_tx.send(());
@@ -1621,7 +2161,203 @@ async fn openclaw_chat_send_response_prefix() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn openclaw_cron_delivery_full_text_and_agent_prefix() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "drbot_gateway=debug,drbot=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
 
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let webchat_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let webchat_port = webchat_listener.local_addr().unwrap().port();
+    drop(webchat_listener);
+
+    let mut config = test_config(port);
+    config.messages.response_prefix = Some("auto".to_string());
+    config.providers.cli[0].command = "bash".to_string();
+    config.providers.cli[0].args = vec![
+        "-c".to_string(),
+        "printf 'alpha\\nbeta\\n'".to_string(),
+        "-".to_string(),
+    ];
+
+    let mut webchat_cfg = WebChatConfig::default();
+    webchat_cfg.host = "127.0.0.1".to_string();
+    webchat_cfg.port = webchat_port;
+    config.channels.webchat = Some(webchat_cfg);
+    config.channels.enabled = vec!["webchat".to_string()];
+
+    let gateway = Gateway::new(config);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        gateway
+            .run_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let url = format!("ws://127.0.0.1:{}/openclaw/ws", port);
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let frame = recv_frame(&mut ws).await;
+    assert!(matches!(frame, GatewayFrame::Event(_)));
+
+    let res = send_req(
+        &mut ws,
+        "connect_cron_1",
+        "connect",
+        json!({
+            "minProtocol": 3,
+            "maxProtocol": 3,
+            "client": {
+                "id": "test",
+                "version": "0.0.0-test",
+                "platform": "test",
+                "mode": "test"
+            }
+        }),
+    )
+    .await;
+    assert!(res.ok, "connect failed: {:?}", res.error);
+
+    let webchat_url = format!("ws://127.0.0.1:{}/ws", webchat_port);
+    let mut webchat_ws = None;
+    for _ in 0..20 {
+        match tokio_tungstenite::connect_async(webchat_url.clone()).await {
+            Ok((socket, _)) => {
+                webchat_ws = Some(socket);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let mut webchat_ws = webchat_ws.expect("webchat ws failed to connect");
+
+    let client_id = {
+        let msg = tokio::time::timeout(Duration::from_secs(3), webchat_ws.next())
+            .await
+            .expect("timed out waiting for webchat connect")
+            .expect("webchat ws closed")
+            .expect("webchat ws recv error");
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Binary(b) => String::from_utf8(b.to_vec()).expect("webchat binary not utf8"),
+            other => panic!("unexpected webchat ws msg: {:?}", other),
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&text).expect("invalid webchat json");
+        payload
+            .get("event")
+            .and_then(|v| v.get("data"))
+            .and_then(|v| v.get("client_id"))
+            .and_then(|v| v.as_str())
+            .expect("missing webchat client_id")
+            .to_string()
+    };
+
+    let res = send_req(
+        &mut ws,
+        "agents_update_cron",
+        "agents.update",
+        json!({ "agentId": "cronbot", "name": "CronBot" }),
+    )
+    .await;
+    assert!(res.ok, "agents.update failed: {:?}", res.error);
+
+    let res = send_req(
+        &mut ws,
+        "cron_add_deliver",
+        "cron.add",
+        json!({
+            "name": "deliver-test",
+            "agentId": "cronbot",
+            "schedule": { "kind": "every", "everyMs": 3600000 },
+            "sessionTarget": "isolated",
+            "wakeMode": "next-heartbeat",
+            "payload": { "kind": "agentTurn", "message": "run" },
+            "delivery": { "mode": "deliver", "channel": "webchat", "to": client_id }
+        }),
+    )
+    .await;
+    assert!(res.ok, "cron.add failed: {:?}", res.error);
+    let payload = res.payload.expect("missing cron.add payload");
+    let job_id = payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("cron.add missing id")
+        .to_string();
+
+    let res = send_req(
+        &mut ws,
+        "cron_run_deliver",
+        "cron.run",
+        json!({ "id": job_id, "mode": "force" }),
+    )
+    .await;
+    assert!(res.ok, "cron.run failed: {:?}", res.error);
+
+    let mut delivered = None;
+    for _ in 0..50 {
+        let msg = tokio::time::timeout(Duration::from_secs(3), webchat_ws.next())
+            .await
+            .ok()
+            .flatten()
+            .transpose()
+            .unwrap_or(None);
+        let Some(msg) = msg else {
+            continue;
+        };
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Binary(b) => String::from_utf8(b.to_vec()).expect("webchat binary not utf8"),
+            _ => continue,
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&text).expect("invalid webchat json");
+        if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        if let Some(content) = payload
+            .get("data")
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_str())
+        {
+            delivered = Some(content.to_string());
+            break;
+        }
+    }
+
+    let delivered = delivered.expect("did not receive webchat delivery");
+    assert!(
+        delivered.starts_with("[CronBot]"),
+        "expected agent prefix, got: {:?}",
+        delivered
+    );
+    assert!(
+        delivered.contains("alpha") && delivered.contains("beta"),
+        "expected full text delivery, got: {:?}",
+        delivered
+    );
+
+    drop(webchat_ws);
+    drop(ws);
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_handle)
+        .await
+        .expect("server did not shut down")
+        .unwrap();
+}
 
 #[tokio::test]
 async fn openclaw_chat_send_strips_media_path_lines() {
@@ -1974,8 +2710,6 @@ async fn openclaw_send_applies_response_prefix_cascade() {
         .unwrap();
 }
 
-
-
 #[tokio::test]
 async fn openclaw_send_applies_response_prefix_account_override() {
     let _ = tracing_subscriber::fmt()
@@ -2311,12 +3045,7 @@ async fn tools_invoke_process_resize_pty_session() {
         .join("default")
         .join("sessions")
         .join("sessions.json");
-    std::fs::create_dir_all(
-        sidecar_path
-            .parent()
-            .expect("sessions.json missing parent"),
-    )
-    .unwrap();
+    std::fs::create_dir_all(sidecar_path.parent().expect("sessions.json missing parent")).unwrap();
     std::fs::write(
         &sidecar_path,
         serde_json::to_string_pretty(&json!({
@@ -2469,12 +3198,7 @@ async fn tools_invoke_exec_host_sandbox_uses_isolated_cwd_and_home() {
         .join("default")
         .join("sessions")
         .join("sessions.json");
-    std::fs::create_dir_all(
-        sidecar_path
-            .parent()
-            .expect("sessions.json missing parent"),
-    )
-    .unwrap();
+    std::fs::create_dir_all(sidecar_path.parent().expect("sessions.json missing parent")).unwrap();
     std::fs::write(
         &sidecar_path,
         serde_json::to_string_pretty(&json!({

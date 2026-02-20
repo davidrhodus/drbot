@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 /// A tool that an agent can use.
@@ -1587,10 +1587,12 @@ fn evaluate_simple_expr(expr: &str) -> std::result::Result<f64, String> {
 
 /// Tool registry for managing available tools.
 #[derive(Default)]
+#[allow(dead_code)] // Test-only helper for now; agent runtime uses `BuiltinTools` directly.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn AgentTool>>,
 }
 
+#[allow(dead_code)]
 impl ToolRegistry {
     /// Create a new registry.
     pub fn new() -> Self {

@@ -21,7 +21,7 @@ impl RoutingStrategy for CostOptimizedStrategy {
         &self,
         candidates: &[RegisteredProvider],
         complexity: TaskComplexity,
-        criteria: &SelectionCriteria,
+        _criteria: &SelectionCriteria,
     ) -> RegisteredProvider {
         // For simple tasks, use cheapest provider
         // For complex tasks, use high quality provider
@@ -138,6 +138,7 @@ impl RoutingStrategy for BalancedStrategy {
 }
 
 /// Complexity-aware strategy: match provider to task complexity.
+#[allow(dead_code)]
 pub struct ComplexityAwareStrategy;
 
 impl RoutingStrategy for ComplexityAwareStrategy {

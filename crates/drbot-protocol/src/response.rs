@@ -1,5 +1,6 @@
 //! Response types for the drbot protocol.
 
+use drbot_core::message::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -172,6 +173,9 @@ pub struct ChatSendResult {
     pub content: Option<String>,
     /// Model used.
     pub model: String,
+    /// Provider used (if known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Token usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
@@ -202,6 +206,12 @@ pub struct SessionCreateResult {
 pub struct SessionGetResult {
     /// Session data.
     pub session: SessionInfo,
+    /// Session messages (full history).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
+    /// Session system prompt (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 /// Session information.
@@ -211,6 +221,9 @@ pub struct SessionInfo {
     pub id: Uuid,
     /// Session title.
     pub title: Option<String>,
+    /// Provider used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Model used.
     pub model: Option<String>,
     /// Message count.
@@ -230,6 +243,33 @@ pub struct SessionListResult {
     pub sessions: Vec<SessionInfo>,
     /// Total count.
     pub total: usize,
+}
+
+/// Result of session.clear method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionClearResult {
+    /// Session ID.
+    pub session_id: Uuid,
+    /// Whether messages were cleared.
+    pub cleared: bool,
+}
+
+/// Result of session.update method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionUpdateResult {
+    /// Session ID.
+    pub session_id: Uuid,
+    /// Whether the session was updated.
+    pub updated: bool,
+}
+
+/// Result of session.delete method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDeleteResult {
+    /// Session ID.
+    pub session_id: Uuid,
+    /// Whether session was deleted.
+    pub deleted: bool,
 }
 
 // ============================================================================
@@ -273,6 +313,13 @@ pub struct ProviderInfo {
 pub struct ProviderModelsResult {
     /// Available models.
     pub models: Vec<ModelInfo>,
+}
+
+/// Result of provider.select method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSelectResult {
+    /// Selected provider info (now active).
+    pub provider: ProviderInfo,
 }
 
 /// Model information.

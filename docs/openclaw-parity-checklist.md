@@ -1,7 +1,7 @@
 # OpenClaw Parity Checklist (drbot)
 
 This checklist tracks what drbot still needs to implement to reach practical feature parity with
-upstream OpenClaw (especially the Control UI) as of 2026-02-13 (OpenClaw v2026.2.12).
+upstream OpenClaw (especially the Control UI) as of 2026-02-16 (OpenClaw v2026.2.15).
 
 Parity scope (in order):
 1) OpenClaw Control UI works end-to-end against drbot's `/openclaw/ws` gateway.
@@ -55,6 +55,9 @@ Legend:
 
 ### Gateway security & transport
 
+- [x] `chat.send` hardening + input normalization: reject null bytes, strip unsafe control chars,
+      normalize Unicode to NFC, accept list-based `message`/`toolMessages`, and reject malformed
+      `agent:` session keys (OpenClaw v2026.2.15). (`crates/drbot-gateway/src/openclaw.rs`)
 - [x] Implement TLS/WSS in the gateway server (honor `gateway.tls_enabled`, `gateway.tls_cert`,
       `gateway.tls_key`) and enforce a TLS 1.3 minimum (OpenClaw 2026.2.1).
       (`crates/drbot-gateway/src/server.rs`)
@@ -94,6 +97,9 @@ Legend:
 
 ### Control UI critical behaviors
 
+- [x] Cron parity: deliver full text when `delivery.to` is set, preserve agent identity for cron
+      outbound messages, and recompute due runs for `cron.list`/`cron.status`
+      (OpenClaw v2026.2.14). (`crates/drbot-gateway/src/openclaw.rs`)
 - [x] Broadcast inbound channel messages as OpenClaw `chat` events (currently persisted only).
       (`crates/drbot-gateway/src/openclaw_inbound.rs`, `crates/drbot-gateway/src/openclaw.rs`)
 - [x] Use group-aware channel ids in session keys (Slack `channel:`/`group:` + Telegram negative-id
@@ -132,7 +138,8 @@ Legend:
 ### Stubs that the UI will surface
 
 - [ ] (partial) `wizard.*` now implements a real OpenClaw-compatible step flow for **Gateway basics**
-      (auth token + bind host + port) plus a **security warning / risk acknowledgement**, optional
+      (auth token + bind host + port), **pairing requirements**, plus a **security warning / risk
+      acknowledgement**, **assistant policy** (autonomy + tool/workspace allow/deny), optional
       **provider setup** (default provider + API key + default model), and optional **channel setup**
       (enable channels + basic credentials for Telegram/Discord/Slack/Matrix/Signal/WhatsApp/WebChat).
       It writes via `config.patch` and now hot-applies provider/channel changes (no restart required

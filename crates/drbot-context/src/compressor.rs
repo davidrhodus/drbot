@@ -1,6 +1,6 @@
 //! Context compression strategies.
 
-use crate::{ContextItem, ContextItemType, Result};
+use crate::{ContextItem, ContextItemType};
 
 /// Compression strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

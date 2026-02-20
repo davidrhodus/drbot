@@ -6,7 +6,7 @@ use crate::{
     RegisteredProvider, Result, RouterError, RoutingDecision, SelectionCriteria,
 };
 use drbot_core::message::Message;
-use drbot_providers::{ChatOptions, ChatResponse, Provider, StreamEvent};
+use drbot_providers::{ChatOptions, ChatResponse, StreamEvent};
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -168,7 +168,6 @@ impl ModelRouter {
         criteria: SelectionCriteria,
     ) -> Result<(ChatResponse, RoutingDecision)> {
         let decision = self.select(messages, criteria.clone()).await?;
-        let mut last_error = String::new();
 
         // Try selected provider first
         let provider = self
@@ -176,16 +175,16 @@ impl ModelRouter {
             .await
             .ok_or(RouterError::NoProviders)?;
 
-        match provider.provider.chat(messages, options.clone()).await {
+        let mut last_error = match provider.provider.chat(messages, options.clone()).await {
             Ok(response) => return Ok((response, decision.clone())),
             Err(e) => {
                 warn!(provider = %decision.provider_name, error = %e, "Provider failed");
-                last_error = e.to_string();
                 if self.config.auto_fallback {
                     self.mark_unhealthy(&decision.provider_name).await;
                 }
+                e.to_string()
             }
-        }
+        };
 
         // Try fallbacks if enabled
         if self.config.auto_fallback {

@@ -109,8 +109,10 @@ impl LoadBalancer for WeightedBalancer {
 }
 
 /// Random load balancer.
+#[allow(dead_code)]
 pub struct RandomBalancer;
 
+#[allow(dead_code)]
 impl RandomBalancer {
     /// Create a new random balancer.
     pub fn new() -> Self {
@@ -146,10 +148,12 @@ impl LoadBalancer for RandomBalancer {
 }
 
 /// Least-loaded balancer (placeholder - would need actual load tracking).
+#[allow(dead_code)]
 pub struct LeastLoadedBalancer {
     round_robin: RoundRobinBalancer,
 }
 
+#[allow(dead_code)]
 impl LeastLoadedBalancer {
     /// Create a new least-loaded balancer.
     pub fn new() -> Self {

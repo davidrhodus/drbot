@@ -223,6 +223,9 @@ mod tui_tests {
         assert_eq!(config.provider_type, ProviderType::Anthropic);
         assert!(config.api_key.is_none());
         assert!(config.model.is_none());
+        assert!(config.gateway_url.is_none());
+        assert!(config.gateway_auth_token.is_none());
+        assert!(!config.gateway_running);
         assert_eq!(config.max_history, 100);
     }
 }

@@ -1,7 +1,5 @@
 //! Core agent implementation.
 
-use crate::executor::Executor;
-use crate::planner::Planner;
 use crate::tools::AgentTool;
 use crate::{AgentError, AgentEvent, AgentMessage, AgentRole, Result, ToolCall, ToolResult};
 use drbot_providers::Provider;
@@ -9,7 +7,7 @@ use drbot_providers::ToolDefinition;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 fn resolve_tool_result_max_chars() -> usize {

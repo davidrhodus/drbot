@@ -138,6 +138,7 @@ pub struct StreamOptions {
 
 /// Chat completion response.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct ChatCompletionResponse {
     /// Response ID.
     pub id: String,
@@ -155,6 +156,7 @@ pub struct ChatCompletionResponse {
 
 /// Response choice.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct Choice {
     /// Choice index.
     pub index: usize,
@@ -168,6 +170,7 @@ pub struct Choice {
 
 /// Delta content for streaming.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct Delta {
     /// Role (only in first delta).
     pub role: Option<Role>,
@@ -179,6 +182,7 @@ pub struct Delta {
 
 /// Tool call delta for streaming.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct ToolCallDelta {
     /// Index of the tool call.
     pub index: usize,
@@ -202,6 +206,7 @@ pub struct FunctionDelta {
 
 /// Token usage statistics.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct Usage {
     /// Prompt tokens.
     pub prompt_tokens: u32,
@@ -213,6 +218,7 @@ pub struct Usage {
 
 /// Streaming chunk response.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct ChatCompletionChunk {
     /// Chunk ID.
     pub id: String,
@@ -237,6 +243,7 @@ pub struct ErrorResponse {
 
 /// Error details.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct ErrorDetails {
     /// Error message.
     pub message: String,

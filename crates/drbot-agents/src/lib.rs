@@ -50,7 +50,6 @@ pub use sandbox::{Sandbox, SandboxConfig};
 pub use tools::{AgentTool, BuiltinTools, BuiltinToolsOptions};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Agent execution result.
 pub type Result<T> = std::result::Result<T, AgentError>;

@@ -3,6 +3,8 @@
 //! This crate provides a terminal-based chat interface using ratatui.
 
 mod app;
+mod gateway_client;
+mod openclaw_client;
 mod ui;
 
 pub use app::{App, AppConfig, ProviderType};
@@ -18,8 +20,14 @@ use std::io;
 use std::time::Duration;
 use tracing::error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitAction {
+    Quit,
+    LaunchWizard,
+}
+
 /// Run the TUI application.
-pub async fn run(config: AppConfig) -> Result<()> {
+pub async fn run(config: AppConfig) -> Result<ExitAction> {
     // Setup terminal
     enable_raw_mode().map_err(|e| drbot_core::Error::Internal(e.to_string()))?;
     let mut stdout = io::stdout();
@@ -53,10 +61,10 @@ pub async fn run(config: AppConfig) -> Result<()> {
         return Err(e);
     }
 
-    Ok(())
+    Ok(app.exit_action)
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<ExitAction> {
     loop {
         // Draw UI
         terminal
@@ -72,10 +80,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
             {
                 // Handle quit
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return Ok(());
-                }
-                if key.code == KeyCode::Esc {
-                    return Ok(());
+                    return Ok(ExitAction::Quit);
                 }
 
                 // Handle input
@@ -88,7 +93,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
 
         // Check if we should quit
         if app.should_quit() {
-            return Ok(());
+            return Ok(app.exit_action);
         }
     }
 }

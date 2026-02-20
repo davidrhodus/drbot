@@ -602,7 +602,6 @@ impl GatewayState {
         diff == 0
     }
 
-
     /// Check if the provider is configured.
     pub fn has_provider(&self) -> bool {
         self.inner
@@ -659,35 +658,134 @@ pub(crate) fn init_provider(config: &Config) -> Option<Arc<dyn Provider>> {
         .clone()
         .unwrap_or_else(|| "auto".to_string());
 
-    match selected.as_str() {
-        "auto" => init_provider_auto(config),
-        "anthropic" | "claude" => init_provider_anthropic(config),
-        "openai" | "gpt" => init_provider_openai(config),
-        "ollama" | "local" => init_provider_ollama(config),
-        "claude-cli" | "claude-code" => init_provider_cli_preset(config, "claude-cli"),
-        "codex-cli" | "codex" => init_provider_cli_preset(config, "codex-cli"),
-        other => {
-            if let Some(provider) = init_provider_openai_compatible(config, other) {
-                return Some(provider);
-            }
-            if let Some(provider) = init_provider_cli_custom(config, other) {
-                return Some(provider);
-            }
-            tracing::warn!(provider = %other, "Unknown provider; falling back to auto");
-            init_provider_auto(config)
+    try_init_provider_named(config, &selected)
+        .ok()
+        .or_else(|| init_provider_auto(config))
+}
+
+fn env_nonempty(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn env_flag_enabled(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
         }
+        Err(_) => false,
     }
 }
 
+fn parse_env_placeholder(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let inner = trimmed.strip_prefix("${")?.strip_suffix("}")?;
+    let name = inner.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+fn resolve_api_key(raw: &str, primary_env: Option<&str>) -> Option<String> {
+    if let Some(primary_env) = primary_env {
+        if let Some(v) = env_nonempty(primary_env) {
+            return Some(v);
+        }
+    }
+
+    if let Some(env_name) = parse_env_placeholder(raw) {
+        return env_nonempty(env_name);
+    }
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub(crate) fn try_init_provider_named(
+    config: &Config,
+    provider_name: &str,
+) -> std::result::Result<Arc<dyn Provider>, String> {
+    let name = provider_name.trim();
+    if name.is_empty() {
+        return Err("provider name is empty".to_string());
+    }
+
+    let provider = match name {
+        "auto" => init_provider_auto(config)
+            .ok_or_else(|| "no providers available (try drbot wizard)".to_string())?,
+        "anthropic" | "claude" => init_provider_anthropic(config)
+            .ok_or_else(|| "anthropic not configured (missing API key)".to_string())?,
+        "openai" | "gpt" => init_provider_openai(config)
+            .ok_or_else(|| "openai not configured (missing API key)".to_string())?,
+        "ollama" | "local" => {
+            init_provider_ollama(config).ok_or_else(|| "ollama not configured".to_string())?
+        }
+        "claude-cli" | "claude-code" => init_provider_cli_preset("claude-cli")
+            .ok_or_else(|| CliProvider::claude_cli().not_found_hint())?,
+        "codex-cli" | "codex" => init_provider_cli_preset("codex-cli")
+            .ok_or_else(|| CliProvider::codex_cli().not_found_hint())?,
+        "codex-oss" | "codex-local" => init_provider_cli_preset("codex-oss")
+            .ok_or_else(|| CliProvider::codex_oss_ollama().not_found_hint())?,
+        other => {
+            if let Some(provider) = init_provider_openai_compatible(config, other) {
+                provider
+            } else if let Some(provider) = init_provider_cli_custom(config, other) {
+                provider
+            } else {
+                return Err(format!("unknown provider: {}", other));
+            }
+        }
+    };
+
+    Ok(provider)
+}
+
 fn init_provider_auto(config: &Config) -> Option<Arc<dyn Provider>> {
-    init_provider_anthropic(config)
+    // Auto selection prefers cost-savers first:
+    // - CLI tools (claude-cli / codex-cli) if installed on PATH
+    // - Ollama if configured
+    // - API providers as fallback
+    //
+    // You can disable CLI auto-detect with: DRBOT_AUTO_DISABLE_CLI_PRESETS=1
+    let cli_presets_disabled = env_flag_enabled("DRBOT_AUTO_DISABLE_CLI_PRESETS");
+
+    let cli = if cli_presets_disabled {
+        None
+    } else {
+        init_provider_cli_preset("claude-cli").or_else(|| init_provider_cli_preset("codex-cli"))
+    };
+
+    cli.or_else(|| init_provider_ollama(config))
+        .or_else(|| init_provider_anthropic(config))
         .or_else(|| init_provider_openai(config))
-        .or_else(|| init_provider_ollama(config))
+        .or_else(|| {
+            config
+                .providers
+                .openai_compatible
+                .iter()
+                .find_map(|c| init_provider_openai_compatible(config, &c.name))
+        })
+        .or_else(|| {
+            config
+                .providers
+                .cli
+                .iter()
+                .find_map(|c| init_provider_cli_custom(config, &c.name))
+        })
 }
 
 fn init_provider_anthropic(config: &Config) -> Option<Arc<dyn Provider>> {
-    config.providers.anthropic.as_ref().map(|cfg| {
-        let mut provider = AnthropicProvider::new(&cfg.api_key);
+    config.providers.anthropic.as_ref().and_then(|cfg| {
+        let api_key = resolve_api_key(&cfg.api_key, Some("ANTHROPIC_API_KEY"))?;
+        let mut provider = AnthropicProvider::new(&api_key);
         if let Some(base_url) = &cfg.base_url {
             provider = provider.with_base_url(base_url);
         }
@@ -705,13 +803,14 @@ fn init_provider_anthropic(config: &Config) -> Option<Arc<dyn Provider>> {
             provider = provider.with_default_max_tokens(max_tokens);
         }
         tracing::info!(provider = "anthropic", "Initialized provider");
-        Arc::new(provider) as Arc<dyn Provider>
+        Some(Arc::new(provider) as Arc<dyn Provider>)
     })
 }
 
 fn init_provider_openai(config: &Config) -> Option<Arc<dyn Provider>> {
-    config.providers.openai.as_ref().map(|cfg| {
-        let mut provider = OpenAIProvider::new(&cfg.api_key);
+    config.providers.openai.as_ref().and_then(|cfg| {
+        let api_key = resolve_api_key(&cfg.api_key, Some("OPENAI_API_KEY"))?;
+        let mut provider = OpenAIProvider::new(&api_key);
         if let Some(base_url) = &cfg.base_url {
             provider = provider.with_base_url(base_url);
         }
@@ -726,7 +825,7 @@ fn init_provider_openai(config: &Config) -> Option<Arc<dyn Provider>> {
             provider = provider.with_default_model(model);
         }
         tracing::info!(provider = "openai", "Initialized provider");
-        Arc::new(provider) as Arc<dyn Provider>
+        Some(Arc::new(provider) as Arc<dyn Provider>)
     })
 }
 
@@ -736,8 +835,9 @@ fn init_provider_openai_compatible(config: &Config, name: &str) -> Option<Arc<dy
         .openai_compatible
         .iter()
         .find(|c| c.name == name)
-        .map(|cfg| {
-            let mut provider = OpenAIProvider::new(&cfg.api_key)
+        .and_then(|cfg| {
+            let api_key = resolve_api_key(&cfg.api_key, None)?;
+            let mut provider = OpenAIProvider::new(&api_key)
                 .with_provider_name(name.to_string())
                 .with_base_url(cfg.base_url.clone());
             let model = cfg
@@ -755,7 +855,7 @@ fn init_provider_openai_compatible(config: &Config, name: &str) -> Option<Arc<dy
                 base_url = %cfg.base_url,
                 "Initialized OpenAI-compatible provider"
             );
-            Arc::new(provider) as Arc<dyn Provider>
+            Some(Arc::new(provider) as Arc<dyn Provider>)
         })
 }
 
@@ -774,10 +874,11 @@ fn init_provider_ollama(config: &Config) -> Option<Arc<dyn Provider>> {
     })
 }
 
-fn init_provider_cli_preset(_config: &Config, name: &str) -> Option<Arc<dyn Provider>> {
+fn init_provider_cli_preset(name: &str) -> Option<Arc<dyn Provider>> {
     let provider = match name {
         "claude-cli" | "claude-code" => CliProvider::claude_cli(),
         "codex-cli" | "codex" => CliProvider::codex_cli(),
+        "codex-oss" | "codex-local" => CliProvider::codex_oss_ollama(),
         _ => return None,
     };
     match provider.check_command_exists() {
@@ -793,9 +894,17 @@ fn init_provider_cli_preset(_config: &Config, name: &str) -> Option<Arc<dyn Prov
 }
 
 fn init_provider_cli_custom(config: &Config, name: &str) -> Option<Arc<dyn Provider>> {
-    config.providers.cli.iter().find(|c| c.name == name).map(|cfg| {
-        let provider = CliProvider::from_config(cfg);
-        tracing::info!(provider = %name, command = %cfg.command, "Initialized custom CLI provider");
-        Arc::new(provider) as Arc<dyn Provider>
-    })
+    let cfg = config.providers.cli.iter().find(|c| c.name == name)?;
+    let provider = CliProvider::from_config(cfg);
+    if let Err(e) = provider.check_command_exists() {
+        tracing::warn!(
+            provider = %name,
+            command = %cfg.command,
+            error = %e,
+            "Custom CLI provider not available"
+        );
+        return None;
+    }
+    tracing::info!(provider = %name, command = %cfg.command, "Initialized custom CLI provider");
+    Some(Arc::new(provider) as Arc<dyn Provider>)
 }

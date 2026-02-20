@@ -25,6 +25,7 @@ members = [
     "crates/drbot-hooks",
     "crates/drbot-plugins",
     "crates/drbot-tui",
+    "crates/drbot-tool-mode",
     "crates/drbot-cli",
     "crates/drbot-media",
     # Feature parity crates
@@ -726,6 +727,9 @@ async-trait = "0.1"
 # Regex
 regex = "1.11"
 
+# Unicode normalization
+unicode-normalization = "0.1"
+
 # Bytes
 bytes = "1.9"
 
@@ -778,6 +782,7 @@ drbot-cron = { path = "crates/drbot-cron" }
 drbot-hooks = { path = "crates/drbot-hooks" }
 drbot-plugins = { path = "crates/drbot-plugins" }
 drbot-tui = { path = "crates/drbot-tui" }
+drbot-tool-mode = { path = "crates/drbot-tool-mode" }
 drbot-cli = { path = "crates/drbot-cli" }
 drbot-media = { path = "crates/drbot-media" }
 # Next-gen crates
@@ -1415,6 +1420,7 @@ drbot-personas.workspace = true
 drbot-router.workspace = true
 drbot-iron.workspace = true
 drbot-tui.workspace = true
+drbot-tool-mode.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
@@ -1429,6 +1435,7 @@ reqwest.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 base64.workspace = true
 tokio-tungstenite.workspace = true
 uuid.workspace = true

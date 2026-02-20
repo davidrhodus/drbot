@@ -79,6 +79,7 @@ pub struct Tool {
 
 /// Response from the Messages API.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct MessagesResponse {
     pub id: String,
     #[serde(rename = "type")]
@@ -129,6 +130,7 @@ pub enum StreamEvent {
 
 /// Data in message_start event.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct MessageStartData {
     pub id: String,
     #[serde(rename = "type")]
@@ -148,6 +150,7 @@ pub enum ContentDelta {
 
 /// Message delta at end of stream.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields are kept for completeness; we deserialize them but don't always read them.
 pub struct MessageDelta {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
@@ -169,6 +172,7 @@ pub struct ApiError {
 
 /// Error response wrapper.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Currently unused, but matches the API's error envelope.
 pub struct ErrorResponse {
     #[serde(rename = "type")]
     pub response_type: String,

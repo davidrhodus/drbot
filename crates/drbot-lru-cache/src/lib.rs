@@ -249,7 +249,12 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
             return;
         };
 
-        if inner.entries.get(tail_idx).and_then(|e| e.as_ref()).is_none() {
+        if inner
+            .entries
+            .get(tail_idx)
+            .and_then(|e| e.as_ref())
+            .is_none()
+        {
             return;
         }
 

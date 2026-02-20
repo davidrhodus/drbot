@@ -1,6 +1,6 @@
 //! Context window management.
 
-use crate::{ContextConfig, ContextError, ContextItem, Result};
+use crate::{ContextItem, Result};
 use std::collections::VecDeque;
 
 /// Configuration for context window.

@@ -4,11 +4,11 @@ A personal AI assistant written in Rust. Multi-channel, multi-provider, highly e
 
 ## Features
 
-- **Multiple AI Providers**: Anthropic Claude, OpenAI GPT, AWS Bedrock, Ollama (local models)
+- **Multiple AI Providers**: Anthropic Claude, OpenAI GPT, AWS Bedrock, Ollama (local models), Claude CLI, Codex CLI (incl. OSS/local via Ollama)
 - **Multiple Channels**: WhatsApp, Telegram, Discord, Slack, Signal, iMessage, Matrix, WebChat
 - **Streaming Responses**: Real-time token streaming with tool/function calling support
-- **Session Management**: Persistent conversations with SQLite storage
-- **Memory System**: Vector embeddings for semantic search across conversation history
+- **Session Management**: Persistent conversations with SQLite storage (pick up where you left off)
+- **Memory System**: Workspace-backed personalization + knowledge base (`USER.md` / `MEMORY.md` / `memory/*.md`) with best-effort semantic recall
 - **Plugin System**: WASM-based plugins for extensibility
 - **Browser Automation**: Chromium DevTools Protocol integration
 - **Scheduled Tasks**: Cron-based job scheduling
@@ -38,8 +38,10 @@ The binary will be at `target/release/drbot`.
 ### Interactive Chat
 
 ```bash
-# Set your API key
+# If you want API providers:
 export ANTHROPIC_API_KEY=your-api-key
+# or
+export OPENAI_API_KEY=your-api-key
 
 # Start interactive chat
 drbot chat
@@ -48,11 +50,17 @@ drbot chat
 drbot chat -M "What is the capital of France?"
 ```
 
+Tip: If you have `claude` or `codex` installed on your PATH, drbot can use them as cost-savers
+without configuring API keys (default provider `auto` prefers `claude-cli`/`codex-cli` first).
+
 ### Terminal UI
 
 ```bash
+drbot       # Default: start Terminal UI + gateway
 drbot tui
 ```
+
+Keybindings: `Ctrl+P` provider picker, `Ctrl+M` model picker, `Ctrl+O` sessions, `Ctrl+D` OpenClaw.
 
 ### Gateway Server
 
@@ -75,7 +83,7 @@ drbot gateway --openclaw-agent-bash-allow-all
 ## CLI Commands
 
 ```
-drbot                      # Start gateway (default)
+drbot                      # Start Terminal UI + gateway (default)
 drbot wizard               # Interactive setup wizard
 drbot gateway              # Start WebSocket gateway server
 drbot chat                 # Interactive chat with AI
@@ -100,6 +108,8 @@ The wizard will guide you through:
 - Setting API keys (with environment variable detection)
 - Choosing default models
 - Gateway server settings
+- Assistant autonomy + tool/workspace allowlists
+- OpenClaw pairing requirements for remote operator connections
 - Saving the configuration file
 
 ### Chat Options
@@ -108,7 +118,7 @@ The wizard will guide you through:
 drbot chat [OPTIONS]
 
 Options:
-  -p, --provider <PROVIDER> Provider to use (anthropic, openai, ollama, auto)
+  -p, --provider <PROVIDER> Provider to use (auto, anthropic/claude, openai/gpt, ollama/local, claude-cli, codex-cli, codex-oss)
   -m, --model <MODEL>      Model to use (e.g., claude-sonnet-4-20250514)
   -s, --system <PROMPT>    System prompt
       --skill-url <URL>    Load an OpenClaw-style SKILL.md from a URL (and linked relative docs)
@@ -135,6 +145,14 @@ Example configuration:
 [gateway]
 host = "127.0.0.1"
 port = 18789
+# pairing_required = false
+# pairing_allow_local = true
+
+[assistant]
+# autonomy_mode = "supervised"  # read-only | supervised | full
+# workspace_allowlist = ["~/projects"]
+# tool_allowlist = ["read*", "list*", "search"]
+# tool_denylist = ["exec", "bash"]
 
 [providers]
 default_provider = "anthropic"
@@ -159,6 +177,11 @@ media_path = "~/.local/share/drbot/media"
 Environment variables override config file values:
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
+- `DRBOT_OLLAMA_URL` (or `OLLAMA_HOST`)
+
+## Persistent memory
+
+See `docs/persistent-memory.md` for how session continuity, personalization, and the workspace knowledge base work (and the relevant env vars).
 
 ## Architecture
 

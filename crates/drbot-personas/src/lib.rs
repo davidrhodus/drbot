@@ -11,7 +11,6 @@ pub use persona::{Persona, PersonaStyle, PersonaTrait};
 pub use registry::{PersonaId, PersonaRegistry};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Persona result.
 pub type Result<T> = std::result::Result<T, PersonaError>;
@@ -54,49 +53,47 @@ pub struct BuiltinPersonas;
 impl BuiltinPersonas {
     /// Default assistant persona.
     pub fn default_assistant() -> Persona {
-        PersonaBuilder::new("default")
-            .name("Assistant")
-            .description("A helpful AI assistant")
-            .style(PersonaStyle::Professional)
-            .trait_(PersonaTrait::Helpful)
-            .trait_(PersonaTrait::Accurate)
-            .build()
+        let mut persona = builder::presets::professional("default", "Assistant");
+        persona.description = "A helpful AI assistant".to_string();
+        persona
     }
 
     /// Creative writing persona.
     pub fn creative_writer() -> Persona {
-        PersonaBuilder::new("creative")
-            .name("Creative Writer")
-            .description("A creative and imaginative writing assistant")
-            .style(PersonaStyle::Creative)
-            .trait_(PersonaTrait::Creative)
-            .trait_(PersonaTrait::Expressive)
-            .system_prompt("You are a creative writing assistant. Be imaginative, use vivid language, and help craft compelling narratives.")
-            .build()
+        let mut persona = builder::presets::creative("creative", "Creative Writer");
+        persona.description = "A creative and imaginative writing assistant".to_string();
+        persona.system_prompt = Some("You are a creative writing assistant. Be imaginative, use vivid language, and help craft compelling narratives.".to_string());
+        persona
     }
 
     /// Technical expert persona.
     pub fn technical_expert() -> Persona {
-        PersonaBuilder::new("technical")
-            .name("Technical Expert")
-            .description("A precise and detailed technical assistant")
-            .style(PersonaStyle::Technical)
-            .trait_(PersonaTrait::Precise)
-            .trait_(PersonaTrait::Thorough)
-            .system_prompt("You are a technical expert. Provide detailed, accurate technical information. Use proper terminology and be thorough in explanations.")
-            .build()
+        let mut persona = builder::presets::technical("technical", "Technical Expert");
+        persona.description = "A precise and detailed technical assistant".to_string();
+        persona.system_prompt = Some("You are a technical expert. Provide detailed, accurate technical information. Use proper terminology and be thorough in explanations.".to_string());
+        persona
     }
 
     /// Casual friend persona.
     pub fn casual_friend() -> Persona {
-        PersonaBuilder::new("casual")
-            .name("Casual Friend")
-            .description("A friendly, casual conversationalist")
-            .style(PersonaStyle::Casual)
-            .trait_(PersonaTrait::Friendly)
-            .trait_(PersonaTrait::Humorous)
-            .system_prompt("You are a friendly chat companion. Be casual, use conversational language, and feel free to use humor when appropriate.")
-            .build()
+        let mut persona = builder::presets::casual("casual", "Casual Friend");
+        persona.description = "A friendly, casual conversationalist".to_string();
+        persona.system_prompt = Some("You are a friendly chat companion. Be casual, use conversational language, and feel free to use humor when appropriate.".to_string());
+        persona
+    }
+
+    /// Educational tutor persona.
+    pub fn teacher() -> Persona {
+        let mut persona = builder::presets::teacher("teacher", "Teacher");
+        persona.description = "An educational tutor".to_string();
+        persona
+    }
+
+    /// Concise assistant persona.
+    pub fn concise_assistant() -> Persona {
+        let mut persona = builder::presets::concise("concise", "Concise Assistant");
+        persona.description = "A brief and direct assistant".to_string();
+        persona
     }
 
     /// Get all built-in personas.
@@ -106,6 +103,8 @@ impl BuiltinPersonas {
             Self::creative_writer(),
             Self::technical_expert(),
             Self::casual_friend(),
+            Self::teacher(),
+            Self::concise_assistant(),
         ]
     }
 }

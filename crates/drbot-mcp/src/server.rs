@@ -5,7 +5,7 @@ use crate::resources::ResourceRegistry;
 use crate::tools::ToolRegistry;
 use crate::{
     error_codes, Implementation, JsonRpcError, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, RequestId, ServerCapabilities, MCP_VERSION,
+    JsonRpcResponse, ServerCapabilities, MCP_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::Arc;

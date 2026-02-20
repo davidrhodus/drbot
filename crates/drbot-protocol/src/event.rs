@@ -45,6 +45,9 @@ pub mod chat {
         pub message_id: Uuid,
         /// Model being used.
         pub model: String,
+        /// Provider name (if known).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provider: Option<String>,
     }
 
     /// Stream delta (chunk) event.
@@ -191,6 +194,26 @@ pub mod system {
     }
 }
 
+// ============================================================================
+// Provider Events
+// ============================================================================
+
+/// Event types for provider state changes.
+pub mod provider {
+    use super::*;
+
+    /// Provider changed event.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ChangedEvent {
+        /// New active provider name.
+        pub provider: String,
+        /// Previous active provider name (if any).
+        pub previous_provider: Option<String>,
+        /// Optional reason for the change (e.g. failure message).
+        pub reason: Option<String>,
+    }
+}
+
 /// Event type constants.
 pub mod event_types {
     // Chat events
@@ -213,6 +236,9 @@ pub mod event_types {
     pub const SYSTEM_CONNECTED: &str = "system.connected";
     pub const SYSTEM_HEARTBEAT: &str = "system.heartbeat";
     pub const SYSTEM_SHUTDOWN: &str = "system.shutdown";
+
+    // Provider events
+    pub const PROVIDER_CHANGED: &str = "provider.changed";
 }
 
 #[cfg(test)]

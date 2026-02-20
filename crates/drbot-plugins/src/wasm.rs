@@ -36,8 +36,11 @@
 use crate::{Plugin, PluginContext, PluginEvent, PluginMetadata, PluginResponse};
 use async_trait::async_trait;
 use std::path::Path;
+#[cfg(feature = "wasm")]
 use std::sync::Arc;
+#[cfg(feature = "wasm")]
 use tokio::sync::RwLock;
+#[cfg(feature = "wasm")]
 use tracing::{debug, error, info, warn};
 
 /// WASM plugin configuration.
@@ -189,6 +192,7 @@ impl WasmRuntime {
 
 /// WASM store data for host functions.
 #[derive(Default)]
+#[cfg(feature = "wasm")]
 struct WasmStoreData {
     /// Plugin data storage.
     data: std::collections::HashMap<String, Vec<u8>>,

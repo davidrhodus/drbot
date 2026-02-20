@@ -28,7 +28,6 @@ pub use stdio::{create_drbot_mcp_server, McpServerBuilder, StdioServer};
 pub use tools::{Tool, ToolRegistry};
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// MCP protocol version.
 pub const MCP_VERSION: &str = "2024-11-05";

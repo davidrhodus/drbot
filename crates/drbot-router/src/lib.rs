@@ -34,10 +34,7 @@ pub use triage::{
     UrgencyLevel,
 };
 
-use drbot_core::message::Message;
-use drbot_providers::{ChatOptions, ChatResponse, Provider, StreamEvent};
-use futures::Stream;
-use std::pin::Pin;
+use drbot_providers::Provider;
 use std::sync::Arc;
 
 /// Result type for router operations.
@@ -202,6 +199,10 @@ pub struct RoutingDecision {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use drbot_core::message::Message;
+    use drbot_providers::{ChatOptions, ChatResponse, Provider, StreamEvent};
+    use futures::Stream;
+    use std::pin::Pin;
 
     #[test]
     fn test_selection_criteria() {

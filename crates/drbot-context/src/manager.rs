@@ -2,12 +2,11 @@
 
 use crate::compressor::ContextCompressor;
 use crate::summarizer::Summarizer;
-use crate::window::ContextWindow;
-use crate::{ContextConfig, ContextError, ContextItem, ContextItemType, Result};
+use crate::{ContextConfig, ContextItem, ContextItemType, Result};
 use drbot_core::message::Message;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Current state of the context.
 #[derive(Debug, Clone)]
@@ -139,36 +138,11 @@ impl ContextManager {
             self.config.max_tokens / 2
         );
 
-        // Strategy: Remove lowest priority items first
-        let mut items: Vec<_> = self.items.drain(..).collect();
-        items.sort_by(|a, b| a.priority.partial_cmp(&b.priority).unwrap());
-
-        // Keep high priority items
-        let mut kept = VecDeque::new();
-        let mut kept_tokens = 0;
         let target_tokens = self.config.max_tokens / 2;
-
-        // Always keep system prompt
-        if let Some(pos) = items
-            .iter()
-            .position(|i| i.item_type == ContextItemType::SystemPrompt)
-        {
-            let item = items.remove(pos);
-            kept_tokens += item.tokens;
-            kept.push_back(item);
-        }
-
-        // Keep recent messages (highest priority last)
-        items.reverse();
-        for item in items {
-            if kept_tokens + item.tokens <= target_tokens {
-                kept_tokens += item.tokens;
-                kept.push_front(item);
-            }
-        }
-
-        self.items = kept;
-        self.total_tokens = kept_tokens;
+        let items: Vec<ContextItem> = self.items.drain(..).collect();
+        let compressed = self.compressor.compress(items, target_tokens);
+        self.total_tokens = compressed.iter().map(|i| i.tokens).sum();
+        self.items = compressed.into_iter().collect();
 
         debug!(
             "Context compressed: {} items, {} tokens",

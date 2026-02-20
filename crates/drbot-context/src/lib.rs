@@ -12,7 +12,6 @@ pub use manager::{ContextManager, ContextState};
 pub use summarizer::{Summarizer, Summary};
 pub use window::{ContextWindow, WindowConfig};
 
-use drbot_core::message::Message;
 use serde::{Deserialize, Serialize};
 
 /// Context result.

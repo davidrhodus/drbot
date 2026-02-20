@@ -22,7 +22,6 @@ use crate::{
     RequestId,
 };
 use std::io::{BufRead, Write};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Run drbot as an MCP server via stdio.

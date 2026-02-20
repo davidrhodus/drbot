@@ -13,8 +13,9 @@ use axum::{
 };
 use drbot_core::message::Message;
 use drbot_core::session::Session;
-use drbot_providers::{ChatOptions, StreamEvent as ProviderStreamEvent};
+use drbot_providers::{ChatOptions, Provider, StreamEvent as ProviderStreamEvent};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -26,9 +27,17 @@ pub fn create_router(state: GatewayState) -> Router {
         .allow_headers(Any);
 
     let hooks_base = state.config().hooks.path.trim();
-    let hooks_base = if hooks_base.is_empty() { "/hooks" } else { hooks_base };
+    let hooks_base = if hooks_base.is_empty() {
+        "/hooks"
+    } else {
+        hooks_base
+    };
     let hooks_base = hooks_base.trim_end_matches('/');
-    let hooks_base = if hooks_base == "/" { "/hooks" } else { hooks_base };
+    let hooks_base = if hooks_base == "/" {
+        "/hooks"
+    } else {
+        hooks_base
+    };
     let hooks_base = hooks_base.to_string();
     let hooks_max_body = state
         .config()
@@ -38,7 +47,10 @@ pub fn create_router(state: GatewayState) -> Router {
         .clamp(1, 5_000_000) as usize;
     let hooks_router = Router::new()
         .route("/wake", post(crate::openclaw_webhooks::hooks_wake_handler))
-        .route("/agent", post(crate::openclaw_webhooks::hooks_agent_handler))
+        .route(
+            "/agent",
+            post(crate::openclaw_webhooks::hooks_agent_handler),
+        )
         .layer(DefaultBodyLimit::max(hooks_max_body));
 
     Router::new()
@@ -77,6 +89,180 @@ async fn index() -> Html<&'static str> {
 </body>
 </html>"#,
     )
+}
+
+fn env_flag_enabled(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+fn env_nonempty(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn normalize_http_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Ollama commonly uses OLLAMA_HOST like "127.0.0.1:11434".
+    if trimmed.contains("://") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("http://{}", trimmed))
+    }
+}
+
+fn ollama_base_url(config: &drbot_core::Config) -> String {
+    if let Some(v) = env_nonempty("DRBOT_OLLAMA_URL").and_then(|v| normalize_http_url(&v)) {
+        return v;
+    }
+    if let Some(v) = env_nonempty("OLLAMA_HOST").and_then(|v| normalize_http_url(&v)) {
+        return v;
+    }
+    config
+        .providers
+        .ollama
+        .as_ref()
+        .map(|c| c.url.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| drbot_ollama::DEFAULT_BASE_URL.to_string())
+}
+
+async fn fetch_ollama_tags(
+    base_url: &str,
+    timeout: Duration,
+) -> Option<(bool, Option<serde_json::Value>)> {
+    let tags_url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    tokio::time::timeout(timeout, async {
+        let resp = reqwest::Client::new().get(&tags_url).send().await.ok()?;
+        let ok = resp.status().is_success();
+        let json = if ok {
+            resp.json::<serde_json::Value>().await.ok()
+        } else {
+            None
+        };
+        Some((ok, json))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn init_provider_auto_best_effort(
+    state: &GatewayState,
+) -> std::result::Result<std::sync::Arc<dyn Provider>, String> {
+    // Auto selection prefers cost-savers first:
+    // - CLI tools (claude-cli / codex-cli) if installed on PATH
+    // - Ollama if running (even without config)
+    // - API providers as fallback
+    //
+    // You can disable CLI auto-detect with: DRBOT_AUTO_DISABLE_CLI_PRESETS=1
+    let cli_presets_disabled = env_flag_enabled("DRBOT_AUTO_DISABLE_CLI_PRESETS");
+
+    if !cli_presets_disabled {
+        if let Ok(p) = crate::state::try_init_provider_named(state.config(), "claude-cli") {
+            return Ok(p);
+        }
+        if let Ok(p) = crate::state::try_init_provider_named(state.config(), "codex-cli") {
+            return Ok(p);
+        }
+    }
+
+    let base_url = ollama_base_url(state.config());
+    if let Some((reachable, _json)) = fetch_ollama_tags(&base_url, Duration::from_millis(350)).await
+    {
+        if reachable {
+            let mut provider = drbot_ollama::OllamaProvider::new().with_base_url(base_url);
+            let model = state
+                .config()
+                .providers
+                .ollama
+                .as_ref()
+                .and_then(|c| c.default_model.clone())
+                .or_else(|| state.config().providers.default_model.clone());
+            if let Some(model) = model {
+                provider = provider.with_default_model(model);
+            }
+            return Ok(std::sync::Arc::new(provider) as std::sync::Arc<dyn Provider>);
+        }
+    }
+
+    // Fall back to configured API/custom providers.
+    if let Ok(p) = crate::state::try_init_provider_named(state.config(), "anthropic") {
+        return Ok(p);
+    }
+    if let Ok(p) = crate::state::try_init_provider_named(state.config(), "openai") {
+        return Ok(p);
+    }
+    for cfg in state.config().providers.openai_compatible.iter() {
+        if let Ok(p) = crate::state::try_init_provider_named(state.config(), &cfg.name) {
+            return Ok(p);
+        }
+    }
+    for cfg in state.config().providers.cli.iter() {
+        if let Ok(p) = crate::state::try_init_provider_named(state.config(), &cfg.name) {
+            return Ok(p);
+        }
+    }
+
+    Err("no providers available (try drbot wizard)".to_string())
+}
+
+async fn try_init_provider_named_best_effort(
+    state: &GatewayState,
+    name: &str,
+) -> std::result::Result<std::sync::Arc<dyn Provider>, String> {
+    let requested = name.trim();
+    if requested.is_empty() {
+        return Err("provider name is empty".to_string());
+    }
+
+    if requested.eq_ignore_ascii_case("auto") {
+        return init_provider_auto_best_effort(state).await;
+    }
+
+    if requested.eq_ignore_ascii_case("ollama") || requested.eq_ignore_ascii_case("local") {
+        if let Ok(p) = crate::state::try_init_provider_named(state.config(), "ollama") {
+            return Ok(p);
+        }
+
+        // Allow configless Ollama if it's actually running.
+        let base_url = ollama_base_url(state.config());
+        let reachable = fetch_ollama_tags(&base_url, Duration::from_millis(350))
+            .await
+            .map(|(ok, _)| ok)
+            .unwrap_or(false);
+        if !reachable {
+            return Err(format!(
+                "ollama not reachable at {} (start Ollama or run drbot wizard)",
+                base_url.trim()
+            ));
+        }
+
+        let mut provider = drbot_ollama::OllamaProvider::new().with_base_url(base_url);
+        let model = state
+            .config()
+            .providers
+            .ollama
+            .as_ref()
+            .and_then(|c| c.default_model.clone())
+            .or_else(|| state.config().providers.default_model.clone());
+        if let Some(model) = model {
+            provider = provider.with_default_model(model);
+        }
+        return Ok(std::sync::Arc::new(provider) as std::sync::Arc<dyn Provider>);
+    }
+
+    crate::state::try_init_provider_named(state.config(), requested)
 }
 
 async fn health(State(state): State<GatewayState>) -> impl IntoResponse {
@@ -735,9 +921,12 @@ async fn handle_request(
     client_ctx: &std::sync::Arc<tokio::sync::RwLock<ClientContext>>,
 ) -> drbot_protocol::WsMessage {
     use drbot_protocol::{
-        event_types, AuthLoginParams, AuthLoginResult, ChatSendParams, ErrorCode, Event,
-        ProviderListResult, SessionCreateParams, SessionCreateResult, SessionListParams,
-        SessionListResult, SystemInfoResult, SystemPingResult, WsMessage,
+        event_types, AuthLoginParams, AuthLoginResult, ChatSendParams, ErrorCode, Event, ModelInfo,
+        ProviderListResult, ProviderModelsParams, ProviderModelsResult, ProviderSelectParams,
+        ProviderSelectResult, SessionClearParams, SessionClearResult, SessionCreateParams,
+        SessionCreateResult, SessionDeleteParams, SessionDeleteResult, SessionGetParams,
+        SessionGetResult, SessionListParams, SessionListResult, SessionUpdateParams,
+        SessionUpdateResult, SystemInfoResult, SystemPingResult, WsMessage,
     };
     use futures::StreamExt;
     use tracing::{debug, error, warn};
@@ -802,27 +991,261 @@ async fn handle_request(
                 }
             };
 
-            // Check if provider is configured
-            let provider = match state.provider() {
-                Some(p) => p,
-                None => {
-                    return WsMessage::error(
-                        request.id,
-                        ErrorCode::ProviderError,
-                        "No AI provider configured",
-                    );
-                }
-            };
-
-            // Get or create session
+            // Establish a session id upfront (even if we short-circuit provider calls).
             let session_id = params.session_id.unwrap_or_else(uuid::Uuid::new_v4);
             let message_id = uuid::Uuid::new_v4();
 
+            // Local workspace commands (e.g. `/remember ...`) are handled without calling a provider.
+            //
+            // This keeps "memory updates" fast, reliable, and available even when no provider is
+            // configured.
+            let msg_trimmed = params.message.trim_start();
+            let msg_lower = msg_trimmed.to_ascii_lowercase();
+            let is_remember_cmd =
+                msg_lower.starts_with("/remember") || msg_lower.starts_with("remember:");
+            let is_forget_cmd =
+                msg_lower.starts_with("/forget") || msg_lower.starts_with("forget:");
+            let is_memory_cmd = msg_lower == "/memory" || msg_lower == "/mem";
+            let is_profile_cmd = msg_lower == "/profile";
+            let is_kb_cmd = msg_lower == "/kb"
+                || msg_lower.starts_with("/kb ")
+                || msg_lower.starts_with("/kb:")
+                || msg_lower.starts_with("kb:")
+                || msg_lower == "/notes"
+                || msg_lower.starts_with("/notes ")
+                || msg_lower.starts_with("/notes:")
+                || msg_lower.starts_with("notes:");
+            let is_local_cmd =
+                is_remember_cmd || is_forget_cmd || is_memory_cmd || is_profile_cmd || is_kb_cmd;
+
+            if is_local_cmd {
+                let workspace_dir = crate::openclaw::ensure_agent_workspace_bootstrap_best_effort(
+                    state,
+                    crate::openclaw_paths::DEFAULT_AGENT_ID,
+                );
+                let should_persist = is_remember_cmd || is_forget_cmd;
+
+                let reply = if is_remember_cmd || is_forget_cmd {
+                    let updates = if is_remember_cmd {
+                        crate::workspace_autosave::autosave_workspace_best_effort(
+                            &workspace_dir,
+                            &params.message,
+                        )
+                    } else {
+                        crate::workspace_autosave::forget_workspace_best_effort(
+                            &workspace_dir,
+                            &params.message,
+                        )
+                    };
+
+                    if updates.applied {
+                        if updates.updates.is_empty() {
+                            if is_remember_cmd {
+                                "Saved to memory.".to_string()
+                            } else {
+                                "Forgot.".to_string()
+                            }
+                        } else {
+                            let mut out = String::new();
+                            out.push_str(if is_remember_cmd {
+                                "Saved to memory:\n"
+                            } else {
+                                "Forgot:\n"
+                            });
+                            for u in updates.updates.iter().take(12) {
+                                out.push_str("- ");
+                                out.push_str(u);
+                                out.push('\n');
+                            }
+                            out.trim_end().to_string()
+                        }
+                    } else if is_remember_cmd {
+                        if crate::workspace_autosave::parse_remember_command(&params.message)
+                            .is_some()
+                        {
+                            "Nothing saved (refused to store sensitive/invalid content)."
+                                .to_string()
+                        } else {
+                            "Usage: /remember <note>".to_string()
+                        }
+                    } else if crate::workspace_autosave::parse_forget_command(&params.message)
+                        .is_some()
+                    {
+                        "Nothing forgotten (no matching items).".to_string()
+                    } else {
+                        "Usage: /forget <name|timezone|style|all|text>".to_string()
+                    }
+                } else if is_profile_cmd {
+                    crate::workspace_memory_view::build_workspace_profile_overview(&workspace_dir)
+                } else if is_memory_cmd {
+                    crate::workspace_memory_view::build_workspace_memory_overview(&workspace_dir)
+                } else if is_kb_cmd {
+                    let query = if msg_lower == "/kb"
+                        || msg_lower.starts_with("/kb ")
+                        || msg_lower.starts_with("/kb:")
+                    {
+                        msg_trimmed[3..].trim_start_matches(&[' ', ':'][..]).trim()
+                    } else if msg_lower.starts_with("kb:") {
+                        msg_trimmed[3..].trim()
+                    } else if msg_lower == "/notes"
+                        || msg_lower.starts_with("/notes ")
+                        || msg_lower.starts_with("/notes:")
+                    {
+                        msg_trimmed[6..].trim_start_matches(&[' ', ':'][..]).trim()
+                    } else if msg_lower.starts_with("notes:") {
+                        msg_trimmed[6..].trim()
+                    } else {
+                        ""
+                    };
+
+                    if query.trim().is_empty() {
+                        "Usage: /kb <query>".to_string()
+                    } else {
+                        crate::workspace_notes_recall::recall_workspace_notes_prompt_explicit(
+                            &workspace_dir,
+                            query,
+                        )
+                        .await
+                        .unwrap_or_else(|| "No relevant notes found.".to_string())
+                    }
+                } else {
+                    "Unknown local command.".to_string()
+                };
+
+                // Persist only mutating commands; view/search commands would bloat chat history.
+                if should_persist {
+                    if let Some(store) = state.session_store() {
+                        let user_id = client_ctx.read().await.effective_user_id();
+                        match store.get(session_id).await {
+                            Ok(Some(mut s)) => {
+                                if s.user_id != user_id {
+                                    warn!(
+                                        session_id = %session_id,
+                                        session_user_id = %s.user_id,
+                                        request_user_id = %user_id,
+                                        "Session access denied"
+                                    );
+                                    return WsMessage::error(
+                                        request.id,
+                                        ErrorCode::PermissionDenied,
+                                        "Permission denied",
+                                    );
+                                }
+                                s.add_message(Message::user(&params.message));
+                                s.add_message(Message::assistant(&reply));
+                                s.update_timestamp();
+                                let _ = store.update(&s).await;
+                            }
+                            Ok(None) => {
+                                let mut s =
+                                    Session::new(user_id, "gateway", session_id.to_string());
+                                s.id = session_id;
+                                s.title = Some("Gateway Chat".to_string());
+                                // Don't force a provider selection for local commands.
+                                s.provider = state.provider().map(|p| p.name().to_string());
+                                s.model = params.model.clone();
+                                s.system_prompt = params
+                                    .options
+                                    .as_ref()
+                                    .and_then(|o| o.system_prompt.clone());
+                                s.add_message(Message::user(&params.message));
+                                s.add_message(Message::assistant(&reply));
+                                let _ = store.create(&s).await;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+
+                let model_name = params.model.clone().unwrap_or_else(|| "local".to_string());
+
+                if params.stream {
+                    let start_event = Event::new(
+                        event_types::CHAT_STREAM_START,
+                        drbot_protocol::event::chat::StreamStartEvent {
+                            request_id: request.id,
+                            session_id,
+                            message_id,
+                            model: model_name.clone(),
+                            provider: None,
+                        },
+                    );
+                    if let Ok(json) = serde_json::to_string(&WsMessage::Event(start_event)) {
+                        let _ = tx.send(json).await;
+                    }
+
+                    let delta_event = Event::new(
+                        event_types::CHAT_STREAM_DELTA,
+                        drbot_protocol::event::chat::StreamDeltaEvent {
+                            request_id: request.id,
+                            delta: reply.clone(),
+                        },
+                    );
+                    if let Ok(json) = serde_json::to_string(&WsMessage::Event(delta_event)) {
+                        let _ = tx.send(json).await;
+                    }
+
+                    let complete_event = Event::new(
+                        event_types::CHAT_STREAM_COMPLETE,
+                        drbot_protocol::event::chat::StreamCompleteEvent {
+                            request_id: request.id,
+                            content: reply.clone(),
+                            stop_reason: Some("local".to_string()),
+                            usage: None,
+                        },
+                    );
+                    if let Ok(json) = serde_json::to_string(&WsMessage::Event(complete_event)) {
+                        let _ = tx.send(json).await;
+                    }
+
+                    return WsMessage::success(
+                        request.id,
+                        drbot_protocol::ChatSendResult {
+                            session_id,
+                            message_id,
+                            content: None,
+                            model: model_name,
+                            provider: None,
+                            usage: None,
+                        },
+                    );
+                }
+
+                return WsMessage::success(
+                    request.id,
+                    drbot_protocol::ChatSendResult {
+                        session_id,
+                        message_id,
+                        content: Some(reply),
+                        model: model_name,
+                        provider: None,
+                        usage: None,
+                    },
+                );
+            }
+
+            // Get provider; if none is active, try auto-init (best effort).
+            let mut provider = match state.provider() {
+                Some(p) => p,
+                None => match init_provider_auto_best_effort(state).await {
+                    Ok(p) => {
+                        state.set_provider(Some(p.clone()));
+                        p
+                    }
+                    Err(reason) => {
+                        return WsMessage::error(request.id, ErrorCode::ProviderError, reason);
+                    }
+                },
+            };
+            let mut active_provider_name = provider.name().to_string();
+            let mut initial_provider_name = active_provider_name.clone();
+
+            // Get or create session
             // Build messages for the provider
             let mut messages = Vec::new();
 
             // Build chat options
-            let options = ChatOptions {
+            let mut options = ChatOptions {
                 model: params.model.clone(),
                 max_tokens: params.options.as_ref().and_then(|o| o.max_tokens),
                 temperature: params.options.as_ref().and_then(|o| o.temperature),
@@ -864,6 +1287,7 @@ async fn handle_request(
                     Ok(None) => {
                         let mut s = Session::new(user_id, "gateway", session_id.to_string());
                         s.id = session_id;
+                        s.provider = Some(active_provider_name.clone());
                         s.model = params.model.clone();
                         s.system_prompt = options.system_prompt.clone();
                         s.title = Some("Gateway Chat".to_string());
@@ -880,180 +1304,492 @@ async fn handle_request(
                     }
                 };
 
+                // Prefer the session's persisted provider when resuming. This makes gateway chat
+                // robust even if the client doesn't explicitly select a provider.
+                if let Some(session_provider) = session
+                    .provider
+                    .as_deref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    if session_provider != active_provider_name {
+                        match crate::state::try_init_provider_named(
+                            state.config(),
+                            session_provider,
+                        ) {
+                            Ok(p) => {
+                                provider = p;
+                                active_provider_name = provider.name().to_string();
+                                initial_provider_name = active_provider_name.clone();
+                                state.set_provider(Some(provider.clone()));
+                            }
+                            Err(reason) => {
+                                warn!(
+                                    session_id = %session_id,
+                                    provider = %session_provider,
+                                    reason = %reason,
+                                    "Session provider unavailable; continuing with active provider"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Treat request model/system prompt as session-level settings.
+                // If omitted, fall back to the session's persisted values.
+                if params.model.is_some() {
+                    session.model = params.model.clone();
+                }
+                if options.system_prompt.is_some() {
+                    session.system_prompt = options.system_prompt.clone();
+                }
+                if options.model.is_none() {
+                    options.model = session.model.clone();
+                }
+                if options.system_prompt.is_none() {
+                    options.system_prompt = session.system_prompt.clone();
+                }
+
                 messages.extend(session.messages.clone());
                 // Keep the session for persistence updates below.
-                persisted_session = Some({
-                    // Ensure metadata stays consistent with prompt options.
-                    if session.model.is_none() {
-                        session.model = params.model.clone();
-                    }
-                    if session.system_prompt.is_none() {
-                        session.system_prompt = options.system_prompt.clone();
-                    }
-                    session
-                });
+                persisted_session = Some(session);
             }
+
+            // Workspace-backed personalization + knowledge base (best effort).
+            //
+            // We use the default OpenClaw agent workspace so the same USER.md/MEMORY.md and
+            // memory/*.md notes apply across the gateway and OpenClaw surfaces.
+            let workspace_dir = crate::openclaw::ensure_agent_workspace_bootstrap_best_effort(
+                state,
+                crate::openclaw_paths::DEFAULT_AGENT_ID,
+            );
+            // Avoid polluting workspace memory/recall with internal tool-loop messages.
+            let msg_trimmed = params.message.trim_start();
+            let is_internal_tool_message = msg_trimmed.starts_with("[Tool Result]")
+                || msg_trimmed.starts_with("[Tool Denied]")
+                || msg_trimmed.starts_with("[Tool Mode Strict]");
+            if !is_internal_tool_message {
+                crate::workspace_autosave::autosave_workspace_best_effort(
+                    &workspace_dir,
+                    &params.message,
+                );
+            }
+            let workspace_context =
+                crate::workspace_chat_context::build_chat_workspace_context_prompt(&workspace_dir);
+            let workspace_notes = if is_internal_tool_message {
+                None
+            } else {
+                crate::workspace_notes_recall::recall_workspace_notes_prompt(
+                    &workspace_dir,
+                    &params.message,
+                )
+                .await
+            };
+
+            let mut system_sections: Vec<String> = Vec::new();
+            if let Some(existing) = options.system_prompt.take() {
+                let trimmed = existing.trim();
+                if !trimmed.is_empty() {
+                    system_sections.push(trimmed.to_string());
+                }
+            }
+            let ctx_trimmed = workspace_context.trim();
+            if !ctx_trimmed.is_empty() {
+                system_sections.push(ctx_trimmed.to_string());
+            }
+            if let Some(notes) = workspace_notes.as_deref() {
+                let trimmed = notes.trim();
+                if !trimmed.is_empty() {
+                    system_sections.push(trimmed.to_string());
+                }
+            }
+            options.system_prompt = if system_sections.is_empty() {
+                None
+            } else {
+                Some(system_sections.join("\n\n---\n\n"))
+            };
 
             // Add the user's message (to provider only; persistence happens after a successful response).
             let user_msg = Message::user(&params.message);
             messages.push(user_msg.clone());
 
-            let model_name = options
-                .model
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let mut fallback_providers: Vec<String> = vec![
+                "claude-cli".to_string(),
+                "codex-cli".to_string(),
+                "codex-oss".to_string(),
+                "ollama".to_string(),
+                "anthropic".to_string(),
+                "openai".to_string(),
+            ];
+            fallback_providers.extend(
+                state
+                    .config()
+                    .providers
+                    .openai_compatible
+                    .iter()
+                    .map(|c| c.name.clone()),
+            );
+            fallback_providers.extend(state.config().providers.cli.iter().map(|c| c.name.clone()));
+            let mut seen = std::collections::HashSet::new();
+            fallback_providers.retain(|n| seen.insert(n.clone()));
 
             if params.stream {
                 // Streaming response
-                match provider.stream(&messages, options).await {
-                    Ok(mut stream) => {
-                        // Send start event
-                        let start_event = Event::new(
-                            event_types::CHAT_STREAM_START,
-                            drbot_protocol::event::chat::StreamStartEvent {
-                                request_id: request.id,
-                                session_id,
-                                message_id,
-                                model: model_name.clone(),
+                let mut stream = match provider.stream(&messages, options.clone()).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let first_error = e.to_string();
+                        warn!(
+                            provider = %active_provider_name,
+                            error = %first_error,
+                            "Provider stream failed; attempting fallback"
+                        );
+
+                        let mut last_error = first_error.clone();
+                        let mut selected_provider = None;
+                        let mut selected_stream = None;
+
+                        for name in fallback_providers.iter() {
+                            if name == &active_provider_name {
+                                continue;
+                            }
+
+                            let p = match try_init_provider_named_best_effort(state, name).await {
+                                Ok(p) => p,
+                                Err(reason) => {
+                                    debug!(
+                                        provider = %name,
+                                        reason = %reason,
+                                        "Fallback provider not available"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let mut attempt_options = options.clone();
+                            // Model ids rarely port across providers; use provider default on fallback.
+                            attempt_options.model = None;
+
+                            match p.stream(&messages, attempt_options).await {
+                                Ok(s) => {
+                                    selected_provider = Some(p);
+                                    selected_stream = Some(s);
+                                    break;
+                                }
+                                Err(err) => {
+                                    last_error = err.to_string();
+                                    debug!(
+                                        provider = %name,
+                                        error = %last_error,
+                                        "Fallback provider stream failed"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let Some(p) = selected_provider else {
+                            error!(
+                                provider = %active_provider_name,
+                                error = %first_error,
+                                last_error = %last_error,
+                                "All provider fallbacks failed (stream)"
+                            );
+                            return WsMessage::error(
+                                request.id,
+                                ErrorCode::ProviderError,
+                                format!("{} (fallback failed: {})", first_error, last_error),
+                            );
+                        };
+
+                        let Some(s) = selected_stream else {
+                            return WsMessage::error(
+                                request.id,
+                                ErrorCode::ProviderError,
+                                format!("{} (fallback failed: {})", first_error, last_error),
+                            );
+                        };
+
+                        let previous_provider = active_provider_name.clone();
+                        provider = p;
+                        active_provider_name = provider.name().to_string();
+                        state.set_provider(Some(provider.clone()));
+
+                        // Drop model selection when switching providers to avoid mismatch.
+                        options.model = None;
+
+                        let changed_event = Event::new(
+                            event_types::PROVIDER_CHANGED,
+                            drbot_protocol::event::provider::ChangedEvent {
+                                provider: active_provider_name.clone(),
+                                previous_provider: Some(previous_provider.clone()),
+                                reason: Some(format!(
+                                    "{} failed: {}",
+                                    previous_provider, first_error
+                                )),
                             },
                         );
-                        if let Ok(json) = serde_json::to_string(&WsMessage::Event(start_event)) {
+                        if let Ok(json) = serde_json::to_string(&WsMessage::Event(changed_event)) {
                             let _ = tx.send(json).await;
                         }
 
-                        let mut full_content = String::new();
-                        let mut final_usage = None;
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                ProviderStreamEvent::Delta { content } => {
-                                    full_content.push_str(&content);
-                                    let delta_event = Event::new(
-                                        event_types::CHAT_STREAM_DELTA,
-                                        drbot_protocol::event::chat::StreamDeltaEvent {
-                                            request_id: request.id,
-                                            delta: content,
-                                        },
-                                    );
-                                    if let Ok(json) =
-                                        serde_json::to_string(&WsMessage::Event(delta_event))
-                                    {
-                                        let _ = tx.send(json).await;
-                                    }
-                                }
-                                ProviderStreamEvent::Stop { reason, usage } => {
-                                    final_usage = usage;
-                                    let complete_event = Event::new(
-                                        event_types::CHAT_STREAM_COMPLETE,
-                                        drbot_protocol::event::chat::StreamCompleteEvent {
-                                            request_id: request.id,
-                                            content: full_content.clone(),
-                                            stop_reason: Some(reason),
-                                            usage: final_usage.as_ref().map(|u| {
-                                                drbot_protocol::response::TokenUsage {
-                                                    input_tokens: u.input_tokens,
-                                                    output_tokens: u.output_tokens,
-                                                }
-                                            }),
-                                        },
-                                    );
-                                    if let Ok(json) =
-                                        serde_json::to_string(&WsMessage::Event(complete_event))
-                                    {
-                                        let _ = tx.send(json).await;
-                                    }
-                                }
-                                ProviderStreamEvent::Error { message } => {
-                                    error!(error = %message, "Stream error");
-                                    let error_event = Event::new(
-                                        event_types::CHAT_STREAM_ERROR,
-                                        drbot_protocol::event::chat::StreamErrorEvent {
-                                            request_id: request.id,
-                                            error: message,
-                                        },
-                                    );
-                                    if let Ok(json) =
-                                        serde_json::to_string(&WsMessage::Event(error_event))
-                                    {
-                                        let _ = tx.send(json).await;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if let (Some(store), Some(session)) =
-                            (state.session_store(), persisted_session.as_mut())
-                        {
-                            session.add_message(user_msg);
-                            session.add_message(Message::assistant(&full_content));
-                            if let Some(usage) = &final_usage {
-                                session.add_token_usage(usage.input_tokens, usage.output_tokens);
-                            }
-                            session.update_timestamp();
-                            if let Err(e) = store.update(session).await {
-                                error!(error = %e, session_id = %session_id, "Failed to update session");
-                            }
-                        }
-
-                        WsMessage::success(
-                            request.id,
-                            drbot_protocol::ChatSendResult {
-                                session_id,
-                                message_id,
-                                content: None,
-                                model: model_name,
-                                usage: final_usage.map(|u| drbot_protocol::response::TokenUsage {
-                                    input_tokens: u.input_tokens,
-                                    output_tokens: u.output_tokens,
-                                }),
-                            },
-                        )
+                        s
                     }
-                    Err(e) => {
-                        error!(error = %e, "Failed to stream");
-                        WsMessage::error(request.id, ErrorCode::ProviderError, e.to_string())
+                };
+
+                let model_name = options
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+
+                // Send start event
+                let start_event = Event::new(
+                    event_types::CHAT_STREAM_START,
+                    drbot_protocol::event::chat::StreamStartEvent {
+                        request_id: request.id,
+                        session_id,
+                        message_id,
+                        model: model_name.clone(),
+                        provider: Some(active_provider_name.clone()),
+                    },
+                );
+                if let Ok(json) = serde_json::to_string(&WsMessage::Event(start_event)) {
+                    let _ = tx.send(json).await;
+                }
+
+                let mut full_content = String::new();
+                let mut final_usage = None;
+
+                while let Some(event) = stream.next().await {
+                    match event {
+                        ProviderStreamEvent::Delta { content } => {
+                            full_content.push_str(&content);
+                            let delta_event = Event::new(
+                                event_types::CHAT_STREAM_DELTA,
+                                drbot_protocol::event::chat::StreamDeltaEvent {
+                                    request_id: request.id,
+                                    delta: content,
+                                },
+                            );
+                            if let Ok(json) = serde_json::to_string(&WsMessage::Event(delta_event))
+                            {
+                                let _ = tx.send(json).await;
+                            }
+                        }
+                        ProviderStreamEvent::Stop { reason, usage } => {
+                            final_usage = usage;
+                            let complete_event = Event::new(
+                                event_types::CHAT_STREAM_COMPLETE,
+                                drbot_protocol::event::chat::StreamCompleteEvent {
+                                    request_id: request.id,
+                                    content: full_content.clone(),
+                                    stop_reason: Some(reason),
+                                    usage: final_usage.as_ref().map(|u| {
+                                        drbot_protocol::response::TokenUsage {
+                                            input_tokens: u.input_tokens,
+                                            output_tokens: u.output_tokens,
+                                        }
+                                    }),
+                                },
+                            );
+                            if let Ok(json) =
+                                serde_json::to_string(&WsMessage::Event(complete_event))
+                            {
+                                let _ = tx.send(json).await;
+                            }
+                        }
+                        ProviderStreamEvent::Error { message } => {
+                            error!(error = %message, "Stream error");
+                            let error_event = Event::new(
+                                event_types::CHAT_STREAM_ERROR,
+                                drbot_protocol::event::chat::StreamErrorEvent {
+                                    request_id: request.id,
+                                    error: message,
+                                },
+                            );
+                            if let Ok(json) = serde_json::to_string(&WsMessage::Event(error_event))
+                            {
+                                let _ = tx.send(json).await;
+                            }
+                        }
+                        _ => {}
                     }
                 }
+
+                if let (Some(store), Some(session)) =
+                    (state.session_store(), persisted_session.as_mut())
+                {
+                    if active_provider_name != initial_provider_name {
+                        // Prevent a persisted model id from the previous provider from breaking
+                        // future calls after fallback.
+                        session.model = None;
+                    }
+                    session.provider = Some(active_provider_name.clone());
+                    session.add_message(user_msg);
+                    session.add_message(Message::assistant(&full_content));
+                    if let Some(usage) = &final_usage {
+                        session.add_token_usage(usage.input_tokens, usage.output_tokens);
+                    }
+                    session.update_timestamp();
+                    if let Err(e) = store.update(session).await {
+                        error!(error = %e, session_id = %session_id, "Failed to update session");
+                    }
+                }
+
+                WsMessage::success(
+                    request.id,
+                    drbot_protocol::ChatSendResult {
+                        session_id,
+                        message_id,
+                        content: None,
+                        model: model_name,
+                        provider: Some(active_provider_name.clone()),
+                        usage: final_usage.map(|u| drbot_protocol::response::TokenUsage {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                        }),
+                    },
+                )
             } else {
                 // Non-streaming response
-                match provider.chat(&messages, options).await {
-                    Ok(response) => {
-                        if let (Some(store), Some(session)) =
-                            (state.session_store(), persisted_session.as_mut())
-                        {
-                            session.add_message(user_msg);
-                            session.add_message(Message::assistant(&response.content));
-                            if let Some(usage) = &response.usage {
-                                session.add_token_usage(usage.input_tokens, usage.output_tokens);
+                let response = match provider.chat(&messages, options.clone()).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        let first_error = e.to_string();
+                        warn!(
+                            provider = %active_provider_name,
+                            error = %first_error,
+                            "Provider chat failed; attempting fallback"
+                        );
+
+                        let mut last_error = first_error.clone();
+                        let mut selected_provider = None;
+                        let mut selected_response = None;
+
+                        for name in fallback_providers.iter() {
+                            if name == &active_provider_name {
+                                continue;
                             }
-                            session.update_timestamp();
-                            if let Err(e) = store.update(session).await {
-                                error!(error = %e, session_id = %session_id, "Failed to update session");
+
+                            let p = match try_init_provider_named_best_effort(state, name).await {
+                                Ok(p) => p,
+                                Err(reason) => {
+                                    debug!(
+                                        provider = %name,
+                                        reason = %reason,
+                                        "Fallback provider not available"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let mut attempt_options = options.clone();
+                            // Model ids rarely port across providers; use provider default on fallback.
+                            attempt_options.model = None;
+
+                            match p.chat(&messages, attempt_options).await {
+                                Ok(r) => {
+                                    selected_provider = Some(p);
+                                    selected_response = Some(r);
+                                    break;
+                                }
+                                Err(err) => {
+                                    last_error = err.to_string();
+                                    debug!(
+                                        provider = %name,
+                                        error = %last_error,
+                                        "Fallback provider chat failed"
+                                    );
+                                    continue;
+                                }
                             }
                         }
 
-                        WsMessage::success(
-                            request.id,
-                            drbot_protocol::ChatSendResult {
-                                session_id,
-                                message_id,
-                                content: Some(response.content),
-                                model: response.model,
-                                usage: response.usage.map(|u| {
-                                    drbot_protocol::response::TokenUsage {
-                                        input_tokens: u.input_tokens,
-                                        output_tokens: u.output_tokens,
-                                    }
-                                }),
+                        let Some(p) = selected_provider else {
+                            error!(
+                                provider = %active_provider_name,
+                                error = %first_error,
+                                last_error = %last_error,
+                                "All provider fallbacks failed (chat)"
+                            );
+                            return WsMessage::error(
+                                request.id,
+                                ErrorCode::ProviderError,
+                                format!("{} (fallback failed: {})", first_error, last_error),
+                            );
+                        };
+
+                        let Some(r) = selected_response else {
+                            return WsMessage::error(
+                                request.id,
+                                ErrorCode::ProviderError,
+                                format!("{} (fallback failed: {})", first_error, last_error),
+                            );
+                        };
+
+                        let previous_provider = active_provider_name.clone();
+                        provider = p;
+                        active_provider_name = provider.name().to_string();
+                        state.set_provider(Some(provider.clone()));
+
+                        // Drop model selection when switching providers to avoid mismatch.
+                        options.model = None;
+
+                        let changed_event = Event::new(
+                            event_types::PROVIDER_CHANGED,
+                            drbot_protocol::event::provider::ChangedEvent {
+                                provider: active_provider_name.clone(),
+                                previous_provider: Some(previous_provider.clone()),
+                                reason: Some(format!(
+                                    "{} failed: {}",
+                                    previous_provider, first_error
+                                )),
                             },
-                        )
+                        );
+                        if let Ok(json) = serde_json::to_string(&WsMessage::Event(changed_event)) {
+                            let _ = tx.send(json).await;
+                        }
+
+                        r
                     }
-                    Err(e) => {
-                        error!(error = %e, "Failed to chat");
-                        WsMessage::error(request.id, ErrorCode::ProviderError, e.to_string())
+                };
+
+                if let (Some(store), Some(session)) =
+                    (state.session_store(), persisted_session.as_mut())
+                {
+                    if active_provider_name != initial_provider_name {
+                        // Prevent a persisted model id from the previous provider from breaking
+                        // future calls after fallback.
+                        session.model = None;
+                    }
+                    session.provider = Some(active_provider_name.clone());
+                    session.add_message(user_msg);
+                    session.add_message(Message::assistant(&response.content));
+                    if let Some(usage) = &response.usage {
+                        session.add_token_usage(usage.input_tokens, usage.output_tokens);
+                    }
+                    session.update_timestamp();
+                    if let Err(e) = store.update(session).await {
+                        error!(error = %e, session_id = %session_id, "Failed to update session");
                     }
                 }
+
+                WsMessage::success(
+                    request.id,
+                    drbot_protocol::ChatSendResult {
+                        session_id,
+                        message_id,
+                        content: Some(response.content),
+                        model: response.model,
+                        provider: Some(active_provider_name.clone()),
+                        usage: response
+                            .usage
+                            .map(|u| drbot_protocol::response::TokenUsage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                            }),
+                    },
+                )
             }
         }
 
@@ -1085,6 +1821,10 @@ async fn handle_request(
             let mut session = Session::new(user_id, "gateway", session_id.to_string());
             session.id = session_id;
             session.title = params.title.clone();
+            session.provider = params
+                .provider
+                .clone()
+                .or_else(|| state.provider().map(|p| p.name().to_string()));
             session.model = params.model.clone();
             session.system_prompt = params.system_prompt.clone();
 
@@ -1094,6 +1834,294 @@ async fn handle_request(
             }
 
             WsMessage::success(request.id, SessionCreateResult { session_id })
+        }
+
+        "session.get" => {
+            let params: SessionGetParams = match serde_json::from_value(request.params.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::InvalidParams,
+                        format!("Invalid params: {}", e),
+                    );
+                }
+            };
+
+            let store = match state.session_store() {
+                Some(s) => s,
+                None => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::SessionError,
+                        "Session store not configured",
+                    );
+                }
+            };
+
+            let user_id = client_ctx.read().await.effective_user_id();
+            let session = match store.get(params.session_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return WsMessage::error(request.id, ErrorCode::NotFound, "Session not found");
+                }
+                Err(e) => {
+                    error!(error = %e, session_id = %params.session_id, "Failed to load session");
+                    return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+                }
+            };
+
+            if session.user_id != user_id {
+                warn!(
+                    session_id = %params.session_id,
+                    session_user_id = %session.user_id,
+                    request_user_id = %user_id,
+                    "Session access denied"
+                );
+                return WsMessage::error(
+                    request.id,
+                    ErrorCode::PermissionDenied,
+                    "Permission denied",
+                );
+            }
+
+            let info = drbot_protocol::SessionInfo {
+                id: session.id,
+                title: session.title.clone(),
+                provider: session.provider.clone(),
+                model: session.model.clone(),
+                message_count: session.metadata.message_count,
+                created_at: session.created_at,
+                updated_at: session.updated_at,
+                state: match session.state {
+                    drbot_core::session::SessionState::Active => "active".to_string(),
+                    drbot_core::session::SessionState::Archived => "archived".to_string(),
+                    drbot_core::session::SessionState::Deleted => "deleted".to_string(),
+                },
+            };
+
+            WsMessage::success(
+                request.id,
+                SessionGetResult {
+                    session: info,
+                    messages: session.messages,
+                    system_prompt: session.system_prompt,
+                },
+            )
+        }
+
+        "session.update" => {
+            let params: SessionUpdateParams = match serde_json::from_value(request.params.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::InvalidParams,
+                        format!("Invalid params: {}", e),
+                    );
+                }
+            };
+
+            let store = match state.session_store() {
+                Some(s) => s,
+                None => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::SessionError,
+                        "Session store not configured",
+                    );
+                }
+            };
+
+            let user_id = client_ctx.read().await.effective_user_id();
+            let mut session = match store.get(params.session_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return WsMessage::error(request.id, ErrorCode::NotFound, "Session not found");
+                }
+                Err(e) => {
+                    error!(error = %e, session_id = %params.session_id, "Failed to load session");
+                    return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+                }
+            };
+
+            if session.user_id != user_id {
+                warn!(
+                    session_id = %params.session_id,
+                    session_user_id = %session.user_id,
+                    request_user_id = %user_id,
+                    "Session access denied"
+                );
+                return WsMessage::error(
+                    request.id,
+                    ErrorCode::PermissionDenied,
+                    "Permission denied",
+                );
+            }
+
+            if params.clear_provider {
+                session.provider = None;
+            }
+            if params.clear_model {
+                session.model = None;
+            }
+            if params.clear_system_prompt {
+                session.system_prompt = None;
+            }
+
+            if let Some(title) = params.title.clone() {
+                session.title = Some(title);
+            }
+            if let Some(provider) = params.provider.clone() {
+                session.provider = Some(provider);
+            }
+            if let Some(model) = params.model.clone() {
+                session.model = Some(model);
+            }
+            if let Some(system_prompt) = params.system_prompt.clone() {
+                session.system_prompt = Some(system_prompt);
+            }
+
+            session.update_timestamp();
+            if let Err(e) = store.update(&session).await {
+                error!(error = %e, session_id = %params.session_id, "Failed to update session");
+                return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+            }
+
+            WsMessage::success(
+                request.id,
+                SessionUpdateResult {
+                    session_id: params.session_id,
+                    updated: true,
+                },
+            )
+        }
+
+        "session.clear" => {
+            let params: SessionClearParams = match serde_json::from_value(request.params.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::InvalidParams,
+                        format!("Invalid params: {}", e),
+                    );
+                }
+            };
+
+            let store = match state.session_store() {
+                Some(s) => s,
+                None => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::SessionError,
+                        "Session store not configured",
+                    );
+                }
+            };
+
+            let user_id = client_ctx.read().await.effective_user_id();
+            let mut session = match store.get(params.session_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return WsMessage::error(request.id, ErrorCode::NotFound, "Session not found");
+                }
+                Err(e) => {
+                    error!(error = %e, session_id = %params.session_id, "Failed to load session");
+                    return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+                }
+            };
+
+            if session.user_id != user_id {
+                warn!(
+                    session_id = %params.session_id,
+                    session_user_id = %session.user_id,
+                    request_user_id = %user_id,
+                    "Session access denied"
+                );
+                return WsMessage::error(
+                    request.id,
+                    ErrorCode::PermissionDenied,
+                    "Permission denied",
+                );
+            }
+
+            session.clear_messages();
+            if let Err(e) = store.update(&session).await {
+                error!(error = %e, session_id = %params.session_id, "Failed to update session");
+                return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+            }
+
+            WsMessage::success(
+                request.id,
+                SessionClearResult {
+                    session_id: params.session_id,
+                    cleared: true,
+                },
+            )
+        }
+
+        "session.delete" => {
+            let params: SessionDeleteParams = match serde_json::from_value(request.params.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::InvalidParams,
+                        format!("Invalid params: {}", e),
+                    );
+                }
+            };
+
+            let store = match state.session_store() {
+                Some(s) => s,
+                None => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::SessionError,
+                        "Session store not configured",
+                    );
+                }
+            };
+
+            let user_id = client_ctx.read().await.effective_user_id();
+            let session = match store.get(params.session_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return WsMessage::error(request.id, ErrorCode::NotFound, "Session not found");
+                }
+                Err(e) => {
+                    error!(error = %e, session_id = %params.session_id, "Failed to load session");
+                    return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+                }
+            };
+
+            if session.user_id != user_id {
+                warn!(
+                    session_id = %params.session_id,
+                    session_user_id = %session.user_id,
+                    request_user_id = %user_id,
+                    "Session access denied"
+                );
+                return WsMessage::error(
+                    request.id,
+                    ErrorCode::PermissionDenied,
+                    "Permission denied",
+                );
+            }
+
+            if let Err(e) = store.delete(params.session_id).await {
+                error!(error = %e, session_id = %params.session_id, "Failed to delete session");
+                return WsMessage::error(request.id, ErrorCode::SessionError, e.to_string());
+            }
+
+            WsMessage::success(
+                request.id,
+                SessionDeleteResult {
+                    session_id: params.session_id,
+                    deleted: true,
+                },
+            )
         }
 
         "session.list" => {
@@ -1171,6 +2199,7 @@ async fn handle_request(
                 .map(|s| drbot_protocol::SessionInfo {
                     id: s.id,
                     title: s.title,
+                    provider: s.provider,
                     model: s.model,
                     message_count: s.metadata.message_count,
                     created_at: s.created_at,
@@ -1187,17 +2216,371 @@ async fn handle_request(
         }
 
         "provider.list" => {
-            let providers = if let Some(provider) = state.provider() {
-                vec![drbot_protocol::ProviderInfo {
-                    name: provider.name().to_string(),
-                    status: "configured".to_string(),
-                    models: provider.models().iter().map(|m| m.id.clone()).collect(),
-                }]
-            } else {
-                vec![]
+            let active = state.provider().map(|p| p.name().to_string());
+
+            let mut candidates: Vec<String> = vec![
+                "auto".to_string(),
+                "claude-cli".to_string(),
+                "codex-cli".to_string(),
+                "codex-oss".to_string(),
+                "ollama".to_string(),
+                "anthropic".to_string(),
+                "openai".to_string(),
+            ];
+            candidates.extend(
+                state
+                    .config()
+                    .providers
+                    .openai_compatible
+                    .iter()
+                    .map(|c| c.name.clone()),
+            );
+            candidates.extend(state.config().providers.cli.iter().map(|c| c.name.clone()));
+            candidates.sort();
+            candidates.dedup();
+
+            // Preserve a friendly order: cost-savers first.
+            let mut ordered: Vec<String> = Vec::new();
+            for name in [
+                "auto",
+                "claude-cli",
+                "codex-cli",
+                "codex-oss",
+                "ollama",
+                "anthropic",
+                "openai",
+            ] {
+                if candidates.iter().any(|c| c == name) {
+                    ordered.push(name.to_string());
+                }
+            }
+            for c in candidates {
+                if !ordered.contains(&c) {
+                    ordered.push(c);
+                }
+            }
+
+            let mut providers: Vec<drbot_protocol::ProviderInfo> = Vec::new();
+            let status_is_selectable = |status: &str| {
+                status == "available"
+                    || (status.starts_with("active") && !status.contains("unreachable"))
             };
+            for name in ordered.into_iter().filter(|n| n != "auto") {
+                // Special-case Ollama so we can report reachability (configured != running).
+                if name == "ollama" {
+                    let base_url = ollama_base_url(state.config());
+                    let fetched = fetch_ollama_tags(&base_url, Duration::from_millis(350)).await;
+                    let mut reachable = false;
+                    let mut models: Vec<String> = drbot_ollama::OllamaProvider::new()
+                        .models()
+                        .iter()
+                        .map(|m| m.id.clone())
+                        .collect();
+
+                    if let Some((ok, json)) = fetched {
+                        reachable = ok;
+                        if let Some(json) = json {
+                            let mut names: Vec<String> = json
+                                .get("models")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|m| {
+                                            m.get("name")
+                                                .and_then(|n| n.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            names.sort();
+                            names.dedup();
+                            if !names.is_empty() {
+                                models = names;
+                            }
+                        }
+                    }
+
+                    let is_active = active.as_deref() == Some("ollama");
+                    let status = if is_active && !reachable {
+                        "active (unreachable)".to_string()
+                    } else if is_active {
+                        "active".to_string()
+                    } else if reachable {
+                        "available".to_string()
+                    } else {
+                        format!("unavailable: ollama not reachable at {}", base_url.trim())
+                    };
+                    providers.push(drbot_protocol::ProviderInfo {
+                        name,
+                        status,
+                        models,
+                    });
+                    continue;
+                }
+
+                // Special-case codex-oss so we can report local Ollama reachability.
+                if name == "codex-oss" {
+                    match crate::state::try_init_provider_named(state.config(), &name) {
+                        Ok(p) => {
+                            let mut models: Vec<String> =
+                                p.models().iter().map(|m| m.id.clone()).collect();
+                            let mut reachable = false;
+
+                            let base_url = ollama_base_url(state.config());
+                            let fetched =
+                                fetch_ollama_tags(&base_url, Duration::from_millis(350)).await;
+
+                            if let Some((ok, json)) = fetched {
+                                reachable = ok;
+                                if let Some(json) = json {
+                                    let mut names: Vec<String> = json
+                                        .get("models")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|m| {
+                                                    m.get("name")
+                                                        .and_then(|n| n.as_str())
+                                                        .map(|s| s.to_string())
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default();
+                                    names.sort();
+                                    names.dedup();
+                                    if !names.is_empty() {
+                                        models = names;
+                                    }
+                                }
+                            }
+
+                            let is_active = active.as_deref() == Some("codex-oss");
+                            let status = if is_active && !reachable {
+                                "active (unreachable)".to_string()
+                            } else if is_active {
+                                "active".to_string()
+                            } else if reachable {
+                                "available".to_string()
+                            } else {
+                                format!("unavailable: ollama not reachable at {}", base_url.trim())
+                            };
+
+                            providers.push(drbot_protocol::ProviderInfo {
+                                name,
+                                status,
+                                models,
+                            });
+                        }
+                        Err(reason) => providers.push(drbot_protocol::ProviderInfo {
+                            name,
+                            status: format!("unavailable: {}", reason),
+                            models: vec![],
+                        }),
+                    }
+                    continue;
+                }
+
+                match crate::state::try_init_provider_named(state.config(), &name) {
+                    Ok(p) => providers.push(drbot_protocol::ProviderInfo {
+                        name: name.clone(),
+                        status: if active.as_deref() == Some(name.as_str()) {
+                            "active".to_string()
+                        } else {
+                            "available".to_string()
+                        },
+                        models: p.models().iter().map(|m| m.id.clone()).collect(),
+                    }),
+                    Err(reason) => providers.push(drbot_protocol::ProviderInfo {
+                        name,
+                        status: format!("unavailable: {}", reason),
+                        models: vec![],
+                    }),
+                }
+            }
+
+            let any_available = providers.iter().any(|p| status_is_selectable(&p.status));
+            providers.insert(
+                0,
+                drbot_protocol::ProviderInfo {
+                    name: "auto".to_string(),
+                    status: if any_available {
+                        "available".to_string()
+                    } else {
+                        "unavailable: no providers available (try drbot wizard)".to_string()
+                    },
+                    models: vec![],
+                },
+            );
 
             WsMessage::success(request.id, ProviderListResult { providers })
+        }
+
+        "provider.models" => {
+            let params: ProviderModelsParams = match serde_json::from_value(request.params.clone())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::InvalidParams,
+                        format!("Invalid params: {}", e),
+                    );
+                }
+            };
+
+            let provider = match params
+                .provider
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                Some(name) => match crate::state::try_init_provider_named(state.config(), name) {
+                    Ok(p) => p,
+                    Err(e) => return WsMessage::error(request.id, ErrorCode::ProviderError, e),
+                },
+                None => match state.provider() {
+                    Some(p) => p,
+                    None => {
+                        return WsMessage::error(
+                            request.id,
+                            ErrorCode::ProviderError,
+                            "No provider configured",
+                        );
+                    }
+                },
+            };
+
+            let models = if provider.name() == "ollama" || provider.name() == "codex-oss" {
+                let mut out: Vec<ModelInfo> = Vec::new();
+                let mut tags_models: Vec<String> = Vec::new();
+
+                let base_url = ollama_base_url(state.config());
+                if let Some((reachable, json)) =
+                    fetch_ollama_tags(&base_url, Duration::from_millis(600)).await
+                {
+                    if reachable {
+                        if let Some(json) = json {
+                            tags_models = json
+                                .get("models")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|m| {
+                                            m.get("name")
+                                                .and_then(|n| n.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            tags_models.sort();
+                            tags_models.dedup();
+                        }
+                    }
+                };
+
+                if !tags_models.is_empty() {
+                    let provider_name = provider.name().to_string();
+                    for name in tags_models {
+                        out.push(ModelInfo {
+                            id: name.clone(),
+                            name,
+                            provider: provider_name.clone(),
+                            context_window: 0,
+                            max_output_tokens: None,
+                        });
+                    }
+                    out
+                } else {
+                    provider
+                        .models()
+                        .into_iter()
+                        .map(|m| ModelInfo {
+                            id: m.id,
+                            name: m.name,
+                            provider: m.provider,
+                            context_window: m.context_window,
+                            max_output_tokens: m.max_output_tokens,
+                        })
+                        .collect()
+                }
+            } else {
+                provider
+                    .models()
+                    .into_iter()
+                    .map(|m| ModelInfo {
+                        id: m.id,
+                        name: m.name,
+                        provider: m.provider,
+                        context_window: m.context_window,
+                        max_output_tokens: m.max_output_tokens,
+                    })
+                    .collect()
+            };
+
+            WsMessage::success(request.id, ProviderModelsResult { models })
+        }
+
+        "provider.select" => {
+            let params: ProviderSelectParams = match serde_json::from_value(request.params.clone())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::InvalidParams,
+                        format!("Invalid params: {}", e),
+                    );
+                }
+            };
+
+            let requested = params.provider.trim();
+            let provider = if requested.eq_ignore_ascii_case("auto") {
+                match init_provider_auto_best_effort(state).await {
+                    Ok(p) => p,
+                    Err(e) => return WsMessage::error(request.id, ErrorCode::ProviderError, e),
+                }
+            } else if (requested.eq_ignore_ascii_case("ollama")
+                || requested.eq_ignore_ascii_case("local"))
+                && state.config().providers.ollama.is_none()
+            {
+                // Allow selecting Ollama without config when it's actually running.
+                let base_url = ollama_base_url(state.config());
+                let reachable = fetch_ollama_tags(&base_url, Duration::from_millis(350))
+                    .await
+                    .map(|(ok, _)| ok)
+                    .unwrap_or(false);
+                if !reachable {
+                    return WsMessage::error(
+                        request.id,
+                        ErrorCode::ProviderError,
+                        format!(
+                            "ollama not reachable at {} (start Ollama or run drbot wizard)",
+                            base_url.trim()
+                        ),
+                    );
+                }
+                let mut provider = drbot_ollama::OllamaProvider::new().with_base_url(base_url);
+                if let Some(model) = state.config().providers.default_model.clone() {
+                    provider = provider.with_default_model(model);
+                }
+                std::sync::Arc::new(provider) as std::sync::Arc<dyn Provider>
+            } else {
+                match crate::state::try_init_provider_named(state.config(), requested) {
+                    Ok(p) => p,
+                    Err(e) => return WsMessage::error(request.id, ErrorCode::ProviderError, e),
+                }
+            };
+
+            let info = drbot_protocol::ProviderInfo {
+                name: provider.name().to_string(),
+                status: "active".to_string(),
+                models: provider.models().iter().map(|m| m.id.clone()).collect(),
+            };
+            state.set_provider(Some(provider));
+
+            WsMessage::success(request.id, ProviderSelectResult { provider: info })
         }
 
         "system.ping" => WsMessage::success(
@@ -1243,9 +2626,10 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_db_path(test_name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("drbot-gateway-{}-{}.db", test_name, Uuid::new_v4()));
-        path
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("drbot-gateway-{}-{}", test_name, Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("drbot.db")
     }
 
     async fn parse_success<T: serde::de::DeserializeOwned>(msg: WsMessage) -> T {
@@ -1286,6 +2670,7 @@ mod tests {
                 "session.create",
                 SessionCreateParams {
                     title: Some("Test Session".to_string()),
+                    provider: None,
                     model: Some("gpt-4o".to_string()),
                     system_prompt: Some("You are helpful.".to_string()),
                 },
@@ -1436,18 +2821,27 @@ mod tests {
         let recorded = record.lock().await.clone();
         assert_eq!(recorded.len(), 2);
         let first_msgs = recorded[0]["messages"].as_array().unwrap();
-        assert_eq!(first_msgs.len(), 1);
-        assert_eq!(first_msgs[0]["role"], "user");
-        assert_eq!(first_msgs[0]["content"], "first");
+        assert_eq!(first_msgs.len(), 2);
+        assert_eq!(first_msgs[0]["role"], "system");
+        assert!(
+            first_msgs[0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Workspace context:"),
+            "expected workspace context in system prompt"
+        );
+        assert_eq!(first_msgs[1]["role"], "user");
+        assert_eq!(first_msgs[1]["content"], "first");
 
         let second_msgs = recorded[1]["messages"].as_array().unwrap();
-        assert_eq!(second_msgs.len(), 3);
-        assert_eq!(second_msgs[0]["role"], "user");
-        assert_eq!(second_msgs[0]["content"], "first");
-        assert_eq!(second_msgs[1]["role"], "assistant");
-        assert_eq!(second_msgs[1]["content"], "hello");
-        assert_eq!(second_msgs[2]["role"], "user");
-        assert_eq!(second_msgs[2]["content"], "second");
+        assert_eq!(second_msgs.len(), 4);
+        assert_eq!(second_msgs[0]["role"], "system");
+        assert_eq!(second_msgs[1]["role"], "user");
+        assert_eq!(second_msgs[1]["content"], "first");
+        assert_eq!(second_msgs[2]["role"], "assistant");
+        assert_eq!(second_msgs[2]["content"], "hello");
+        assert_eq!(second_msgs[3]["role"], "user");
+        assert_eq!(second_msgs[3]["content"], "second");
 
         // Verify session messages were persisted.
         let store = state.session_store().expect("store").clone();
@@ -1458,6 +2852,86 @@ mod tests {
             .expect("missing session");
         assert_eq!(session.messages.len(), 4);
         assert_eq!(session.metadata.message_count, 4);
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn chat_send_injects_workspace_notes_recall() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, shutdown) = start_mock_openai(record.clone()).await;
+
+        let mut config = Config::default();
+        config.storage.database_path = temp_db_path("chat_send_workspace_notes_recall");
+        config.providers = ProvidersConfig {
+            default_provider: Some("openai".to_string()),
+            default_model: None,
+            anthropic: None,
+            openai: Some(OpenAIConfig {
+                api_key: "test-key".to_string(),
+                base_url: Some(format!("{}/v1", base_url)),
+                headers: Default::default(),
+                organization: None,
+                default_model: Some("gpt-4o".to_string()),
+            }),
+            ollama: None,
+            bedrock: None,
+            cli: vec![],
+            openai_compatible: vec![],
+        };
+
+        let state = GatewayState::new(config);
+
+        // Seed a knowledge-base note in the default workspace.
+        let workspace = crate::openclaw::ensure_agent_workspace_bootstrap_best_effort(
+            &state,
+            crate::openclaw_paths::DEFAULT_AGENT_ID,
+        );
+        let memory_dir = workspace.join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("create memory dir");
+        let token = format!("ZEBRA_{}", Uuid::new_v4());
+        let note_path = memory_dir.join("test.md");
+        std::fs::write(&note_path, format!("# Test\n\n{}\n", token)).expect("write note");
+
+        let (tx, _rx) = mpsc::channel::<String>(8);
+        let client_id = Uuid::new_v4();
+        let client_ctx = Arc::new(tokio::sync::RwLock::new(ClientContext::new(
+            client_id,
+            state.auth_required(),
+        )));
+
+        let req_id = Uuid::new_v4();
+        let resp = handle_request(
+            &state,
+            &tx,
+            drbot_protocol::Request::new(
+                req_id,
+                "chat.send",
+                ChatSendParams {
+                    session_id: None,
+                    message: token.clone(),
+                    model: None,
+                    stream: false,
+                    options: None,
+                },
+            ),
+            &client_ctx,
+        )
+        .await;
+        let _result: drbot_protocol::ChatSendResult = parse_success(resp).await;
+
+        let recorded = record.lock().await.clone();
+        assert_eq!(recorded.len(), 1);
+        let msgs = recorded[0]["messages"].as_array().unwrap();
+        assert!(!msgs.is_empty());
+        assert_eq!(msgs[0]["role"], "system");
+        let sys = msgs[0]["content"].as_str().unwrap_or("");
+        assert!(
+            sys.contains("Relevant notes (workspace knowledge base):"),
+            "expected notes recall section"
+        );
+        assert!(sys.contains("memory/test.md"), "expected note citation");
+        assert!(sys.contains(&token), "expected note content to be injected");
 
         let _ = shutdown.send(());
     }

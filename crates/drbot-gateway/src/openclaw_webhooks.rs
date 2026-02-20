@@ -240,8 +240,7 @@ pub(crate) async fn hooks_wake_handler(
     state
         .openclaw_enqueue_system_event(session_key.as_str(), message, None)
         .await;
-    crate::openclaw_heartbeat::request_heartbeat_now(&state, Some("hooks.wake".to_string()))
-        .await;
+    crate::openclaw_heartbeat::request_heartbeat_now(&state, Some("hooks.wake".to_string())).await;
 
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
@@ -360,9 +359,12 @@ pub(crate) async fn hooks_agent_handler(
         .unwrap_or(crate::openclaw_paths::DEFAULT_AGENT_ID);
     let agent_id = crate::openclaw_paths::normalize_agent_id(agent_id);
     if !state.config().hooks.allowed_agent_ids.is_empty() {
-        let allowed = state.config().hooks.allowed_agent_ids.iter().any(|entry| {
-            crate::openclaw_paths::normalize_agent_id(entry) == agent_id
-        });
+        let allowed = state
+            .config()
+            .hooks
+            .allowed_agent_ids
+            .iter()
+            .any(|entry| crate::openclaw_paths::normalize_agent_id(entry) == agent_id);
         if !allowed {
             return json_error(StatusCode::FORBIDDEN, "agentId not allowed");
         }
@@ -372,7 +374,12 @@ pub(crate) async fn hooks_agent_handler(
         .id
         .as_deref()
         .and_then(normalize_message_id)
-        .or_else(|| payload.idempotency_key.as_deref().and_then(normalize_message_id))
+        .or_else(|| {
+            payload
+                .idempotency_key
+                .as_deref()
+                .and_then(normalize_message_id)
+        })
         .unwrap_or_else(derive_message_id);
 
     let timeout_ms = payload
@@ -412,7 +419,10 @@ pub(crate) async fn hooks_agent_handler(
 
     match result {
         Ok(payload) => {
-            let result_obj = payload.get("result").cloned().unwrap_or(serde_json::Value::Null);
+            let result_obj = payload
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let usage = result_obj
                 .get("usage")
                 .cloned()

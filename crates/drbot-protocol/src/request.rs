@@ -91,6 +91,9 @@ pub struct SessionCreateParams {
     /// Optional title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional provider to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Optional model to use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -134,6 +137,34 @@ pub struct SessionClearParams {
     pub session_id: Uuid,
 }
 
+/// Parameters for session.update method.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionUpdateParams {
+    /// Session ID.
+    pub session_id: Uuid,
+    /// Optional title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional provider to persist on the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Optional model to persist on the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional system prompt to persist on the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Clear the session provider.
+    #[serde(default)]
+    pub clear_provider: bool,
+    /// Clear the session model (use provider default).
+    #[serde(default)]
+    pub clear_model: bool,
+    /// Clear the session system prompt.
+    #[serde(default)]
+    pub clear_system_prompt: bool,
+}
+
 // ============================================================================
 // Auth Methods
 // ============================================================================
@@ -163,6 +194,13 @@ pub struct ProviderModelsParams {
     /// Provider name (optional, lists all if not provided).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+}
+
+/// Parameters for provider.select method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSelectParams {
+    /// Provider name to select (e.g. "claude-cli", "codex-cli", "ollama", "anthropic", "openai").
+    pub provider: String,
 }
 
 // ============================================================================

@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 /// Main configuration for drbot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Assistant behavior configuration.
+    #[serde(default)]
+    pub assistant: AssistantConfig,
+
     /// Gateway server configuration.
     #[serde(default)]
     pub gateway: GatewayConfig,
@@ -107,6 +111,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            assistant: AssistantConfig::default(),
             gateway: GatewayConfig::default(),
             hooks: HooksConfig::default(),
             providers: ProvidersConfig::default(),
@@ -114,6 +119,74 @@ impl Default for Config {
             messages: MessagesConfig::default(),
             storage: StorageConfig::default(),
             logging: LoggingConfig::default(),
+        }
+    }
+}
+
+/// Assistant autonomy mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutonomyMode {
+    #[serde(alias = "readonly", alias = "read_only")]
+    ReadOnly,
+    Supervised,
+    Full,
+}
+
+impl Default for AutonomyMode {
+    fn default() -> Self {
+        AutonomyMode::Supervised
+    }
+}
+
+fn is_default_autonomy_mode(mode: &AutonomyMode) -> bool {
+    *mode == AutonomyMode::default()
+}
+
+/// Assistant behavior configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantConfig {
+    /// Autonomy policy for tool usage.
+    #[serde(
+        default,
+        rename = "autonomyMode",
+        alias = "autonomy_mode",
+        skip_serializing_if = "is_default_autonomy_mode"
+    )]
+    pub autonomy_mode: AutonomyMode,
+    /// Allowed workspace roots for OpenClaw agent workspaces (empty = allow any).
+    #[serde(
+        default,
+        rename = "workspaceAllowlist",
+        alias = "workspace_allowlist",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub workspace_allowlist: Vec<PathBuf>,
+    /// Tool allowlist (empty = allow all).
+    #[serde(
+        default,
+        rename = "toolAllowlist",
+        alias = "tool_allowlist",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tool_allowlist: Vec<String>,
+    /// Tool denylist (matched before allowlist).
+    #[serde(
+        default,
+        rename = "toolDenylist",
+        alias = "tool_denylist",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tool_denylist: Vec<String>,
+}
+
+impl Default for AssistantConfig {
+    fn default() -> Self {
+        Self {
+            autonomy_mode: AutonomyMode::default(),
+            workspace_allowlist: Vec::new(),
+            tool_allowlist: Vec::new(),
+            tool_denylist: Vec::new(),
         }
     }
 }
@@ -145,6 +218,12 @@ pub struct GatewayConfig {
     pub port: u16,
     /// Authentication token (optional).
     pub auth_token: Option<String>,
+    /// Require device pairing for OpenClaw connections.
+    #[serde(default)]
+    pub pairing_required: bool,
+    /// Allow loopback clients to skip pairing requirements.
+    #[serde(default = "default_gateway_pairing_allow_local")]
+    pub pairing_allow_local: bool,
     /// Enable TLS.
     #[serde(default)]
     pub tls_enabled: bool,
@@ -162,12 +241,18 @@ fn default_gateway_port() -> u16 {
     18789
 }
 
+fn default_gateway_pairing_allow_local() -> bool {
+    true
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             host: default_gateway_host(),
             port: default_gateway_port(),
             auth_token: None,
+            pairing_required: false,
+            pairing_allow_local: default_gateway_pairing_allow_local(),
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,

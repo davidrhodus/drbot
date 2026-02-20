@@ -1,6 +1,5 @@
 //! Audio processing utilities.
 
-use crate::{Result, VoiceError};
 use serde::{Deserialize, Serialize};
 
 /// Audio format specification.
@@ -232,6 +231,8 @@ pub struct VoiceActivityDetector {
     threshold: f32,
     /// Minimum speech duration in samples.
     min_speech_samples: usize,
+    /// Accumulates consecutive speech samples before we emit SpeechStart.
+    speech_count: usize,
     /// Speech detected state.
     is_speaking: bool,
     /// Silence counter.
@@ -246,6 +247,7 @@ impl VoiceActivityDetector {
         Self {
             threshold: 500.0,
             min_speech_samples: (sample_rate as f32 * 0.1) as usize, // 100ms
+            speech_count: 0,
             is_speaking: false,
             silence_count: 0,
             max_silence: (sample_rate as f32 * 0.5) as usize, // 500ms
@@ -263,21 +265,28 @@ impl VoiceActivityDetector {
         let rms = buffer.rms();
 
         if rms > self.threshold {
+            self.speech_count = self.speech_count.saturating_add(buffer.samples.len());
             self.silence_count = 0;
 
             if !self.is_speaking {
-                self.is_speaking = true;
-                return VadResult::SpeechStart;
+                if self.speech_count >= self.min_speech_samples {
+                    self.is_speaking = true;
+                    return VadResult::SpeechStart;
+                }
+                // Not enough evidence yet to mark speech as started.
+                return VadResult::Silence;
             }
 
             VadResult::Speech
         } else {
+            self.speech_count = 0;
             if self.is_speaking {
                 self.silence_count += buffer.samples.len();
 
                 if self.silence_count > self.max_silence {
                     self.is_speaking = false;
                     self.silence_count = 0;
+                    self.speech_count = 0;
                     return VadResult::SpeechEnd;
                 }
 
@@ -292,6 +301,7 @@ impl VoiceActivityDetector {
     pub fn reset(&mut self) {
         self.is_speaking = false;
         self.silence_count = 0;
+        self.speech_count = 0;
     }
 }
 

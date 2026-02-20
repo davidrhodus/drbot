@@ -29,6 +29,10 @@ mod router;
 mod server;
 mod ssrf;
 mod state;
+pub mod workspace_autosave;
+pub mod workspace_chat_context;
+pub mod workspace_memory_view;
+pub mod workspace_notes_recall;
 
 pub use server::{Gateway, GatewayBuilder};
 pub use state::GatewayState;

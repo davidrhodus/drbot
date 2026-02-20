@@ -65,6 +65,7 @@ impl SqliteSessionStore {
                 channel_type TEXT NOT NULL,
                 channel_id TEXT NOT NULL,
                 title TEXT,
+                provider TEXT,
                 model TEXT,
                 system_prompt TEXT,
                 state TEXT NOT NULL DEFAULT 'active',
@@ -94,6 +95,22 @@ impl SqliteSessionStore {
         )
         .map_err(|e| Error::Session(format!("Failed to initialize schema: {}", e)))?;
 
+        // Best-effort migration for older databases.
+        // (No-op if the column already exists.)
+        let has_provider_col = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .and_then(|mut stmt| {
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect::<Vec<_>>();
+                Ok(names.into_iter().any(|n| n == "provider"))
+            })
+            .unwrap_or(true);
+        if !has_provider_col {
+            let _ = conn.execute("ALTER TABLE sessions ADD COLUMN provider TEXT", []);
+        }
+
         Ok(())
     }
 
@@ -106,6 +123,7 @@ impl SqliteSessionStore {
         Option<String>,
         String,
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -124,6 +142,7 @@ impl SqliteSessionStore {
             session.channel_type.clone(),
             session.channel_id.clone(),
             session.title.clone(),
+            session.provider.clone(),
             session.model.clone(),
             session.system_prompt.clone(),
             match session.state {
@@ -149,15 +168,16 @@ impl SqliteSessionStore {
         let channel_type: String = row.get(3)?;
         let channel_id: String = row.get(4)?;
         let title: Option<String> = row.get(5)?;
-        let model: Option<String> = row.get(6)?;
-        let system_prompt: Option<String> = row.get(7)?;
-        let state: String = row.get(8)?;
-        let total_input_tokens: i64 = row.get(9)?;
-        let total_output_tokens: i64 = row.get(10)?;
-        let message_count: i64 = row.get(11)?;
-        let tags: String = row.get(12)?;
-        let created_at: String = row.get(13)?;
-        let updated_at: String = row.get(14)?;
+        let provider: Option<String> = row.get(6)?;
+        let model: Option<String> = row.get(7)?;
+        let system_prompt: Option<String> = row.get(8)?;
+        let state: String = row.get(9)?;
+        let total_input_tokens: i64 = row.get(10)?;
+        let total_output_tokens: i64 = row.get(11)?;
+        let message_count: i64 = row.get(12)?;
+        let tags: String = row.get(13)?;
+        let created_at: String = row.get(14)?;
+        let updated_at: String = row.get(15)?;
 
         Ok(Session {
             id: Uuid::parse_str(&id).unwrap_or_default(),
@@ -166,6 +186,7 @@ impl SqliteSessionStore {
             channel_type,
             channel_id,
             title,
+            provider,
             model,
             system_prompt,
             messages: Vec::new(), // Messages loaded separately
@@ -290,12 +311,12 @@ impl SessionStore for SqliteSessionStore {
             let conn = self.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO sessions (id, user_id, workspace_id, channel_type, channel_id,
-                 title, model, system_prompt, state, total_input_tokens, total_output_tokens,
+                 title, provider, model, system_prompt, state, total_input_tokens, total_output_tokens,
                  message_count, tags, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
-                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
-                    row.11, row.12, row.13, row.14
+                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+                    row.10, row.11, row.12, row.13, row.14, row.15
                 ],
             )
             .map_err(|e| Error::Session(format!("Failed to create session: {}", e)))?;
@@ -314,7 +335,7 @@ impl SessionStore for SqliteSessionStore {
         let session = {
             let conn = self.conn.lock().unwrap();
             conn.query_row(
-                "SELECT id, user_id, workspace_id, channel_type, channel_id, title, model,
+                "SELECT id, user_id, workspace_id, channel_type, channel_id, title, provider, model,
                  system_prompt, state, total_input_tokens, total_output_tokens, message_count,
                  tags, created_at, updated_at FROM sessions WHERE id = ?",
                 params![id.to_string()],
@@ -340,7 +361,7 @@ impl SessionStore for SqliteSessionStore {
         let session = {
             let conn = self.conn.lock().unwrap();
             conn.query_row(
-                "SELECT id, user_id, workspace_id, channel_type, channel_id, title, model,
+                "SELECT id, user_id, workspace_id, channel_type, channel_id, title, provider, model,
                  system_prompt, state, total_input_tokens, total_output_tokens, message_count,
                  tags, created_at, updated_at FROM sessions
                  WHERE channel_type = ? AND channel_id = ? AND state = 'active'",
@@ -366,12 +387,12 @@ impl SessionStore for SqliteSessionStore {
             let conn = self.conn.lock().unwrap();
             conn.execute(
                 "UPDATE sessions SET user_id = ?, workspace_id = ?, channel_type = ?,
-                 channel_id = ?, title = ?, model = ?, system_prompt = ?, state = ?,
+                 channel_id = ?, title = ?, provider = ?, model = ?, system_prompt = ?, state = ?,
                  total_input_tokens = ?, total_output_tokens = ?, message_count = ?,
                  tags = ?, updated_at = ? WHERE id = ?",
                 params![
                     row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
-                    row.12, row.14, row.0
+                    row.12, row.13, row.15, row.0
                 ],
             )
             .map_err(|e| Error::Session(format!("Failed to update session: {}", e)))?;
@@ -400,7 +421,7 @@ impl SessionStore for SqliteSessionStore {
         let conn = self.conn.lock().unwrap();
 
         let mut sql = String::from(
-            "SELECT id, user_id, workspace_id, channel_type, channel_id, title, model,
+            "SELECT id, user_id, workspace_id, channel_type, channel_id, title, provider, model,
              system_prompt, state, total_input_tokens, total_output_tokens, message_count,
              tags, created_at, updated_at FROM sessions WHERE 1=1",
         );

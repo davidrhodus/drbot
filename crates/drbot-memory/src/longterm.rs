@@ -7,8 +7,8 @@
 //! - Semantic deduplication to avoid redundant memories
 //! - Automatic summarization of related memories
 
-use crate::{Memory, MemorySearchResult, MemoryStore, SearchOptions};
-use chrono::{DateTime, Duration, Utc};
+use crate::{Memory, MemoryStore, SearchOptions};
+use chrono::{DateTime, Utc};
 use drbot_core::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -562,7 +562,6 @@ impl MemoryConsolidator {
         summary_embedding: Option<Vec<f32>>,
     ) -> LongTermMemory {
         let user_id = &memories[0].user_id;
-        let category = memories[0].category;
 
         // Take highest importance
         let importance = memories
@@ -585,12 +584,18 @@ impl MemoryConsolidator {
         tags.sort();
         tags.dedup();
 
-        LongTermMemory::new(user_id, summary_content)
+        let mut summary = LongTermMemory::new(user_id, summary_content)
             .with_category(MemoryCategory::Summary)
             .with_importance(importance)
             .with_confidence(confidence)
             .with_embedding(summary_embedding.unwrap_or_default())
-            .with_tag("consolidated")
+            .with_tag("consolidated");
+
+        for memory_id in related {
+            summary = summary.with_related(memory_id);
+        }
+
+        summary
     }
 }
 

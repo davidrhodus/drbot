@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "Voice I/O for drbot (speech-to-text, text-to-speech)"
 
+[features]
+default = []
+porcupine = []
+vosk = []
+
 [dependencies]
 drbot-core.workspace = true
 drbot-providers.workspace = true
