@@ -183,6 +183,10 @@ Environment variables override config file values:
 
 See `docs/persistent-memory.md` for how session continuity, personalization, and the workspace knowledge base work (and the relevant env vars).
 
+## Production readiness
+
+See `docs/production.md` for a practical production checklist (CI gates, non-loopback gateway security, and data/retention notes).
+
 ## Architecture
 
 ```
