@@ -15,6 +15,7 @@ This project spans local-only usage (TUI + loopback gateway) and networked deplo
   - If you set `gateway.host = "0.0.0.0"`, also set either:
     - `gateway.auth_token`, and/or
     - `gateway.pairing_required = true` (recommended for remote OpenClaw operators).
+- Even on loopback, prefer setting `gateway.auth_token` if you browse the web (mitigates localhost WebSocket attacks).
 - Prefer TLS when exposing the gateway outside a trusted LAN.
 - Keep OpenClaw/agent tool execution restricted:
   - Avoid `--openclaw-agent-bash-allow-all`.
@@ -28,6 +29,7 @@ This project spans local-only usage (TUI + loopback gateway) and networked deplo
   - Sessions: SQLite DB (see `storage.*` config).
   - Media: filesystem (see `storage.media_path`).
   - Project knowledge base: `.drbot/` inside repos (auto-init can be disabled with `DRBOT_PROJECT_KB_AUTO_INIT_ENABLED=0`).
+- Know what gets sent to providers: workspace context + recalled snippets are injected into prompts by default; keep secrets out of memory files (or disable recall/context via env vars in `docs/persistent-memory.md`).
 - Decide retention/backup:
   - Back up the SQLite DB and any `.drbot/` KB you care about.
   - Avoid storing secrets in workspace notes that could be recalled into prompts.

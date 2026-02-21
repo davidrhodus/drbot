@@ -8830,11 +8830,35 @@ async fn run_doctor(config: &Config) -> Result<()> {
             });
         }
     } else {
-        findings.push(Finding {
-            severity: Severity::Ok,
-            title: "Gateway bind policy".to_string(),
-            details: vec![format!("bind: {}:{}", host, config.gateway.port)],
-        });
+        if auth_token.is_empty() {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "Gateway on loopback without auth token".to_string(),
+                details: vec![
+                    format!("bind: {}:{}", host, config.gateway.port),
+                    "This is reachable by any local process and may be reachable by websites via localhost WebSockets.".to_string(),
+                    "Fix: set `gateway.auth_token` (recommended even on loopback).".to_string(),
+                ],
+            });
+        } else {
+            let weak = auth_token.len() < 16
+                || matches!(
+                    auth_token.to_ascii_lowercase().as_str(),
+                    "changeme" | "change-me" | "password" | "token"
+                );
+            findings.push(Finding {
+                severity: if weak { Severity::Warning } else { Severity::Ok },
+                title: "Gateway bind policy".to_string(),
+                details: vec![
+                    format!("bind: {}:{}", host, config.gateway.port),
+                    if weak {
+                        "Auth token looks weak; use a long random token.".to_string()
+                    } else {
+                        "Auth token configured.".to_string()
+                    },
+                ],
+            });
+        }
     }
 
     // --------------------------------------------
