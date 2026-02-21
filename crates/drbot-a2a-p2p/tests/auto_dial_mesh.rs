@@ -85,10 +85,23 @@ async fn auto_dial_forms_mesh_beyond_bootstrap() {
     let bridge_a = start_p2p_bridge(hub_a, cfg_a).await.unwrap();
     let bridge_c = start_p2p_bridge(hub_c, cfg_c).await.unwrap();
 
+    // Ensure both nodes have reached the bootstrap peer before asserting the mesh.
+    let bootstrap_deadline = Instant::now() + Duration::from_secs(3);
+    timeout(Duration::from_secs(4), async {
+        tokio::join!(
+            wait_connected(&bridge_a, bridge_b.peer_id, bootstrap_deadline),
+            wait_connected(&bridge_c, bridge_b.peer_id, bootstrap_deadline),
+        );
+    })
+    .await
+    .expect("bootstrap connect timeout");
+
     let deadline = Instant::now() + Duration::from_secs(5);
     timeout(Duration::from_secs(6), async {
-        wait_connected(&bridge_a, bridge_c.peer_id, deadline).await;
-        wait_connected(&bridge_c, bridge_a.peer_id, deadline).await;
+        tokio::join!(
+            wait_connected(&bridge_a, bridge_c.peer_id, deadline),
+            wait_connected(&bridge_c, bridge_a.peer_id, deadline),
+        );
     })
     .await
     .expect("auto-dial mesh timeout");
