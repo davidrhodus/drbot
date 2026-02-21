@@ -6,6 +6,7 @@ This project spans local-only usage (TUI + loopback gateway) and networked deplo
 
 - CI must be green on every merge to `main`.
 - `cargo test --workspace` must be stable (no flakes/timeouts).
+- Run `drbot doctor` against the intended config and treat warnings as action items.
 - Add a “smoke run” that starts the gateway and hits health endpoints (optional but recommended).
 
 ## 2) Security gates (must-have for any non-loopback deployment)
